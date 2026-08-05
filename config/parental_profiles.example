@@ -1,19 +1,23 @@
-# Profile-based parental control configuration
+# Profile configuration (single source of truth)
 # Format: profile_name|budget_minutes_per_day|mac1,mac2,mac3
 #
-# budget_minutes_per_day:
-#   0 = unlimited (schedule-only, no daily limit)
-#   120 = 2 hours per day (shared across all devices in the profile)
+# budget_minutes: 0 = unlimited (no daily limit)
 #
-# MACs are comma-separated, use lowercase
-#
-# Lines starting with # are comments
+# ALL MACs across ALL profiles form the MAC allowlist.
+# Only listed MACs get internet access; unknown devices are blocked.
+# Profiles with budget 0 and no cron schedule = always allowed (adults, IoT).
+# Disable MAC randomization on kids' devices so their real MAC is used.
 
-# Example: Alice has 2 hours/day across her phone and laptop
-alice|120|aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:02
+# === Adults (unlimited, no schedule) ===
+dad|0|CHANGEME:MAC1,CHANGEME:MAC2
+mom|0|CHANGEME:MAC3,CHANGEME:MAC4
 
-# Example: Bob has 1.5 hours/day across his phone and tablet
-bob|90|aa:bb:cc:dd:ee:03,aa:bb:cc:dd:ee:04
+# === Household devices (unlimited, no schedule) ===
+smart_tv|0|CHANGEME:MAC5
+printer|0|CHANGEME:MAC6
+nas|0|CHANGEME:MAC7
 
-# Example: Teen has unlimited time but still on schedule
-teen|0|aa:bb:cc:dd:ee:05,aa:bb:cc:dd:ee:06
+# === Kids (with budgets and schedules) ===
+alice|120|CHANGEME:MAC8,CHANGEME:MAC9
+bob|90|CHANGEME:MAC10,CHANGEME:MAC11
+charlie|60|CHANGEME:MAC12,CHANGEME:MAC13

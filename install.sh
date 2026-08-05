@@ -110,9 +110,8 @@ upload_config() {
     fi
 }
 
-upload_config "$LOCAL_DIR/parental_profiles"  "/etc/config/parental_profiles"   "Profiles config"
+upload_config "$LOCAL_DIR/parental_profiles"  "/etc/config/parental_profiles"   "Profiles + MAC allowlist (single file)"
 upload_config "$LOCAL_DIR/parental_websites"  "/etc/config/parental_websites"   "Website blocking config"
-upload_config "$LOCAL_DIR/mac_allowlist"      "/etc/config/mac_allowlist"       "MAC allowlist"
 upload_config "$LOCAL_DIR/parental_blocklists" "/etc/config/parental_blocklists" "Global blocklists"
 
 # Create default blocklists config if neither local nor remote exists
@@ -209,29 +208,8 @@ FIRST_INSTALL=$(ssh $SSH_OPTS "$SSH_TARGET" "nft list table inet parental_contro
 if [ -n "$FIRST_INSTALL" ] && [ $FORCE -eq 0 ]; then
     # Re-install: update the allowed_macs set without flushing the forward chain
     # This preserves active profile blocks, website blocks, and tickets
-    if [ -f "$LOCAL_DIR/mac_allowlist" ]; then
-        ssh $SSH_OPTS "$SSH_TARGET" << 'REMOTE' 2>/dev/null
-# Get current allowed MACs
-CURRENT=$(nft list set inet parental_control allowed_macs 2>/dev/null | grep -o '[0-9a-fA-F:]\{17\}' | sort)
-# Get new allowed MACs (from config file, skip comments)
-NEW=$(grep -v '^#' /etc/config/mac_allowlist 2>/dev/null | awk '{print $1}' | grep -v '^$' | sort)
-
-# Add new MACs
-for mac in $NEW; do
-    nft add element inet parental_control allowed_macs "{ $mac }" 2>/dev/null
-done
-
-# Remove MACs no longer in the config
-for mac in $CURRENT; do
-    if ! echo "$NEW" | grep -q "$mac"; then
-        nft delete element inet parental_control allowed_macs "{ $mac }" 2>/dev/null
-    fi
-done
-REMOTE
+    ssh $SSH_OPTS "$SSH_TARGET" "/usr/bin/setup-firewall.sh update" 2>/dev/null
         ok "MAC allowlist updated (preserved active blocks/tickets)"
-    else
-        skip "MAC allowlist (no local config, keeping existing)"
-    fi
 else
     # First install or --force: full apply
     ssh $SSH_OPTS "$SSH_TARGET" "/usr/bin/setup-firewall.sh apply" 2>/dev/null
