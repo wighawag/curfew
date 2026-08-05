@@ -26,8 +26,13 @@ SCP_OPTS="-O -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"  # -O 
 FORCE=0
 
 if [ -z "$ROUTER_IP" ]; then
-    echo "Usage: ./install.sh <router-ip> [--user root] [--force]"
-    echo "Example: ./install.sh 192.168.1.1"
+    echo "Usage: ./install.sh <router-ip> [--user root] [--force] [--setup]"
+    echo ""
+    echo "  --setup : apply router config (PPPoE, Wi-Fi, timezone) from config/local/router_config"
+    echo "  --force : full re-apply (clears active blocks/tickets)"
+    echo ""
+    echo "  First time:  ./install.sh 192.168.1.1 --setup"
+    echo "  Updates:     ./install.sh 192.168.1.1"
     exit 1
 fi
 
@@ -36,6 +41,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --user) SSH_USER="$2"; shift 2 ;;
         --force) FORCE=1; shift ;;
+        --setup) SETUP=1; shift ;;
         *) shift ;;
     esac
 done
@@ -43,6 +49,8 @@ done
 SSH_TARGET="${SSH_USER}@${ROUTER_IP}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOCAL_DIR="$SCRIPT_DIR/config/local"
+FORCE=0
+SETUP=0
 
 # Colors
 GREEN='\033[0;32m'
@@ -54,7 +62,7 @@ skip() { echo -e "  ${YELLOW}SKIP${NC} $1"; }
 
 echo "=== Parental Control Installer ==="
 echo "Router: $SSH_TARGET"
-echo "Mode: $([ $FORCE -eq 1 ] && echo "FORCE (full re-apply)" || echo "idempotent (preserves active state)")"
+echo "Mode: $([ $FORCE -eq 1 ] && echo "FORCE" || echo "idempotent")$([ $SETUP -eq 1 ] && echo " + setup" || echo "")
 echo ""
 
 # Step 1: Test SSH
@@ -67,8 +75,9 @@ fi
 ok "SSH connection"
 
 # Step 1b: Apply router config (PPPoE, Wi-Fi, timezone, etc.)
-if [ -f "$LOCAL_DIR/router_config" ]; then
-    echo "1b. Applying router configuration..."
+# Only runs with --setup flag to avoid disrupting an already-configured router
+if [ $SETUP -eq 1 ] && [ -f "$LOCAL_DIR/router_config" ]; then
+    echo "1b. Applying router configuration (--setup)..."
     scp $SCP_OPTS "$LOCAL_DIR/router_config" "$SSH_TARGET:/tmp/router_config" 2>/dev/null
     ssh $SSH_OPTS "$SSH_TARGET" << 'REMOTE' 2>/dev/null
 . /tmp/router_config 2>/dev/null

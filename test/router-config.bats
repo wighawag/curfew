@@ -66,6 +66,7 @@ EOF
     [ "$HARDWARE_OFFLOADING" = "true" ]
 }
 
-@test "install.sh references router_config" {
-    grep -q "router_config" "$SCRIPT_DIR/install.sh"
+@test "install.sh references router_config only with --setup" {
+    grep -q "SETUP" "$SCRIPT_DIR/install.sh"
+    grep -q -- "--setup" "$SCRIPT_DIR/install.sh"
 }
