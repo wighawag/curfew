@@ -5,25 +5,10 @@
 # These are GLOBAL blocks — apply to ALL devices on the network.
 # For per-profile blocking, use /etc/config/parental_websites instead.
 
-# Gambling sites
+# Default lists (smaller lists only - large lists crash dnsmasq on routers)
 https://blocklistproject.github.io/Lists/dnsmasq-version/gambling-dnsmasq.txt
-
-# Porn / adult content
-https://blocklistproject.github.io/Lists/dnsmasq-version/porn-dnsmasq.txt
-
-# Malware
-https://blocklistproject.github.io/Lists/dnsmasq-version/malware-dnsmasq.txt
-
-# Phishing
-https://blocklistproject.github.io/Lists/dnsmasq-version/phishing-dnsmasq.txt
-
-# Ransomware
 https://blocklistproject.github.io/Lists/dnsmasq-version/ransomware-dnsmasq.txt
-
-# Scam
 https://blocklistproject.github.io/Lists/dnsmasq-version/scam-dnsmasq.txt
-
-# Fraud
 https://blocklistproject.github.io/Lists/dnsmasq-version/fraud-dnsmasq.txt
 
 # To add more categories, see https://blocklistproject.github.io/Lists/

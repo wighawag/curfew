@@ -71,8 +71,8 @@ echo "2. Installing scripts..."
 scp $SCP_OPTS "$SCRIPT_DIR/scripts/parental-profiles.sh" "$SSH_TARGET:/usr/bin/parental-profiles.sh" 2>/dev/null
 scp $SCP_OPTS "$SCRIPT_DIR/scripts/setup-firewall.sh" "$SSH_TARGET:/usr/bin/setup-firewall.sh" 2>/dev/null
 scp $SCP_OPTS "$SCRIPT_DIR/scripts/website-blocking.sh" "$SSH_TARGET:/usr/bin/website-blocking.sh" 2>/dev/null
-scp $SCP_OPTS "$SCRIPT_DIR/scripts/blocklists.sh" "$SSH_TARGET:/usr/bin/blocklists.sh" 2>/dev/null
-ssh $SSH_OPTS "$SSH_TARGET" "chmod +x /usr/bin/parental-profiles.sh /usr/bin/setup-firewall.sh /usr/bin/website-blocking.sh /usr/bin/blocklists.sh" 2>/dev/null
+scp $SCP_OPTS "$SCRIPT_DIR/scripts/setup-adguard.sh" "$SSH_TARGET:/usr/bin/setup-adguard.sh" 2>/dev/null
+ssh $SSH_OPTS "$SSH_TARGET" "chmod +x /usr/bin/parental-profiles.sh /usr/bin/setup-firewall.sh /usr/bin/website-blocking.sh /usr/bin/setup-adguard.sh" 2>/dev/null
 ok "Scripts installed"
 
 # Step 3: Copy web interface
@@ -158,7 +158,8 @@ cat > /tmp/parental_crontab << 'EOF'
 # === Parental Control ===
 * * * * * /usr/bin/parental-profiles.sh budget-check
 0 * * * * /usr/bin/website-blocking.sh refresh
-0 3 * * 0 /usr/bin/blocklists.sh update
+# AdGuard Home auto-updates its own blocklists (no cron needed)
+# 0 3 * * 0 /usr/bin/blocklists.sh update
 
 # Internet: block 22:00-08:00
 0 22 * * * /usr/bin/parental-profiles.sh block alice
@@ -270,9 +271,22 @@ chmod +x /etc/init.d/parental-allowlist
 /etc/init.d/parental-allowlist enable' 2>/dev/null
 ok "Boot script enabled"
 
-# Step 9: Show status
-echo "9. Current status:"
-ssh $SSH_OPTS "$SSH_TARGET" "/usr/bin/parental-profiles.sh status 2>/dev/null; echo '---'; /usr/bin/website-blocking.sh status 2>/dev/null; echo '---'; /usr/bin/blocklists.sh status 2>/dev/null" 2>/dev/null || true
+# Step 9: Install AdGuard Home (DNS filtering)
+echo "9. Installing AdGuard Home (DNS filtering)..."
+if ! ssh $SSH_OPTS "$SSH_TARGET" "pgrep AdGuardHome" 2>/dev/null; then
+    ssh $SSH_OPTS "$SSH_TARGET" "/usr/bin/setup-adguard.sh" 2>&1
+    if [ $? -eq 0 ]; then
+        ok "AdGuard Home installed (web UI at http://${ROUTER_IP}:3000)"
+    else
+        skip "AdGuard Home install failed (run manually: ssh root@${ROUTER_IP} setup-adguard.sh)"
+    fi
+else
+    skip "AdGuard Home already running"
+fi
+
+# Step 10: Show status
+echo "10. Current status:"
+ssh $SSH_OPTS "$SSH_TARGET" "/usr/bin/parental-profiles.sh status 2>/dev/null; echo '---'; /usr/bin/website-blocking.sh status 2>/dev/null" 2>/dev/null || true
 
 echo ""
 echo "=== Installation Complete ==="

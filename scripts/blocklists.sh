@@ -79,6 +79,8 @@ update_lists() {
     # Clear old lists
     rm -f "$BLOCKLIST_DIR"/*.txt 2>/dev/null
 
+    local total_domains=0
+
     while read -r url; do
         # Skip comments and empty lines
         case "$url" in
@@ -97,6 +99,10 @@ update_lists() {
             echo "    OK: $count domains"
             downloaded=$((downloaded + 1))
             total_domains=$((total_domains + count))
+            # Safety check: warn if total exceeds 500K domains
+            if [ $total_domains -gt 500000 ]; then
+                echo "    WARNING: Total domains ($total_domains) is high - may crash dnsmasq"
+            fi
         else
             echo "    FAILED"
             failed=$((failed + 1))
