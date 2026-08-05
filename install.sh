@@ -225,9 +225,11 @@ fi
 echo "7. Setting up static IPs..."
 if [ -f "$LOCAL_DIR/device_ips" ]; then
     ssh $SSH_OPTS "$SSH_TARGET" << 'REMOTE' 2>/dev/null
-# Remove old parental static leases
-uci -q delete dhcp.parental_static_leases 2>/dev/null
-uci set dhcp.parental_static_leases=odhcpd 2>/dev/null || true
+# Remove old parental static leases (clean up any previously added host entries)
+# We tag our entries with a comment in the name so we can identify them
+for i in $(uci show dhcp 2>/dev/null | grep 'name.*parental_' | cut -d'.' -f2 | cut -d'=' -f1); do
+    uci -q delete dhcp.$i 2>/dev/null
+done
 
 # Add static leases from config
 while IFS='|' read -r mac ip name; do
@@ -236,10 +238,12 @@ while IFS='|' read -r mac ip name; do
     esac
     [ -z "$mac" ] || [ -z "$ip" ] && continue
     local_name=$(echo "$name" | tr -cd 'a-zA-Z0-9_-')
+    # Skip lines where mac is still TODO
+    echo "$mac" | grep -qi 'todo' && continue
     uci add dhcp host
     uci set dhcp.@host[-1].mac="$mac"
     uci set dhcp.@host[-1].ip="$ip"
-    [ -n "$local_name" ] && uci set dhcp.@host[-1].name="$local_name"
+    [ -n "$local_name" ] && uci set dhcp.@host[-1].name="parental_${local_name}"
 done < /etc/config/device_ips
 uci commit dhcp
 /etc/init.d/dnsmasq restart 2>/dev/null
