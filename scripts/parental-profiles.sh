@@ -330,7 +330,7 @@ check_budget() {
     today=$(get_today)
 
     if [ -z "$profile" ]; then
-        for p in $(cut -d'|' -f1 "$CONFIG" 2>/dev/null); do
+        for p in $(grep -v '^#' "$CONFIG" 2>/dev/null | cut -d'|' -f1); do
             _check_single_budget "$p" "$today"
         done
     else
@@ -372,6 +372,7 @@ show_status() {
     echo "-----------|-------------|-----------|----------|----"
     while IFS='|' read -r name budget macs; do
         [ -z "$name" ] && continue
+        case "$name" in \#*) continue ;; esac
         local status
         status=$(cat "$STATE_DIR/${name}_status" 2>/dev/null || echo "unknown")
         local used
@@ -395,6 +396,7 @@ list_profiles() {
     fi
     while IFS='|' read -r name budget macs; do
         [ -z "$name" ] && continue
+        case "$name" in \#*) continue ;; esac
         if [ "$budget" = "0" ]; then
             echo "  $name: budget=unlimited, devices=$macs"
         else
