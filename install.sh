@@ -62,7 +62,10 @@ skip() { echo -e "  ${YELLOW}SKIP${NC} $1"; }
 
 echo "=== Parental Control Installer ==="
 echo "Router: $SSH_TARGET"
-echo "Mode: $([ $FORCE -eq 1 ] && echo "FORCE" || echo "idempotent")$([ $SETUP -eq 1 ] && echo " + setup" || echo "")
+MODE="idempotent"
+[ $FORCE -eq 1 ] && MODE="FORCE"
+[ $SETUP -eq 1 ] && MODE="$MODE + setup"
+echo "Mode: $MODE"
 echo ""
 
 # Step 1: Test SSH
