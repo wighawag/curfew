@@ -51,6 +51,8 @@ detect_firewall() {
 FIREWALL_BACKEND="${PARENTAL_FIREWALL:-$(detect_firewall)}"
 
 # Ensure state directory exists
+WEBSITE_BLOCKING_BIN="${WEBSITE_BLOCKING:-website-blocking.sh}"
+
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 
 # ----------------------------------------------------------------------------
@@ -242,6 +244,26 @@ issue_ticket() {
 
     unblock_profile "$profile"
 
+    # Also disable any active website blocking rules for this profile
+    # (tickets override everything: internet block + website blocks)
+    # Save which rules were active so we can re-enable them on expiry
+    local saved_rules_file="$STATE_DIR/${profile}_ticket_saved_rules"
+    : > "$saved_rules_file"
+    if [ -n "$(command -v sh 2>/dev/null)" ]; then
+        for f in "$STATE_DIR"/${profile}_*_websites; do
+            [ -f "$f" ] || continue
+            local wstatus
+            wstatus=$(cat "$f")
+            [ "$wstatus" = "enabled" ] || continue
+            local wname
+            wname=$(basename "$f" _websites)
+            local wrule
+            wrule=$(echo "$wname" | sed 's/^[^_]*_//')
+            echo "$wrule" >> "$saved_rules_file"
+            $WEBSITE_BLOCKING_BIN disable "$profile" "$wrule" 2>/dev/null
+        done
+    fi
+
     local timestamp
     timestamp=$($DATE +%s)
     echo "$profile $minutes $timestamp" >> "$STATE_DIR/tickets"
@@ -252,6 +274,13 @@ issue_ticket() {
         (
             $SLEEP $((minutes * 60))
             block_profile "$profile"
+            # Re-enable website blocking rules that were active before the ticket
+            if [ -f "$saved_rules_file" ]; then
+                while read -r wrule; do
+                    [ -n "$wrule" ] && $WEBSITE_BLOCKING_BIN enable "$profile" "$wrule" 2>/dev/null
+                done < "$saved_rules_file"
+                rm -f "$saved_rules_file"
+            fi
             sed -i "/^$profile $minutes $timestamp$/d" "$STATE_DIR/tickets" 2>/dev/null
         ) &
     fi

@@ -112,6 +112,7 @@ upload_config() {
 
 upload_config "$LOCAL_DIR/parental_profiles"  "/etc/config/parental_profiles"   "Profiles + MAC allowlist (single file)"
 upload_config "$LOCAL_DIR/block_rules"       "/etc/config/block_rules"         "Block rules (reusable domain lists)"
+upload_config "$LOCAL_DIR/device_ips"        "/etc/config/device_ips"          "Static IP assignments"
 upload_config "$LOCAL_DIR/parental_blocklists" "/etc/config/parental_blocklists" "Global blocklists"
 
 # Create default blocklists config if neither local nor remote exists
@@ -199,7 +200,6 @@ REMOTE
     ok "Cron installed (default schedule - customize in config/local/crontab)"
 fi
 
-# Step 6: Apply firewall (idempotent)
 echo "6. Applying firewall rules..."
 
 # Check if this is a first install or a re-install
@@ -220,8 +220,36 @@ else
     fi
 fi
 
-# Step 7: Init script for boot
-echo "7. Setting up boot script..."
+# Step 7: Apply static IPs
+echo "7. Setting up static IPs..."
+if [ -f "$LOCAL_DIR/device_ips" ]; then
+    ssh $SSH_OPTS "$SSH_TARGET" << 'REMOTE' 2>/dev/null
+# Remove old parental static leases
+uci -q delete dhcp.parental_static_leases 2>/dev/null
+uci set dhcp.parental_static_leases=odhcpd 2>/dev/null || true
+
+# Add static leases from config
+while IFS='|' read -r mac ip name; do
+    case "$mac" in
+        \#*|"") continue ;;
+    esac
+    [ -z "$mac" ] || [ -z "$ip" ] && continue
+    local_name=$(echo "$name" | tr -cd 'a-zA-Z0-9_-')
+    uci add dhcp host
+    uci set dhcp.@host[-1].mac="$mac"
+    uci set dhcp.@host[-1].ip="$ip"
+    [ -n "$local_name" ] && uci set dhcp.@host[-1].name="$local_name"
+done < /etc/config/device_ips
+uci commit dhcp
+/etc/init.d/dnsmasq restart 2>/dev/null
+REMOTE
+    ok "Static IPs applied from config/local/device_ips"
+else
+    skip "Static IPs (no config/local/device_ips)"
+fi
+
+# Step 8: Init script for boot
+echo "8. Setting up boot script..."
 ssh $SSH_OPTS "$SSH_TARGET" 'cat > /etc/init.d/parental-allowlist << "EOF"
 #!/bin/sh /etc/rc.common
 START=99
@@ -237,8 +265,8 @@ chmod +x /etc/init.d/parental-allowlist
 /etc/init.d/parental-allowlist enable' 2>/dev/null
 ok "Boot script enabled"
 
-# Step 8: Show status
-echo "8. Current status:"
+# Step 9: Show status
+echo "9. Current status:"
 ssh $SSH_OPTS "$SSH_TARGET" "/usr/bin/parental-profiles.sh status 2>/dev/null; echo '---'; /usr/bin/website-blocking.sh status 2>/dev/null; echo '---'; /usr/bin/blocklists.sh status 2>/dev/null" 2>/dev/null || true
 
 echo ""

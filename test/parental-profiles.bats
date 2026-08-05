@@ -17,6 +17,14 @@ setup() {
     export SLEEP="true"  # Don't actually sleep in tests
     export PARENTAL_SKIP_AUTOBLOCK=1  # Don't run background auto-block in tests
     export PARENTAL_FIREWALL="${PARENTAL_FIREWALL:-nft}"  # Test with nft by default
+    export BLOCK_RULES_CONFIG="${BATS_TMPDIR}/block_rules"
+    export WEBSITE_BLOCKING="sh $SCRIPT_DIR/scripts/website-blocking.sh"
+
+    # Block rules for ticket override tests
+    cat > "$BLOCK_RULES_CONFIG" << 'EOF'
+no_streaming|youtube.com,tiktok.com,netflix.com
+no_gaming|roblox.com,steam.com
+EOF
 
     cat > "$PARENTAL_CONFIG" << 'EOF'
 alice|120|aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:02
@@ -143,6 +151,29 @@ teardown() {
     [ "$status" -eq 0 ]
     assert_mac_not_blocked "aa:bb:cc:dd:ee:01"
     assert_mac_not_blocked "aa:bb:cc:dd:ee:02"
+}
+
+@test "ticket overrides website blocking too" {
+    # Enable a website block for alice
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice no_streaming
+    # Verify it's active
+    nft -a list chain inet parental_control forward 2>/dev/null | grep -q "blocked_sites_alice_no_streaming"
+
+    # Issue ticket - should disable website blocking
+    run sh "$SCRIPT" ticket alice 30
+    [ "$status" -eq 0 ]
+    # Website blocking should be disabled
+    ! nft -a list chain inet parental_control forward 2>/dev/null | grep -q "blocked_sites_alice_no_streaming"
+    # Internet should be unblocked too
+    assert_mac_not_blocked "aa:bb:cc:dd:ee:01"
+}
+
+@test "ticket saves active website rules for re-enabling" {
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice no_streaming
+    sh "$SCRIPT" ticket alice 30
+    # Saved rules file should exist with the rule name
+    [ -f "$PARENTAL_STATE_DIR/alice_ticket_saved_rules" ]
+    grep -q "no_streaming" "$PARENTAL_STATE_DIR/alice_ticket_saved_rules"
 }
 
 @test "ticket records entry in tickets file" {

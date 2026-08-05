@@ -1,0 +1,20 @@
+# Static IP assignments for devices
+# Format: mac_address|ip_address|name
+# These are applied as dnsmasq static leases on the router.
+# IPs should be outside your DHCP pool or within it (dnsmasq reserves them).
+#
+# This is optional but useful for:
+# - Consistent device identification in logs
+# - Port forwarding
+# - The parental control works on MAC addresses, so static IPs are not required
+
+aa:bb:cc:00:00:04|192.168.1.10|device_a
+aa:bb:cc:00:00:01|192.168.1.11|device_b
+AA:BB:CC:00:00:09|192.168.1.20|printer
+
+aa:bb:cc:dd:ee:01|192.168.1.50|device_d
+aa:bb:cc:dd:ee:02|192.168.1.51|eli_laptop
+aa:bb:cc:dd:ee:03|192.168.1.52|ishan_phone
+aa:bb:cc:dd:ee:04|192.168.1.53|ishan_laptop
+aa:bb:cc:dd:ee:05|192.168.1.54|device_e
+aa:bb:cc:dd:ee:06|192.168.1.55|tia_tablet
