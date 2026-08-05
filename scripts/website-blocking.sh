@@ -21,7 +21,6 @@
 set -u
 
 BLOCK_RULES_CONFIG="${BLOCK_RULES_CONFIG:-/etc/config/block_rules}"
-WEBSITES_CONFIG="${PARENTAL_WEBSITES_CONFIG:-/etc/config/parental_websites}"
 PROFILES_CONFIG="${PARENTAL_CONFIG:-/etc/config/parental_profiles}"
 STATE_DIR="${PARENTAL_STATE_DIR:-/tmp/parental-profiles}"
 NFT_BIN="${NFT:-nft}"
@@ -49,13 +48,6 @@ get_rule_domains() {
 # Check if a rule is defined in block_rules
 rule_exists() {
     grep -q "^$1|" "$BLOCK_RULES_CONFIG" 2>/dev/null
-}
-
-# Check if a profile+rule association exists in parental_websites
-association_exists() {
-    local profile="$1"
-    local rule="$2"
-    grep -q "^${profile}|${rule}$\|^${profile}|${rule}|" "$WEBSITES_CONFIG" 2>/dev/null
 }
 
 # Get the nftables set name for a profile+rule
@@ -165,39 +157,26 @@ disable_profile() {
     return 0
 }
 
-# Show status
+# Show status of currently active website blocking (from state files)
 show_status() {
-    echo "Profile/Rule           | Status"
-    echo "-----------------------|--------"
-    if [ ! -f "$WEBSITES_CONFIG" ]; then
-        echo "(no config at $WEBSITES_CONFIG)"
-        return 0
-    fi
-    while IFS='|' read -r profile rule; do
-        [ -z "$profile" ] && continue
-        [ -z "$rule" ] && continue
+    echo "Active website blocking:"
+    local found=0
+    for f in "$STATE_DIR"/*_websites; do
+        [ -f "$f" ] || continue
         local status
-        status=$(cat "$STATE_DIR/${profile}_${rule}_websites" 2>/dev/null || echo "disabled")
-        printf "%-22s | %s\n" "$profile/$rule" "$status"
-    done < "$WEBSITES_CONFIG"
-}
-
-# List all associations
-list_profiles() {
-    echo "Website blocking associations:"
-    if [ ! -f "$WEBSITES_CONFIG" ]; then
-        echo "  (no config at $WEBSITES_CONFIG)"
-        return 0
+        status=$(cat "$f")
+        [ "$status" = "enabled" ] || continue
+        local name
+        name=$(basename "$f" _websites)
+        local profile rule
+        profile=$(echo "$name" | sed 's/_.*//')
+        rule=$(echo "$name" | sed 's/^[^_]*_//')
+        printf "  %-22s | %s\n" "$profile/$rule" "$status"
+        found=1
+    done
+    if [ $found -eq 0 ]; then
+        echo "  (none active)"
     fi
-    while IFS='|' read -r profile rule; do
-        [ -z "$profile" ] && continue
-        [ -z "$rule" ] && continue
-        local status
-        status=$(cat "$STATE_DIR/${profile}_${rule}_websites" 2>/dev/null || echo "disabled")
-        local domains
-        domains=$(get_rule_domains "$rule" | tr '\n' ',' | sed 's/,$//')
-        echo "  $profile/$rule: domains=$domains, status=$status"
-    done < "$WEBSITES_CONFIG"
 }
 
 # List all defined block rules
@@ -215,20 +194,22 @@ list_rules() {
     done < "$BLOCK_RULES_CONFIG"
 }
 
-# Refresh all enabled rules (re-resolve domains)
+
+
+# Refresh all currently enabled rules (re-resolve domains)
 refresh_all() {
-    if [ ! -f "$WEBSITES_CONFIG" ]; then
-        return 0
-    fi
-    while IFS='|' read -r profile rule; do
-        [ -z "$profile" ] && continue
-        [ -z "$rule" ] && continue
+    for f in "$STATE_DIR"/*_websites; do
+        [ -f "$f" ] || continue
         local status
-        status=$(cat "$STATE_DIR/${profile}_${rule}_websites" 2>/dev/null || echo "disabled")
-        if [ "$status" = "enabled" ]; then
-            enable_profile "$profile" "$rule" 2>/dev/null
-        fi
-    done < "$WEBSITES_CONFIG"
+        status=$(cat "$f")
+        [ "$status" = "enabled" ] || continue
+        local name
+        name=$(basename "$f" _websites)
+        local profile rule
+        profile=$(echo "$name" | sed 's/_.*//')
+        rule=$(echo "$name" | sed 's/^[^_]*_//')
+        enable_profile "$profile" "$rule" 2>/dev/null
+    done
     log "Refreshed all website blocking rules"
 }
 
@@ -237,8 +218,7 @@ usage() {
 Usage: website-blocking.sh <command> [args]
 
 Commands:
-  status                        Show status of all profile/rule associations
-  list                          List all associations (with domains)
+  status                        Show currently active website blocking
   rules                         List all defined block rules
   enable <profile> <rule>       Enable website blocking for a profile
   disable <profile> <rule>      Disable website blocking for a profile
@@ -246,8 +226,8 @@ Commands:
 
 Config files:
   $BLOCK_RULES_CONFIG       rule_name|domain1,domain2,...
-  $WEBSITES_CONFIG          profile_name|rule_name
   $PROFILES_CONFIG          profile_name|budget|mac1,mac2,...
+  crontab                       schedule (enable/disable at set times)
 
 Cron examples:
   0 20 * * * /usr/bin/website-blocking.sh enable eli no_streaming
@@ -269,9 +249,6 @@ case "${1:-}" in
         ;;
     status)
         show_status
-        ;;
-    list)
-        list_profiles
         ;;
     rules)
         list_rules

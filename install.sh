@@ -112,7 +112,6 @@ upload_config() {
 
 upload_config "$LOCAL_DIR/parental_profiles"  "/etc/config/parental_profiles"   "Profiles + MAC allowlist (single file)"
 upload_config "$LOCAL_DIR/block_rules"       "/etc/config/block_rules"         "Block rules (reusable domain lists)"
-upload_config "$LOCAL_DIR/parental_websites"  "/etc/config/parental_websites"   "Website blocking associations"
 upload_config "$LOCAL_DIR/parental_blocklists" "/etc/config/parental_blocklists" "Global blocklists"
 
 # Create default blocklists config if neither local nor remote exists

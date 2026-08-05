@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Tests for website-blocking.sh (reusable block rules)
+# Tests for website-blocking.sh (reusable block rules, no associations file)
 
 load "${BATS_TEST_DIRNAME}/test_helper/mocks"
 
@@ -8,7 +8,6 @@ SCRIPT_DIR="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
 setup() {
     export PARENTAL_FIREWALL="nft"
     export PARENTAL_CONFIG="${BATS_TMPDIR}/parental_profiles"
-    export PARENTAL_WEBSITES_CONFIG="${BATS_TMPDIR}/parental_websites"
     export BLOCK_RULES_CONFIG="${BATS_TMPDIR}/block_rules"
     export PARENTAL_STATE_DIR="${BATS_TMPDIR}/parental-state"
     export MOCK_LOG_DIR="/tmp/mock-state"
@@ -41,15 +40,6 @@ no_gaming|roblox.com,steam.com,epicgames.com
 no_social|tiktok.com,snapchat.com,instagram.com
 EOF
 
-    # Associations (which profiles use which rules)
-    cat > "$PARENTAL_WEBSITES_CONFIG" << 'EOF'
-eli|no_streaming
-eli|no_gaming
-ishan|no_streaming
-ishan|no_gaming
-tia|no_streaming
-EOF
-
     rm -rf "$PARENTAL_STATE_DIR"
     mkdir -p "$PARENTAL_STATE_DIR" "$MOCK_LOG_DIR"
     reset_mocks
@@ -78,37 +68,29 @@ teardown() {
 }
 
 # ---------------------------------------------------------------------------
-# Associations / list / status
+# Status (from state files, not a config file)
 # ---------------------------------------------------------------------------
 
-@test "list shows all associations" {
-    run sh "$SCRIPT_DIR/scripts/website-blocking.sh" list
+@test "status shows none active initially" {
+    run sh "$SCRIPT_DIR/scripts/website-blocking.sh" status
     [ "$status" -eq 0 ]
-    echo "$output" | grep -q "eli/no_streaming"
-    echo "$output" | grep -q "eli/no_gaming"
-    echo "$output" | grep -q "ishan/no_streaming"
-    echo "$output" | grep -q "tia/no_streaming"
+    echo "$output" | grep -qi "none active"
 }
 
-@test "list shows domains from block_rules (not duplicated)" {
-    run sh "$SCRIPT_DIR/scripts/website-blocking.sh" list
-    [ "$status" -eq 0 ]
-    # Domains should appear for each association
-    echo "$output" | grep -q "youtube.com"
-    echo "$output" | grep -q "roblox.com"
-}
-
-@test "status shows all associations" {
+@test "status shows active blocks after enable" {
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable eli no_streaming
     run sh "$SCRIPT_DIR/scripts/website-blocking.sh" status
     [ "$status" -eq 0 ]
     echo "$output" | grep -q "eli/no_streaming"
-    echo "$output" | grep -q "tia/no_streaming"
+    echo "$output" | grep -q "enabled"
 }
 
-@test "status shows disabled initially" {
+@test "status does not show disabled blocks" {
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable eli no_streaming
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" disable eli no_streaming
     run sh "$SCRIPT_DIR/scripts/website-blocking.sh" status
     [ "$status" -eq 0 ]
-    echo "$output" | grep -q "disabled"
+    echo "$output" | grep -qi "none active"
 }
 
 # ---------------------------------------------------------------------------
@@ -175,7 +157,6 @@ teardown() {
     sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable eli no_streaming
     sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable eli no_gaming
     sh "$SCRIPT_DIR/scripts/website-blocking.sh" disable eli no_streaming
-    # no_gaming should still be active
     nft -a list chain inet parental_control forward 2>/dev/null | grep -q "blocked_sites_eli_no_gaming"
     ! nft -a list chain inet parental_control forward 2>/dev/null | grep -q "blocked_sites_eli_no_streaming"
 }
@@ -185,6 +166,28 @@ teardown() {
     sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable ishan no_streaming
     nft -a list chain inet parental_control forward 2>/dev/null | grep -q "blocked_sites_eli_no_streaming"
     nft -a list chain inet parental_control forward 2>/dev/null | grep -q "blocked_sites_ishan_no_streaming"
+}
+
+# ---------------------------------------------------------------------------
+# Refresh (from state files)
+# ---------------------------------------------------------------------------
+
+@test "refresh re-enables all active rules" {
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable eli no_streaming
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable ishan no_gaming
+    run sh "$SCRIPT_DIR/scripts/website-blocking.sh" refresh
+    [ "$status" -eq 0 ]
+    # Both should still be active
+    nft list set inet parental_control blocked_sites_eli_no_streaming 2>/dev/null
+    nft list set inet parental_control blocked_sites_ishan_no_gaming 2>/dev/null
+}
+
+@test "refresh does not re-enable disabled rules" {
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable eli no_streaming
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" disable eli no_streaming
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" refresh
+    # Should not be re-enabled
+    ! nft -a list chain inet parental_control forward 2>/dev/null | grep -q "blocked_sites_eli_no_streaming"
 }
 
 # ---------------------------------------------------------------------------
