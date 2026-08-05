@@ -300,11 +300,12 @@ fi
 # Step 7: Apply static IPs
 echo "7. Setting up static IPs..."
 if [ -f "$LOCAL_DIR/device_ips" ]; then
-    ssh $SSH_OPTS "$SSH_TARGET" << 'REMOTE' 2>/dev/null
-# Remove old parental static leases (clean up any previously added host entries)
-# We tag our entries with a comment in the name so we can identify them
-for i in $(uci show dhcp 2>/dev/null | grep 'name.*parental_' | cut -d'.' -f2 | cut -d'=' -f1); do
-    uci -q delete dhcp.$i 2>/dev/null
+    # Write a script to the router and execute it (avoids banner polluting heredoc)
+    cat > /tmp/apply_static_ips.sh << 'SCRIPT'
+#!/bin/sh
+# Remove old parental static leases
+for section in $(uci show dhcp 2>/dev/null | grep 'name.*parental_' | cut -d'.' -f2 | cut -d= -f1); do
+    uci -q delete dhcp.$section 2>/dev/null
 done
 
 # Add static leases from config
@@ -313,17 +314,22 @@ while IFS='|' read -r mac ip name; do
         \#*|"") continue ;;
     esac
     [ -z "$mac" ] || [ -z "$ip" ] && continue
-    local_name=$(echo "$name" | tr -cd 'a-zA-Z0-9_-')
-    # Skip lines where mac is still TODO
+    clean_name=$(echo "$name" | tr -cd 'a-zA-Z0-9_-')
     echo "$mac" | grep -qi 'todo' && continue
     uci add dhcp host
     uci set dhcp.@host[-1].mac="$mac"
     uci set dhcp.@host[-1].ip="$ip"
-    [ -n "$local_name" ] && uci set dhcp.@host[-1].name="parental_${local_name}"
+    [ -n "$clean_name" ] && uci set dhcp.@host[-1].name="parental_${clean_name}"
 done < /etc/config/device_ips
 uci commit dhcp
+# Clear existing leases for devices that got new IPs
+grep -v '^#' /etc/config/device_ips 2>/dev/null | awk -F'|' '{print $1}' | while read -r mac; do
+    [ -n "$mac" ] && sed -i "/$mac/d" /tmp/dhcp.leases 2>/dev/null
+done
 /etc/init.d/dnsmasq restart 2>/dev/null
-REMOTE
+SCRIPT
+    scp $SCP_OPTS /tmp/apply_static_ips.sh "$SSH_TARGET:/tmp/apply_static_ips.sh" 2>/dev/null
+    ssh $SSH_OPTS "$SSH_TARGET" "sh /tmp/apply_static_ips.sh; rm -f /tmp/apply_static_ips.sh" 2>/dev/null
     ok "Static IPs applied from config/local/device_ips"
 else
     skip "Static IPs (no config/local/device_ips)"
