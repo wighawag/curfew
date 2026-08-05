@@ -35,9 +35,10 @@ bob|90|aa:bb:cc:dd:ee:03,aa:bb:cc:dd:ee:04
 teen|0|aa:bb:cc:dd:ee:05,aa:bb:cc:dd:ee:06
 EOF
 
-    # Website blocking config
+    # Website blocking config (with groups)
     cat > "$PARENTAL_WEBSITES_CONFIG" << 'EOF'
-alice|youtube.com,www.youtube.com,tiktok.com
+alice|after_school|youtube.com,www.youtube.com,tiktok.com
+alice|evening|youtube.com,www.youtube.com,tiktok.com,netflix.com
 bob|tiktok.com,snapchat.com
 EOF
 
@@ -87,30 +88,26 @@ teardown() {
 # Enable / Disable
 # ---------------------------------------------------------------------------
 
-@test "enable creates nftables set for profile" {
-    run sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice
+@test "enable creates nftables set for profile+group" {
+    run sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice after_school
     [ "$status" -eq 0 ]
-    # The set should exist
-    nft list set inet parental_control blocked_sites_alice 2>/dev/null
+    nft list set inet parental_control blocked_sites_alice_after_school 2>/dev/null
 }
 
 @test "enable creates nftables rules for each MAC" {
-    run sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice
+    run sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice after_school
     [ "$status" -eq 0 ]
-    # Check that rules exist for alice's MACs
     nft -a list chain inet parental_control forward 2>/dev/null | grep -q "aa:bb:cc:dd:ee:01"
     nft -a list chain inet parental_control forward 2>/dev/null | grep -q "aa:bb:cc:dd:ee:02"
 }
 
 @test "disable removes nftables rules" {
-    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice
-    # Verify rules exist
-    nft -a list chain inet parental_control forward 2>/dev/null | grep -q "blocked_sites_alice"
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice after_school
+    nft -a list chain inet parental_control forward 2>/dev/null | grep -q "blocked_sites_alice_after_school"
 
-    run sh "$SCRIPT_DIR/scripts/website-blocking.sh" disable alice
+    run sh "$SCRIPT_DIR/scripts/website-blocking.sh" disable alice after_school
     [ "$status" -eq 0 ]
-    # Rules should be gone
-    ! nft -a list chain inet parental_control forward 2>/dev/null | grep -q "blocked_sites_alice"
+    ! nft -a list chain inet parental_control forward 2>/dev/null | grep -q "blocked_sites_alice_after_school"
 }
 
 @test "enable on non-existent profile fails" {
@@ -118,22 +115,26 @@ teardown() {
     [ "$status" -ne 0 ]
 }
 
+@test "enable on non-existent group fails" {
+    run sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice nonexistent_group
+    [ "$status" -ne 0 ]
+}
+
 @test "enable writes state file" {
-    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice
-    [ "$(cat "$PARENTAL_STATE_DIR/alice_websites")" = "enabled" ]
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice after_school
+    [ "$(cat "$PARENTAL_STATE_DIR/alice_after_school_websites")" = "enabled" ]
 }
 
 @test "disable writes state file" {
-    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice
-    sh "$SCRIPT_DIR/scripts/website-blocking.sh" disable alice
-    [ "$(cat "$PARENTAL_STATE_DIR/alice_websites")" = "disabled" ]
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice after_school
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" disable alice after_school
+    [ "$(cat "$PARENTAL_STATE_DIR/alice_after_school_websites")" = "disabled" ]
 }
 
 @test "enable is idempotent (enabling twice doesn't create duplicate rules)" {
-    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice
-    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice
-    # Should only have rules for 2 MACs (alice has 2 devices)
-    count=$(nft -a list chain inet parental_control forward 2>/dev/null | grep -c "blocked_sites_alice")
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice after_school
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice after_school
+    count=$(nft -a list chain inet parental_control forward 2>/dev/null | grep -c "blocked_sites_alice_after_school")
     [ "$count" -eq 2 ]
 }
 
@@ -142,25 +143,16 @@ teardown() {
 # ---------------------------------------------------------------------------
 
 @test "website blocking is independent of internet blocking" {
-    # Block internet for alice
     sh "$SCRIPT_DIR/scripts/parental-profiles.sh" block alice
-
-    # Enable website blocking for alice
-    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice
-
-    # Unblock internet for alice
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice after_school
     sh "$SCRIPT_DIR/scripts/parental-profiles.sh" unblock alice
-
-    # Website blocking rules should still be active
-    nft -a list chain inet parental_control forward 2>/dev/null | grep -q "blocked_sites_alice"
+    nft -a list chain inet parental_control forward 2>/dev/null | grep -q "blocked_sites_alice_after_school"
 }
 
 @test "disabling internet unblock does not affect website blocking" {
-    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice after_school
     sh "$SCRIPT_DIR/scripts/parental-profiles.sh" unblock alice
-
-    # Website rules should still exist
-    nft -a list chain inet parental_control forward 2>/dev/null | grep -q "blocked_sites_alice"
+    nft -a list chain inet parental_control forward 2>/dev/null | grep -q "blocked_sites_alice_after_school"
 }
 
 # ---------------------------------------------------------------------------
@@ -181,4 +173,56 @@ teardown() {
 @test "disable without profile name fails" {
     run sh "$SCRIPT_DIR/scripts/website-blocking.sh" disable
     [ "$status" -ne 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# Groups: different domain lists at different times
+# ---------------------------------------------------------------------------
+
+@test "different groups can be active simultaneously" {
+    # Enable after_school group
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice after_school
+    # Enable evening group (different domains) at the same time
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice evening
+
+    # Both groups should have rules
+    nft -a list chain inet parental_control forward 2>/dev/null | grep -q "blocked_sites_alice_after_school"
+    nft -a list chain inet parental_control forward 2>/dev/null | grep -q "blocked_sites_alice_evening"
+}
+
+@test "disabling one group does not affect the other" {
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice after_school
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice evening
+
+    # Disable after_school
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" disable alice after_school
+
+    # evening should still be active
+    nft -a list chain inet parental_control forward 2>/dev/null | grep -q "blocked_sites_alice_evening"
+    # after_school should be gone
+    ! nft -a list chain inet parental_control forward 2>/dev/null | grep -q "blocked_sites_alice_after_school"
+}
+
+@test "each group has its own nftables set" {
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice after_school
+    sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable alice evening
+
+    # Both sets should exist with different names
+    nft list set inet parental_control blocked_sites_alice_after_school 2>/dev/null
+    nft list set inet parental_control blocked_sites_alice_evening 2>/dev/null
+}
+
+@test "backward compatible with 2-field format (no group)" {
+    # bob uses 2-field format (no group) - should use 'default' group
+    run sh "$SCRIPT_DIR/scripts/website-blocking.sh" enable bob
+    [ "$status" -eq 0 ]
+    nft list set inet parental_control blocked_sites_bob_default 2>/dev/null
+}
+
+@test "status shows groups" {
+    run sh "$SCRIPT_DIR/scripts/website-blocking.sh" status
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "alice/after_school"
+    echo "$output" | grep -q "alice/evening"
+    echo "$output" | grep -q "bob/default"
 }

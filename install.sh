@@ -160,10 +160,16 @@ cat > /tmp/crontab << 'EOF'
 0 21 * * 6,0 /usr/bin/parental-profiles.sh block alice
 0 21 * * 6,0 /usr/bin/parental-profiles.sh block bob
 
-# === Website blocking schedules (independent of internet) ===
-# Block YouTube after school until 17:00 (weekdays)
-30 15 * * 1-5 /usr/bin/website-blocking.sh enable alice
-0 17 * * 1-5 /usr/bin/website-blocking.sh disable alice
+# === Website blocking schedules (independent of internet, per group) ===
+# After school: block YouTube + TikTok (weekdays)
+30 15 * * 1-5 /usr/bin/website-blocking.sh enable alice after_school
+0 17 * * 1-5 /usr/bin/website-blocking.sh disable alice after_school
+# Evening: block all streaming (different domain list)
+0 18 * * * /usr/bin/website-blocking.sh enable alice evening
+0 20 * * * /usr/bin/website-blocking.sh disable alice evening
+# Bob: block TikTok all day (uses default group)
+0 7 * * * /usr/bin/website-blocking.sh enable bob
+0 20 * * * /usr/bin/website-blocking.sh disable bob
 EOF
 
 # Merge with existing crontab (don't overwrite other jobs)

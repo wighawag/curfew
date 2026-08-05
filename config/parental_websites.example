@@ -1,17 +1,25 @@
 # Per-profile website blocking configuration
-# Format: profile_name|domain1,domain2,domain3
 #
-# Domains listed here will be blocked for the profile's devices
-# when website-blocking.sh enable <profile> is called.
+# Format (with groups):
+#   profile_name|group_name|domain1,domain2,domain3
 #
-# The profile names must match those in /etc/config/parental_profiles
-# The MACs are read from parental_profiles, not from this file.
+# Format (without groups, backward compatible):
+#   profile_name|domain1,domain2,domain3
+#   (uses the "default" group)
+#
+# Groups let you have different domain lists for different time periods:
+#   website-blocking.sh enable alice after_school
+#   website-blocking.sh enable alice evening
+#
+# Profile names must match those in /etc/config/parental_profiles.
+# MACs are read from parental_profiles, not from this file.
 
-# Alice: block YouTube and TikTok
-alice|youtube.com,www.youtube.com,tiktok.com,www.tiktok.com
+# Alice: different blocks at different times
+alice|after_school|youtube.com,www.youtube.com,tiktok.com,www.tiktok.com
+alice|evening|youtube.com,www.youtube.com,tiktok.com,www.tiktok.com,netflix.com,www.netflix.com,disneyplus.com,www.disneyplus.com
 
-# Bob: block TikTok and Snapchat
+# Bob: same blocks all day (uses default group)
 bob|tiktok.com,www.tiktok.com,snapchat.com,www.snapchat.com
 
 # Teen: block Reddit during study time
-teen|reddit.com,www.reddit.com
+teen|study_time|reddit.com,www.reddit.com
