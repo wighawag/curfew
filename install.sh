@@ -322,9 +322,9 @@ while IFS='|' read -r mac ip name; do
     [ -n "$clean_name" ] && uci set dhcp.@host[-1].name="parental_${clean_name}"
 done < /etc/config/device_ips
 uci commit dhcp
-# Clear existing leases for devices that got new IPs
-grep -v '^#' /etc/config/device_ips 2>/dev/null | awk -F'|' '{print $1}' | while read -r mac; do
-    [ -n "$mac" ] && sed -i "/$mac/d" /tmp/dhcp.leases 2>/dev/null
+# Clear existing leases for devices that got new IPs (case-insensitive)
+grep -v '^#' /etc/config/device_ips 2>/dev/null | awk -F'|' '{tolower($1); print tolower($1)}' | while read -r mac; do
+    [ -n "$mac" ] && sed -i "/$mac/Id" /tmp/dhcp.leases 2>/dev/null
 done
 /etc/init.d/dnsmasq restart 2>/dev/null
 SCRIPT
