@@ -16,6 +16,7 @@ setup() {
     export PARENTAL_LAN_IF="br-lan"
     export SLEEP="true"  # Don't actually sleep in tests
     export PARENTAL_SKIP_AUTOBLOCK=1  # Don't run background auto-block in tests
+    export PARENTAL_FIREWALL="${PARENTAL_FIREWALL:-nft}"  # Test with nft by default
 
     cat > "$PARENTAL_CONFIG" << 'EOF'
 alice|120|aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:02
@@ -109,8 +110,15 @@ teardown() {
 @test "block is idempotent (blocking twice doesn't add duplicate rules)" {
     sh "$SCRIPT" block alice
     sh "$SCRIPT" block alice
-    # Should only have one DROP rule per MAC
-    count=$(grep -c "^DROP aa:bb:cc:dd:ee:01$" "$MOCK_LOG_DIR/iptables_state")
+    # Should only have one entry per MAC (check nft_state for nft backend)
+    local state_file
+    if [ "${PARENTAL_FIREWALL:-nft}" = "iptables" ]; then
+        state_file="$MOCK_LOG_DIR/iptables_state"
+        count=$(grep -c "^DROP aa:bb:cc:dd:ee:01$" "$state_file")
+    else
+        state_file="$MOCK_LOG_DIR/nft_state"
+        count=$(grep -c "^aa:bb:cc:dd:ee:01$" "$state_file")
+    fi
     [ "$count" -eq 1 ]
 }
 
@@ -284,4 +292,67 @@ teardown() {
     run sh "$SCRIPT" reset alice
     [ "$status" -eq 0 ]
     [ "$(cat "$PARENTAL_STATE_DIR/alice_used")" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# Firewall backend
+# ---------------------------------------------------------------------------
+
+@test "backend shows nft when nft is available" {
+    export PARENTAL_FIREWALL=""
+    run sh "$SCRIPT" backend
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "nft"
+}
+
+@test "block works with nft backend" {
+    export PARENTAL_FIREWALL="nft"
+    run sh "$SCRIPT" block alice
+    [ "$status" -eq 0 ]
+    assert_mac_blocked "aa:bb:cc:dd:ee:01"
+    assert_mac_blocked "aa:bb:cc:dd:ee:02"
+}
+
+@test "unblock works with nft backend" {
+    export PARENTAL_FIREWALL="nft"
+    sh "$SCRIPT" block alice
+    run sh "$SCRIPT" unblock alice
+    [ "$status" -eq 0 ]
+    assert_mac_not_blocked "aa:bb:cc:dd:ee:01"
+}
+
+@test "ticket works with nft backend" {
+    export PARENTAL_FIREWALL="nft"
+    sh "$SCRIPT" block alice
+    run sh "$SCRIPT" ticket alice 30
+    [ "$status" -eq 0 ]
+    assert_mac_not_blocked "aa:bb:cc:dd:ee:01"
+}
+
+@test "block works with iptables backend" {
+    export PARENTAL_FIREWALL="iptables"
+    run sh "$SCRIPT" block alice
+    [ "$status" -eq 0 ]
+    assert_mac_blocked "aa:bb:cc:dd:ee:01"
+}
+
+@test "unblock works with iptables backend" {
+    export PARENTAL_FIREWALL="iptables"
+    sh "$SCRIPT" block alice
+    run sh "$SCRIPT" unblock alice
+    [ "$status" -eq 0 ]
+    assert_mac_not_blocked "aa:bb:cc:dd:ee:01"
+}
+
+@test "status shows firewall backend" {
+    run sh "$SCRIPT" status
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "Firewall backend"
+}
+
+@test "status shows blocked MACs" {
+    sh "$SCRIPT" block alice
+    run sh "$SCRIPT" status
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "aa:bb:cc:dd:ee:01"
 }

@@ -2,8 +2,12 @@
 # ============================================================================
 # parental-profiles.sh - Profile-based parental control for OpenWrt
 #
-# Manages internet access for groups of devices (profiles). Each profile
-# contains multiple MAC addresses (e.g. a child's phone + laptop).
+# Works with both nftables (default in OpenWrt 22.03+) and iptables.
+# Auto-detects which firewall is available.
+#
+# Uses a dedicated nftables table (inet parental_control) with MAC address sets.
+# This is cleaner than adding individual rules and doesn't mix with fw4.
+#
 # Features:
 #   - Block/unblock all devices in a profile
 #   - Time-limited tickets (temporary unblock, auto-expires)
@@ -12,22 +16,39 @@
 #
 # Config file: /etc/config/parental_profiles
 # Format: profile_name|budget_minutes_per_day|mac1,mac2,mac3
-#   - budget of 0 means unlimited (schedule-only)
 #
 # Author: wighawag
 # License: AGPL-3.0-only
 # ============================================================================
 
-set -u  # Error on unset variables, but don't exit on non-zero (needed for function returns)
+set -u  # Error on unset variables
 
 CONFIG="${PARENTAL_CONFIG:-/etc/config/parental_profiles}"
 STATE_DIR="${PARENTAL_STATE_DIR:-/tmp/parental-profiles}"
 WAN_IF="${PARENTAL_WAN_IF:-$(uci get network.wan.device 2>/dev/null || echo "eth1")}"
 LAN_IF="${PARENTAL_LAN_IF:-br-lan}"
-IPTABLES="${IPTABLES:-iptables}"
 LOGGER="${LOGGER:-logger}"
 SLEEP="${SLEEP:-sleep}"
 DATE="${DATE:-date}"
+
+# Firewall backend detection
+NFT_BIN="${NFT:-nft}"
+IPTABLES_BIN="${IPTABLES:-iptables}"
+NFT_TABLE="parental_control"
+NFT_SET="blocked_macs"
+
+# Detect which firewall backend to use
+detect_firewall() {
+    if command -v "$NFT_BIN" >/dev/null 2>&1 && $NFT_BIN list tables 2>/dev/null | grep -q .; then
+        echo "nft"
+    elif command -v "$IPTABLES_BIN" >/dev/null 2>&1; then
+        echo "iptables"
+    else
+        echo "none"
+    fi
+}
+
+FIREWALL_BACKEND="${PARENTAL_FIREWALL:-$(detect_firewall)}"
 
 # Ensure state directory exists
 mkdir -p "$STATE_DIR" 2>/dev/null || true
@@ -36,67 +57,132 @@ mkdir -p "$STATE_DIR" 2>/dev/null || true
 # Utility functions
 # ----------------------------------------------------------------------------
 
-# Log a message via syslog (or stderr if logger unavailable)
 log() {
     $LOGGER -t parental "$1" 2>/dev/null || echo "[parental] $1" >&2
 }
 
-# Read a profile's MAC addresses (space-separated)
-# $1 = profile name
 get_profile_macs() {
     grep "^$1|" "$CONFIG" 2>/dev/null | cut -d'|' -f3 | tr ',' ' '
 }
 
-# Read a profile's daily budget in minutes
-# $1 = profile name
-# Returns: budget minutes, or 0 if unlimited/not found
 get_profile_budget() {
     local budget
     budget=$(grep "^$1|" "$CONFIG" 2>/dev/null | cut -d'|' -f2)
     echo "${budget:-0}"
 }
 
-# Check if a profile exists in the config
-# $1 = profile name
-# Returns: 0 if exists, 1 if not
 profile_exists() {
     grep -q "^$1|" "$CONFIG" 2>/dev/null
 }
 
-# Check if a MAC is currently blocked (has a DROP rule in FORWARD chain)
-# $1 = MAC address
-# Returns: 0 if blocked, 1 if not
-is_mac_blocked() {
-    $IPTABLES -C FORWARD -m mac --mac-source "$1" -j DROP 2>/dev/null
+# ----------------------------------------------------------------------------
+# nftables operations
+# ----------------------------------------------------------------------------
+
+# Initialize the nftables table and set (idempotent)
+nft_init() {
+    $NFT_BIN list table inet "$NFT_TABLE" 2>/dev/null && return 0
+    $NFT_BIN add table inet "$NFT_TABLE" 2>/dev/null
+    $NFT_BIN add chain inet "$NFT_TABLE" forward '{ type filter hook forward priority -10; policy accept; }' 2>/dev/null
+    $NFT_BIN add set inet "$NFT_TABLE" "$NFT_SET" '{ type ether_addr; }' 2>/dev/null
+    $NFT_BIN add rule inet "$NFT_TABLE" forward ether saddr "@$NFT_SET" drop 2>/dev/null
+}
+
+# Block a MAC via nftables (add to set)
+nft_block_mac() {
+    local mac="$1"
+    nft_init
+    $NFT_BIN add element inet "$NFT_TABLE" "$NFT_SET" "{ $mac }" 2>/dev/null
+}
+
+# Unblock a MAC via nftables (remove from set)
+nft_unblock_mac() {
+    local mac="$1"
+    $NFT_BIN delete element inet "$NFT_TABLE" "$NFT_SET" "{ $mac }" 2>/dev/null
+}
+
+# Check if a MAC is blocked via nftables
+nft_is_mac_blocked() {
+    local mac="$1"
+    $NFT_BIN get element inet "$NFT_TABLE" "$NFT_SET" "{ $mac }" 2>/dev/null
+}
+
+# List all blocked MACs via nftables
+nft_list_blocked() {
+    $NFT_BIN list set inet "$NFT_TABLE" "$NFT_SET" 2>/dev/null | grep -o '[0-9a-fA-F:]\{17\}'
 }
 
 # ----------------------------------------------------------------------------
-# Firewall operations
+# iptables operations (fallback)
 # ----------------------------------------------------------------------------
 
-# Block a single MAC address (idempotent)
-# $1 = MAC address
-block_mac() {
+iptables_block_mac() {
     local mac="$1"
-    if is_mac_blocked "$mac"; then
-        return 0
-    fi
-    $IPTABLES -I FORWARD 1 -m mac --mac-source "$mac" -j DROP 2>/dev/null
-    log "Blocked MAC: $mac"
+    $IPTABLES_BIN -C FORWARD -m mac --mac-source "$mac" -j DROP 2>/dev/null && return 0
+    $IPTABLES_BIN -I FORWARD 1 -m mac --mac-source "$mac" -j DROP 2>/dev/null
 }
 
-# Unblock a single MAC address (idempotent)
-# $1 = MAC address
-unblock_mac() {
+iptables_unblock_mac() {
     local mac="$1"
-    # Remove all DROP rules for this MAC (may be multiple)
-    while $IPTABLES -D FORWARD -m mac --mac-source "$mac" -j DROP 2>/dev/null; do
-        log "Unblocked MAC: $mac"
+    while $IPTABLES_BIN -D FORWARD -m mac --mac-source "$mac" -j DROP 2>/dev/null; do
+        :
     done
 }
 
-# Block all devices in a profile
-# $1 = profile name
+iptables_is_mac_blocked() {
+    local mac="$1"
+    $IPTABLES_BIN -C FORWARD -m mac --mac-source "$mac" -j DROP 2>/dev/null
+}
+
+iptables_list_blocked() {
+    $IPTABLES_BIN -L FORWARD -n 2>/dev/null | grep -o '[0-9a-fA-F:]\{17\}'
+}
+
+# ----------------------------------------------------------------------------
+# Firewall abstraction layer
+# ----------------------------------------------------------------------------
+
+block_mac() {
+    local mac="$1"
+    case "$FIREWALL_BACKEND" in
+        nft)      nft_block_mac "$mac" ;;
+        iptables) iptables_block_mac "$mac" ;;
+        none)     log "WARNING: no firewall backend available, cannot block $mac" ;;
+    esac
+    log "Blocked MAC: $mac"
+}
+
+unblock_mac() {
+    local mac="$1"
+    case "$FIREWALL_BACKEND" in
+        nft)      nft_unblock_mac "$mac" ;;
+        iptables) iptables_unblock_mac "$mac" ;;
+        none)     log "WARNING: no firewall backend available, cannot unblock $mac" ;;
+    esac
+    log "Unblocked MAC: $mac"
+}
+
+is_mac_blocked() {
+    local mac="$1"
+    case "$FIREWALL_BACKEND" in
+        nft)      nft_is_mac_blocked "$mac" ;;
+        iptables) iptables_is_mac_blocked "$mac" ;;
+        none)     return 1 ;;
+    esac
+}
+
+list_blocked_macs() {
+    case "$FIREWALL_BACKEND" in
+        nft)      nft_list_blocked ;;
+        iptables) iptables_list_blocked ;;
+        none)     echo "" ;;
+    esac
+}
+
+# ----------------------------------------------------------------------------
+# Profile operations
+# ----------------------------------------------------------------------------
+
 block_profile() {
     local profile="$1"
     if ! profile_exists "$profile"; then
@@ -110,8 +196,6 @@ block_profile() {
     log "Profile '$profile' blocked"
 }
 
-# Unblock all devices in a profile
-# $1 = profile name
 unblock_profile() {
     local profile="$1"
     if ! profile_exists "$profile"; then
@@ -129,9 +213,6 @@ unblock_profile() {
 # Ticket system
 # ----------------------------------------------------------------------------
 
-# Issue a ticket: unblock profile for X minutes, then auto-block
-# $1 = profile name
-# $2 = minutes
 issue_ticket() {
     local profile="$1"
     local minutes="$2"
@@ -141,7 +222,6 @@ issue_ticket() {
         return 1
     fi
 
-    # Validate input
     if [ -z "$minutes" ]; then
         echo "Error: invalid duration '$minutes'" >&2
         return 1
@@ -162,7 +242,6 @@ issue_ticket() {
 
     unblock_profile "$profile"
 
-    # Record the ticket
     local timestamp
     timestamp=$($DATE +%s)
     echo "$profile $minutes $timestamp" >> "$STATE_DIR/tickets"
@@ -173,7 +252,6 @@ issue_ticket() {
         (
             $SLEEP $((minutes * 60))
             block_profile "$profile"
-            # Remove the ticket record
             sed -i "/^$profile $minutes $timestamp$/d" "$STATE_DIR/tickets" 2>/dev/null
         ) &
     fi
@@ -182,7 +260,6 @@ issue_ticket() {
     return 0
 }
 
-# List active tickets
 list_tickets() {
     if [ ! -f "$STATE_DIR/tickets" ] || [ ! -s "$STATE_DIR/tickets" ]; then
         echo "No active tickets"
@@ -202,38 +279,28 @@ list_tickets() {
 # Time budget system
 # ----------------------------------------------------------------------------
 
-# Get today's date string (YYYY-MM-DD)
 get_today() {
     $DATE +%Y-%m-%d
 }
 
-# Get the used minutes for a profile today
-# $1 = profile name
 get_used_minutes() {
     local profile="$1"
     cat "$STATE_DIR/${profile}_used" 2>/dev/null || echo "0"
 }
 
-# Reset the usage counter for a profile (called on new day)
-# $1 = profile name
 reset_usage() {
     local profile="$1"
     echo "0" > "$STATE_DIR/${profile}_used"
     echo "$(get_today)" > "$STATE_DIR/${profile}_day"
-    # Remove any budget-based block
     unblock_profile "$profile" 2>/dev/null || true
 }
 
-# Check and enforce time budget for a profile
-# Called by cron every minute
-# $1 = profile name (optional, checks all if not specified)
 check_budget() {
     local profile="${1:-}"
     local today
     today=$(get_today)
 
     if [ -z "$profile" ]; then
-        # Check all profiles
         for p in $(cut -d'|' -f1 "$CONFIG" 2>/dev/null); do
             _check_single_budget "$p" "$today"
         done
@@ -242,32 +309,25 @@ check_budget() {
     fi
 }
 
-# Internal: check budget for a single profile
-# $1 = profile name
-# $2 = today's date
 _check_single_budget() {
     local profile="$1"
     local today="$2"
     local budget
     budget=$(get_profile_budget "$profile")
 
-    # Skip if budget is 0 (unlimited)
     [ "$budget" = "0" ] || [ -z "$budget" ] && return 0
 
-    # Reset if new day
     local last_day
     last_day=$(cat "$STATE_DIR/${profile}_day" 2>/dev/null)
     if [ "$last_day" != "$today" ]; then
         reset_usage "$profile"
     fi
 
-    # Increment usage
     local used
     used=$(get_used_minutes "$profile")
     used=$((used + 1))
     echo "$used" > "$STATE_DIR/${profile}_used"
 
-    # Check if budget exceeded
     if [ "$used" -ge "$budget" ]; then
         block_profile "$profile"
         log "Budget exceeded: '$profile' ($used/$budget min)"
@@ -278,7 +338,6 @@ _check_single_budget() {
 # Status and listing
 # ----------------------------------------------------------------------------
 
-# Show status of all profiles
 show_status() {
     echo "Profile    | Budget(min) | Used(min) | Status   | MACs"
     echo "-----------|-------------|-----------|----------|----"
@@ -291,9 +350,14 @@ show_status() {
         [ "$budget" = "0" ] && budget="unlimited"
         printf "%-10s | %-11s | %-9s | %-8s | %s\n" "$name" "$budget" "$used" "$status" "$macs"
     done < "$CONFIG"
+    echo ""
+    echo "Firewall backend: $FIREWALL_BACKEND"
+    echo "Blocked MACs:"
+    list_blocked_macs | while read -r mac; do
+        [ -n "$mac" ] && echo "  $mac"
+    done
 }
 
-# List all configured profiles
 list_profiles() {
     echo "Profiles configured:"
     if [ ! -f "$CONFIG" ]; then
@@ -327,13 +391,17 @@ Commands:
   tickets                 List active tickets
   budget-check [profile]  Check time budgets (for cron, runs all if no profile)
   reset <profile>         Reset usage counter for a profile (new day)
+  backend                 Show which firewall backend is in use
 
 Options (via environment variables):
-  PARENTAL_CONFIG    Config file path (default: /etc/config/parental_profiles)
-  PARENTAL_STATE_DIR State directory (default: /tmp/parental-profiles)
-  PARENTAL_WAN_IF    WAN interface (default: auto-detect or eth1)
-  PARENTAL_LAN_IF    LAN interface (default: br-lan)
-  IPTABLES           iptables binary (default: iptables)
+  PARENTAL_CONFIG          Config file path (default: /etc/config/parental_profiles)
+  PARENTAL_STATE_DIR       State directory (default: /tmp/parental-profiles)
+  PARENTAL_WAN_IF          WAN interface (default: auto-detect or eth1)
+  PARENTAL_LAN_IF          LAN interface (default: br-lan)
+  PARENTAL_FIREWALL        Force firewall backend: nft, iptables, or none
+  PARENTAL_SKIP_AUTOBLOCK  Set to 1 to skip background auto-block (for testing)
+  NFT                      nft binary path (default: nft)
+  IPTABLES                 iptables binary path (default: iptables)
 EOF
 }
 
@@ -366,6 +434,9 @@ case "${1:-}" in
     reset)
         [ -z "${2:-}" ] && { echo "Error: missing profile name" >&2; exit 1; }
         reset_usage "$2"
+        ;;
+    backend)
+        echo "Firewall backend: $FIREWALL_BACKEND"
         ;;
     -h|--help|help|"")
         usage

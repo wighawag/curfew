@@ -2,10 +2,9 @@
 # Mimics OpenWrt's BusyBox-based environment using Alpine Linux
 #
 # Usage:
-#   docker build -t my-router-test .
-#   docker run --rm my-router-test
+#   docker compose -f docker/docker-compose.yml run --rm test
 #   # Or for interactive testing:
-#   docker run --rm -it my-router-test sh
+#   docker compose -f docker/docker-compose.yml run --rm shell
 
 FROM alpine:3.20
 
@@ -31,12 +30,12 @@ RUN chmod +x scripts/*.sh web/cgi-bin/ticket
 RUN mkdir -p /usr/local/bin /tmp/mock-state
 
 # Mock iptables - simulates FORWARD chain rule management
-# -C: check if rule exists (exit 0=yes, 1=no)
-# -I: insert rule (always succeeds)
-# -D: delete rule (exit 0=deleted, 1=not found)
-# -L: list rules
 COPY docker/mock-iptables.sh /usr/local/bin/mock-iptables
 RUN chmod +x /usr/local/bin/mock-iptables
+
+# Mock nft - simulates nftables table/set management
+COPY docker/mock-nft.sh /usr/local/bin/mock-nft
+RUN chmod +x /usr/local/bin/mock-nft
 
 # Mock uci - returns expected values for known queries
 RUN printf '#!/bin/sh\nif echo "$@" | grep -q "get network.wan.device"; then\n  echo "eth1"\n  exit 0\nfi\nexit 0\n' > /usr/local/bin/mock-uci && chmod +x /usr/local/bin/mock-uci
@@ -47,8 +46,10 @@ RUN printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/mock-ip && chmod +x /usr/local
 # Mock logger - logs to file
 RUN printf '#!/bin/sh\necho "$@" >> /tmp/mock-state/logger.log\n' > /usr/local/bin/mock-logger && chmod +x /usr/local/bin/mock-logger
 
-# Symlink mocks to standard paths (overriding real binaries)
-RUN ln -sf /usr/local/bin/mock-iptables /usr/bin/iptables && \
+# Symlink mocks to standard paths
+# nft is the primary backend (OpenWrt 22.03+ uses nftables)
+RUN ln -sf /usr/local/bin/mock-nft /usr/bin/nft && \
+    ln -sf /usr/local/bin/mock-iptables /usr/bin/iptables && \
     ln -sf /usr/local/bin/mock-uci /usr/bin/uci && \
     ln -sf /usr/local/bin/mock-logger /usr/bin/logger
 
