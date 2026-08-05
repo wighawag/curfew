@@ -16,6 +16,9 @@ set -u
 
 PROFILES_CONFIG="${PARENTAL_CONFIG:-/etc/config/parental_profiles}"
 WAN_IF="${PARENTAL_WAN_IF:-$(uci get network.wan.device 2>/dev/null || echo "eth1")}"
+# For PPPoE, the actual L3 device is pppoe-wan, not eth1
+WAN_L3_IF="$(ifstatus wan 2>/dev/null | grep -o '"l3_device".*' | cut -d'"' -f4)"
+[ -n "$WAN_L3_IF" ] && WAN_IF="$WAN_L3_IF"
 LAN_IF="${PARENTAL_LAN_IF:-br-lan}"
 NFT_BIN="${NFT:-nft}"
 NFT_TABLE="parental_control"
