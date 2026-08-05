@@ -1,0 +1,19 @@
+# Profile-based parental control configuration
+# Format: profile_name|budget_minutes_per_day|mac1,mac2,mac3
+#
+# budget_minutes_per_day:
+#   0 = unlimited (schedule-only, no daily limit)
+#   120 = 2 hours per day (shared across all devices in the profile)
+#
+# MACs are comma-separated, use lowercase
+#
+# Lines starting with # are comments
+
+# Example: Alice has 2 hours/day across her phone and laptop
+alice|120|aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:02
+
+# Example: Bob has 1.5 hours/day across his phone and tablet
+bob|90|aa:bb:cc:dd:ee:03,aa:bb:cc:dd:ee:04
+
+# Example: Teen has unlimited time but still on schedule
+teen|0|aa:bb:cc:dd:ee:05,aa:bb:cc:dd:ee:06

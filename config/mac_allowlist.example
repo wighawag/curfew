@@ -1,0 +1,25 @@
+# MAC Allowlist for unknown device blocking
+# One MAC per line. Lines starting with # are comments.
+# Format: MAC_ADDRESS  # optional comment (device name)
+#
+# Only devices listed here will have internet access.
+# All unknown devices (including randomized MACs) will be blocked.
+
+# Parents
+aa:bb:cc:dd:ee:f1  # Dad's phone
+aa:bb:cc:dd:ee:f2  # Mom's phone
+aa:bb:cc:dd:ee:f3  # Dad's laptop
+aa:bb:cc:dd:ee:f4  # Mom's laptop
+
+# Alice (child 1) - also in parental_profiles
+aa:bb:cc:dd:ee:01  # Alice's phone
+aa:bb:cc:dd:ee:02  # Alice's laptop
+
+# Bob (child 2) - also in parental_profiles
+aa:bb:cc:dd:ee:03  # Bob's phone
+aa:bb:cc:dd:ee:04  # Bob's tablet
+
+# Other household devices
+aa:bb:cc:dd:ee:f5  # Smart TV
+aa:bb:cc:dd:ee:f6  # NAS
+aa:bb:cc:dd:ee:f7  # Printer

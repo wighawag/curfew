@@ -1,0 +1,36 @@
+services:
+  test:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    volumes:
+      - ../:/opt/my-router
+    working_dir: /opt/my-router
+    command: sh -c 'chmod +x scripts/*.sh web/cgi-bin/ticket && bats test/'
+
+  # Interactive shell for manual testing
+  shell:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    volumes:
+      - ../:/opt/my-router
+    working_dir: /opt/my-router
+    entrypoint: sh
+    stdin_open: true
+    tty: true
+
+  # OpenWrt full emulation (requires KVM support)
+  # Uses albrechtloh/openwrt-docker for real OpenWrt testing
+  # Uncomment to use, requires KVM and privileged mode
+  #
+  # openwrt:
+  #   image: albrechtloh/openwrt-docker:latest
+  #   privileged: true
+  #   environment:
+  #     - LAN_IF=veth
+  #     - WAN_IF=veth
+  #   ports:
+  #     - "8006:8006"  # Web UI
+  #   volumes:
+  #     - ./openwrt-init.sh:/openwrt-init.sh

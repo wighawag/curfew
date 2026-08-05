@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Parental Control">
+<title>Parental Control</title>
+<style>
+:root {
+  --bg: #f5f5f5;
+  --card: #ffffff;
+  --primary: #007bff;
+  --primary-hover: #0056b3;
+  --success: #28a745;
+  --text: #333;
+  --muted: #888;
+}
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  max-width: 500px;
+  margin: 0 auto;
+  padding: 20px;
+}
+h1 {
+  font-size: 1.5em;
+  margin: 0 0 10px 0;
+}
+.subtitle {
+  color: var(--muted);
+  font-size: 0.9em;
+  margin: 0 0 20px 0;
+}
+.profile {
+  background: var(--card);
+  padding: 20px;
+  margin: 10px 0;
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+}
+.profile h3 {
+  margin: 0 0 12px 0;
+  text-transform: capitalize;
+}
+.btn-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.btn {
+  flex: 1;
+  min-width: 70px;
+  padding: 12px 16px;
+  background: var(--primary);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 15px;
+  font-weight: 500;
+  transition: background 0.2s;
+}
+.btn:active {
+  background: var(--primary-hover);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+.msg {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--success);
+  color: white;
+  padding: 12px 24px;
+  border-radius: 8px;
+  font-size: 15px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+  opacity: 0;
+  transition: opacity 0.3s;
+  pointer-events: none;
+}
+.msg.show {
+  opacity: 1;
+}
+.loading {
+  text-align: center;
+  padding: 40px;
+  color: var(--muted);
+}
+</style>
+</head>
+<body>
+<h1>Parental Control</h1>
+<p class="subtitle">Tap to grant temporary internet access</p>
+<div id="profiles" class="loading">Loading...</div>
+<div id="message" class="msg"></div>
+<script>
+// These profiles are injected from config on the router.
+// Edit /www/tickets.html on the router to change them.
+var profiles = ["alice", "bob"];
+
+function showMessage(text) {
+  var el = document.getElementById('message');
+  el.textContent = text;
+  el.classList.add('show');
+  setTimeout(function() { el.classList.remove('show'); }, 4000);
+}
+
+function issueTicket(profile, minutes, btn) {
+  // Disable all buttons for this profile
+  var buttons = btn.parentElement.querySelectorAll('.btn');
+  buttons.forEach(function(b) { b.disabled = true; });
+
+  fetch('/cgi-bin/ticket?profile=' + encodeURIComponent(profile) + '&minutes=' + minutes)
+    .then(function(r) { return r.text(); })
+    .then(function(msg) {
+      showMessage(profile + ' got ' + minutes + ' min of internet');
+      buttons.forEach(function(b) { b.disabled = false; });
+    })
+    .catch(function(err) {
+      showMessage('Error: ' + err.message);
+      buttons.forEach(function(b) { b.disabled = false; });
+    });
+}
+
+function init() {
+  var html = '';
+  profiles.forEach(function(p) {
+    var displayName = p.charAt(0).toUpperCase() + p.slice(1);
+    html += '<div class="profile"><h3>' + displayName + '</h3><div class="btn-group">' +
+            '<button class="btn" onclick="issueTicket(\'' + p + '\',15,this)">15 min</button>' +
+            '<button class="btn" onclick="issueTicket(\'' + p + '\',30,this)">30 min</button>' +
+            '<button class="btn" onclick="issueTicket(\'' + p + '\',60,this)">1 hour</button>' +
+            '<button class="btn" onclick="issueTicket(\'' + p + '\',120,this)">2 hours</button>' +
+            '</div></div>';
+  });
+  document.getElementById('profiles').innerHTML = html;
+}
+
+init();
+</script>
+</body>
+</html>

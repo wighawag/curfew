@@ -1,0 +1,31 @@
+#!/bin/sh
+# CGI script for issuing parental control tickets via web
+# Called by /tickets.html
+# No authentication -- relies on being accessible only on LAN
+
+echo "Content-Type: text/plain"
+echo ""
+
+# Parse query string
+QS="${QUERY_STRING:-}"
+PROFILE=$(echo "$QS" | sed -n 's/.*profile=\([^&]*\).*/\1/p' | tr -cd 'a-zA-Z0-9_-')
+MINUTES=$(echo "$QS" | sed -n 's/.*minutes=\([^&]*\).*/\1/p' | tr -cd '0-9')
+
+# Validate input
+if [ -z "$PROFILE" ] || [ -z "$MINUTES" ]; then
+    echo "Error: missing profile or minutes"
+    exit 1
+fi
+
+if [ "$MINUTES" -lt 1 ] 2>/dev/null; then
+    echo "Error: invalid duration"
+    exit 1
+fi
+
+# Issue the ticket
+result=$(/usr/bin/parental-profiles.sh ticket "$PROFILE" "$MINUTES" 2>&1)
+if [ $? -eq 0 ]; then
+    echo "OK: $PROFILE unblocked for $MINUTES minutes"
+else
+    echo "Error: $result"
+fi
