@@ -65,7 +65,8 @@ echo "2. Copying scripts..."
 scp $SSH_OPTS "$SCRIPT_DIR/scripts/parental-profiles.sh" "$SSH_TARGET:/usr/bin/parental-profiles.sh"
 scp $SSH_OPTS "$SCRIPT_DIR/scripts/setup-firewall.sh" "$SSH_TARGET:/usr/bin/setup-firewall.sh"
 scp $SSH_OPTS "$SCRIPT_DIR/scripts/website-blocking.sh" "$SSH_TARGET:/usr/bin/website-blocking.sh"
-ssh $SSH_OPTS "$SSH_TARGET" "chmod +x /usr/bin/parental-profiles.sh /usr/bin/setup-firewall.sh /usr/bin/website-blocking.sh"
+scp $SSH_OPTS "$SCRIPT_DIR/scripts/blocklists.sh" "$SSH_TARGET:/usr/bin/blocklists.sh"
+ssh $SSH_OPTS "$SSH_TARGET" "chmod +x /usr/bin/parental-profiles.sh /usr/bin/setup-firewall.sh /usr/bin/website-blocking.sh /usr/bin/blocklists.sh"
 echo "   Scripts installed"
 
 # Step 3: Copy web interface
@@ -128,6 +129,23 @@ EOF
 else
     echo "   /etc/config/mac_allowlist already exists"
 fi
+
+# Global blocklists (gambling, porn, malware, etc.)
+if [ ! -f /etc/config/parental_blocklists ]; then
+    cat > /etc/config/parental_blocklists << 'EOF'
+# Global content filtering - applies to ALL devices
+https://blocklistproject.github.io/Lists/dnsmasq-version/gambling-dnsmasq.txt
+https://blocklistproject.github.io/Lists/dnsmasq-version/porn-dnsmasq.txt
+https://blocklistproject.github.io/Lists/dnsmasq-version/malware-dnsmasq.txt
+https://blocklistproject.github.io/Lists/dnsmasq-version/phishing-dnsmasq.txt
+https://blocklistproject.github.io/Lists/dnsmasq-version/ransomware-dnsmasq.txt
+https://blocklistproject.github.io/Lists/dnsmasq-version/scam-dnsmasq.txt
+https://blocklistproject.github.io/Lists/dnsmasq-version/fraud-dnsmasq.txt
+EOF
+    echo "   Created /etc/config/parental_blocklists"
+else
+    echo "   /etc/config/parental_blocklists already exists"
+fi
 REMOTE
 
 # Step 5: Set up cron
@@ -142,6 +160,9 @@ cat > /tmp/crontab << 'EOF'
 
 # Refresh website blocking DNS (hourly - keeps IPs updated)
 0 * * * * /usr/bin/website-blocking.sh refresh
+
+# Refresh global blocklists (weekly - gambling/porn/malware lists)
+0 3 * * 0 /usr/bin/blocklists.sh update
 
 # === Internet schedules (edit for your family) ===
 # Bedtime: block at 20:00, unblock at 07:00
@@ -226,8 +247,9 @@ echo "     vi /etc/config/parental_profiles    # Set profile names, budgets, MAC
 echo "     vi /etc/config/parental_websites    # Set websites to block per profile"
 echo "     vi /etc/config/mac_allowlist        # Add ALL device MACs"
 echo ""
-echo "  2. Apply the MAC allowlist:"
+echo "  2. Apply the MAC allowlist and download blocklists:"
 echo "     ssh ${SSH_USER}@${ROUTER_IP} setup-firewall.sh apply"
+echo "     ssh ${SSH_USER}@${ROUTER_IP} blocklists.sh update    # gambling/porn/malware"
 echo ""
 echo "  3. Adjust cron schedules:"
 echo "     ssh ${SSH_USER}@${ROUTER_IP} crontab -e"
