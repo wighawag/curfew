@@ -41,12 +41,14 @@ Edit the pre-created files with your actual values:
 
 | File | What to set |
 |---|---|
-| `parental_profiles` | Profile names, daily budget (minutes), MAC addresses |
+| `parental_profiles` | ALL profiles (adults + kids + IoT): name, budget, MAC addresses |
 | `parental_websites` | Websites to block per profile, organized by time groups |
-| `mac_allowlist` | ALL device MACs that are allowed internet (one per line) |
 | `parental_blocklists` | Global blocklist URLs (gambling/porn/malware) |
 | `crontab` | Your schedule times (bedtime, streaming, gaming blocks) |
 | `tickets.html` | Profile names shown in the phone UI |
+
+The `parental_profiles` file is the single source of truth: all MACs across all
+profiles form the MAC allowlist. Adults and IoT devices get budget `0` (unlimited).
 
 To find your devices' MAC addresses, connect them to the router first, then:
 ```bash
