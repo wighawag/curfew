@@ -2,45 +2,66 @@
 # ============================================================================
 # mocks.bash - Test helpers for parental control script testing
 #
-# Works with the mock binaries provided by the Docker test container.
-# Supports both nft (nftables) and iptables mock backends.
+# Uses REAL nftables (installed in Docker) for nft backend tests.
+# Uses mock iptables for iptables backend tests.
+# Mocks uci and logger (OpenWrt-specific).
 # ============================================================================
 
 MOCK_LOG_DIR="${MOCK_LOG_DIR:-/tmp/mock-state}"
-MOCK_NFT_STATE="${MOCK_LOG_DIR}/nft_state"
+MOCK_NFT_TABLE="${NFT_TABLE:-parental_control}"
+MOCK_NFT_SET="${NFT_SET:-blocked_macs}"
 MOCK_IPTABLES_STATE="${MOCK_LOG_DIR}/iptables_state"
 
-# Reset mock state between tests
+# Reset state between tests
 reset_mocks() {
     mkdir -p "$MOCK_LOG_DIR"
-    : > "$MOCK_NFT_STATE" 2>/dev/null || true
+
+    # Flush real nftables table if it exists
+    nft flush table inet "$MOCK_NFT_TABLE" 2>/dev/null || true
+    nft delete table inet "$MOCK_NFT_TABLE" 2>/dev/null || true
+
+    # Reset iptables mock state
     : > "$MOCK_IPTABLES_STATE" 2>/dev/null || true
-    : > "${MOCK_LOG_DIR}/nft.log" 2>/dev/null || true
     : > "${MOCK_LOG_DIR}/iptables.log" 2>/dev/null || true
     : > "${MOCK_LOG_DIR}/logger.log" 2>/dev/null || true
 }
 
 # Assert that a specific MAC is blocked
-# Uses the appropriate state file based on FIREWALL_BACKEND
+# Works with both nft (real) and iptables (mock) backends
 assert_mac_blocked() {
     local mac="$1"
-    local state_file
     if [ "${PARENTAL_FIREWALL:-nft}" = "iptables" ]; then
-        state_file="$MOCK_IPTABLES_STATE"
+        grep -q "^DROP $mac$" "$MOCK_IPTABLES_STATE"
     else
-        state_file="$MOCK_NFT_STATE"
+        # Use real nft to check
+        nft get element inet "$MOCK_NFT_TABLE" "$MOCK_NFT_SET" "{ $mac }" 2>/dev/null
     fi
-    grep -q "$mac" "$state_file"
 }
 
 # Assert that a specific MAC is NOT blocked
 assert_mac_not_blocked() {
     local mac="$1"
-    local state_file
     if [ "${PARENTAL_FIREWALL:-nft}" = "iptables" ]; then
-        state_file="$MOCK_IPTABLES_STATE"
+        ! grep -q "^DROP $mac$" "$MOCK_IPTABLES_STATE"
     else
-        state_file="$MOCK_NFT_STATE"
+        # Use real nft to check - should fail
+        ! nft get element inet "$MOCK_NFT_TABLE" "$MOCK_NFT_SET" "{ $mac }" 2>/dev/null
     fi
-    ! grep -q "$mac" "$state_file"
+}
+
+# Assert that a profile's website blocking is active
+# Checks that the nftables set for the profile has entries
+assert_websites_blocked() {
+    local profile="$1"
+    local set_name="blocked_sites_${profile}"
+    # The set should exist and have at least one element
+    nft list set inet "$MOCK_NFT_TABLE" "$set_name" 2>/dev/null | grep -q '[0-9]'
+}
+
+# Assert that a profile's website blocking is NOT active
+assert_websites_not_blocked() {
+    local profile="$1"
+    local set_name="blocked_sites_${profile}"
+    # The set should not exist or be empty
+    ! nft list set inet "$MOCK_NFT_TABLE" "$set_name" 2>/dev/null | grep -q '[0-9]'
 }

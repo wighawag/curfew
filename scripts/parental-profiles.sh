@@ -39,7 +39,7 @@ NFT_SET="blocked_macs"
 
 # Detect which firewall backend to use
 detect_firewall() {
-    if command -v "$NFT_BIN" >/dev/null 2>&1 && $NFT_BIN list tables 2>/dev/null | grep -q .; then
+    if command -v "$NFT_BIN" >/dev/null 2>&1 && $NFT_BIN --version >/dev/null 2>&1; then
         echo "nft"
     elif command -v "$IPTABLES_BIN" >/dev/null 2>&1; then
         echo "iptables"

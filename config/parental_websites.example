@@ -1,0 +1,17 @@
+# Per-profile website blocking configuration
+# Format: profile_name|domain1,domain2,domain3
+#
+# Domains listed here will be blocked for the profile's devices
+# when website-blocking.sh enable <profile> is called.
+#
+# The profile names must match those in /etc/config/parental_profiles
+# The MACs are read from parental_profiles, not from this file.
+
+# Alice: block YouTube and TikTok
+alice|youtube.com,www.youtube.com,tiktok.com,www.tiktok.com
+
+# Bob: block TikTok and Snapchat
+bob|tiktok.com,www.tiktok.com,snapchat.com,www.snapchat.com
+
+# Teen: block Reddit during study time
+teen|reddit.com,www.reddit.com

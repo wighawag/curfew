@@ -3,6 +3,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    cap_add:
+      - NET_ADMIN
     volumes:
       - ../:/opt/my-router
     working_dir: /opt/my-router
@@ -13,6 +15,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    cap_add:
+      - NET_ADMIN
     volumes:
       - ../:/opt/my-router
     working_dir: /opt/my-router
@@ -20,7 +24,7 @@ services:
     stdin_open: true
     tty: true
 
-  # OpenWrt full emulation (requires KVM support)
+  # Full OpenWrt emulation via QEMU (requires KVM support)
   # Uses albrechtloh/openwrt-docker for real OpenWrt testing
   # Uncomment to use, requires KVM and privileged mode
   #
@@ -32,5 +36,3 @@ services:
   #     - WAN_IF=veth
   #   ports:
   #     - "8006:8006"  # Web UI
-  #   volumes:
-  #     - ./openwrt-init.sh:/openwrt-init.sh
