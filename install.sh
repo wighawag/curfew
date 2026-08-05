@@ -66,6 +66,69 @@ if ! ssh $SSH_OPTS "$SSH_TARGET" "echo ok" >/dev/null 2>&1; then
 fi
 ok "SSH connection"
 
+# Step 1b: Apply router config (PPPoE, Wi-Fi, timezone, etc.)
+if [ -f "$LOCAL_DIR/router_config" ]; then
+    echo "1b. Applying router configuration..."
+    scp $SCP_OPTS "$LOCAL_DIR/router_config" "$SSH_TARGET:/tmp/router_config" 2>/dev/null
+    ssh $SSH_OPTS "$SSH_TARGET" << 'REMOTE' 2>/dev/null
+. /tmp/router_config 2>/dev/null
+
+# Set root password
+if [ -n "${ROUTER_PASSWORD:-}" ]; then
+    echo "${ROUTER_PASSWORD}" | passwd --stdin root 2>/dev/null || \
+    (echo "root"; echo "${ROUTER_PASSWORD}"; echo "${ROUTER_PASSWORD}") | passwd root 2>/dev/null
+fi
+
+# Configure WAN (PPPoE)
+if [ -n "${PPPOE_USERNAME:-}" ] && [ -n "${PPPOE_PASSWORD:-}" ]; then
+    uci set network.wan.proto='pppoe'
+    uci set network.wan.username="${PPPOE_USERNAME}"
+    uci set network.wan.password="${PPPOE_PASSWORD}"
+    uci commit network
+fi
+
+# Configure Wi-Fi (both radios, same SSID)
+if [ -n "${WIFI_SSID:-}" ] && [ -n "${WIFI_PASSWORD:-}" ]; then
+    for radio in radio0 radio1; do
+        uci set wireless.${radio}.disabled='0'
+        uci set wireless.${radio}.country="${WIFI_COUNTRY:-GB}"
+        # Find the interface associated with this radio
+        iface=$(uci show wireless | grep "device='${radio}'" | cut -d. -f2 | head -1)
+        if [ -n "$iface" ]; then
+            uci set wireless.${iface}.ssid="${WIFI_SSID}"
+            uci set wireless.${iface}.encryption="${WIFI_ENCRYPTION:-WPA2-PSK}"
+            uci set wireless.${iface}.key="${WIFI_PASSWORD}"
+            uci set wireless.${iface}.disabled='0'
+        fi
+    done
+    uci commit wireless
+    wifi reload 2>/dev/null
+fi
+
+# Set timezone
+if [ -n "${TIMEZONE:-}" ]; then
+    uci set system.@system[0].timezone="${TIMEZONE}"
+    uci set system.@system[0].zonename="${TIMEZONE}"
+    uci commit system
+fi
+
+# Enable hardware flow offloading
+if [ "${HARDWARE_OFFLOADING:-true}" = "true" ]; then
+    uci set firewall.@defaults[0].flow_offloading='1'
+    uci set firewall.@defaults[0].flow_offloading_hw='1'
+    uci commit firewall
+fi
+
+rm -f /tmp/router_config
+REMOTE
+    ok "Router config applied (PPPoE, Wi-Fi, timezone, offloading)"
+    # Restart network to apply PPPoE
+    ssh $SSH_OPTS "$SSH_TARGET" "/etc/init.d/network restart" 2>/dev/null
+    sleep 3
+else
+    skip "Router config (no config/local/router_config)"
+fi
+
 # Step 2: Copy scripts (always overwrite)
 echo "2. Installing scripts..."
 scp $SCP_OPTS "$SCRIPT_DIR/scripts/parental-profiles.sh" "$SSH_TARGET:/usr/bin/parental-profiles.sh" 2>/dev/null

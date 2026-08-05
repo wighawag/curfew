@@ -1,0 +1,23 @@
+# Router configuration
+# Applied by install.sh via UCI commands over SSH
+#
+# Format: key=value (one per line)
+# Lines starting with # are comments
+
+# === Internet (PPPoE) ===
+PPPOE_USERNAME=yourusername@plusdsl.net
+PPPOE_PASSWORD=yourpassword
+
+# === Wi-Fi ===
+WIFI_SSID=YourNetworkName
+WIFI_PASSWORD=YourWifiPassword
+WIFI_ENCRYPTION=WPA2-PSK
+WIFI_CIPHER=ccmp
+WIFI_COUNTRY=GB
+
+# === Router ===
+ROUTER_PASSWORD=your_admin_password
+TIMEZONE=Europe/London
+
+# === Performance ===
+HARDWARE_OFFLOADING=true
