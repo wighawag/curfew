@@ -147,7 +147,8 @@ scp $SCP_OPTS "$SCRIPT_DIR/scripts/parental-profiles.sh" "$SSH_TARGET:/usr/bin/p
 scp $SCP_OPTS "$SCRIPT_DIR/scripts/setup-firewall.sh" "$SSH_TARGET:/usr/bin/setup-firewall.sh" 2>/dev/null
 scp $SCP_OPTS "$SCRIPT_DIR/scripts/website-blocking.sh" "$SSH_TARGET:/usr/bin/website-blocking.sh" 2>/dev/null
 scp $SCP_OPTS "$SCRIPT_DIR/scripts/setup-adguard.sh" "$SSH_TARGET:/usr/bin/setup-adguard.sh" 2>/dev/null
-ssh $SSH_OPTS "$SSH_TARGET" "chmod +x /usr/bin/parental-profiles.sh /usr/bin/setup-firewall.sh /usr/bin/website-blocking.sh /usr/bin/setup-adguard.sh" 2>/dev/null
+scp $SCP_OPTS "$SCRIPT_DIR/scripts/panic-off.sh" "$SSH_TARGET:/usr/bin/panic-off.sh" 2>/dev/null
+ssh $SSH_OPTS "$SSH_TARGET" "chmod +x /usr/bin/parental-profiles.sh /usr/bin/setup-firewall.sh /usr/bin/website-blocking.sh /usr/bin/setup-adguard.sh /usr/bin/panic-off.sh" 2>/dev/null
 ok "Scripts installed"
 
 # Step 3: Copy web interface
