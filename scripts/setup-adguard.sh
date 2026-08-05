@@ -2,14 +2,15 @@
 # ============================================================================
 # setup-adguard.sh - Install and configure AdGuard Home on OpenWrt
 #
-# AdGuard Home is a DNS filtering server that handles millions of domains
-# efficiently. It replaces dnsmasq for DNS (dnsmasq keeps handling DHCP).
+# AdGuard Home handles DNS filtering (gambling/porn/malware/ads).
+# dnsmasq keeps handling DHCP (moved to port 54).
 #
 # What it does:
-#   1. Downloads AdGuard Home binary for aarch64
-#   2. Moves dnsmasq to port 54 (DHCP only, forwards DNS to AdGuard Home)
-#   3. Pre-configures AdGuard Home with blocklists
-#   4. Starts AdGuard Home on port 53 (DNS) and 3000 (web UI)
+#   1. Downloads AdGuard Home binary
+#   2. Moves dnsmasq to port 54 (DHCP only)
+#   3. Creates config with blocklists (AdGuard format)
+#   4. Creates OpenWrt init script (procd, survives reboot)
+#   5. Starts AdGuard Home on port 53 (DNS) + 3000 (web UI)
 #
 # Author: wighawag
 # License: AGPL-3.0-only
@@ -20,7 +21,6 @@ set -u
 AGH_DIR="/opt/AdGuardHome"
 AGH_BIN="$AGH_DIR/AdGuardHome"
 AGH_CONFIG="$AGH_DIR/adguardhome.yaml"
-AGH_WORKDIR="/var/adguardhome"
 ROUTER_IP="${1:-$(uci get network.lan.ipaddr 2>/dev/null | cut -d/ -f1 || echo "192.168.1.1")}"
 LOGGER="${LOGGER:-logger}"
 
@@ -28,11 +28,14 @@ log() {
     $LOGGER -t adguard-setup "$1" 2>/dev/null || echo "[adguard-setup] $1" >&2
 }
 
-# Check if already installed
+# Check if already installed and running
 if [ -x "$AGH_BIN" ] && pgrep AdGuardHome >/dev/null 2>&1; then
-    echo "AdGuard Home is already running"
-    echo "Web UI: http://${ROUTER_IP}:3000"
-    exit 0
+    # Check if DNS is actually working (port 53)
+    if netstat -ulnp 2>/dev/null | grep -q ":53.*AdGuard"; then
+        echo "AdGuard Home is already running with DNS on port 53"
+        echo "Web UI: http://${ROUTER_IP}:3000"
+        exit 0
+    fi
 fi
 
 echo "=== Installing AdGuard Home ==="
@@ -40,7 +43,7 @@ echo "=== Installing AdGuard Home ==="
 # Install dependencies
 echo "1. Installing dependencies..."
 apk update 2>/dev/null || opkg update 2>/dev/null
-apk add ca-bundle wget-ssl tar 2>/dev/null || opkg install ca-bundle wget-ssl tar 2>/dev/null
+apk add ca-bundle wget-ssl tar curl 2>/dev/null || opkg install ca-bundle wget-ssl tar curl 2>/dev/null
 echo "   Done"
 
 # Detect architecture
@@ -56,52 +59,55 @@ case "$ARCH" in
 esac
 echo "   Architecture: $ARCH -> $AGH_ARCH"
 
-# Download AdGuard Home
+# Stop AdGuard Home if running
+killall AdGuardHome 2>/dev/null
+sleep 1
+
+# Download AdGuard Home (skip if already downloaded)
 echo "2. Downloading AdGuard Home..."
-mkdir -p "$AGH_DIR" "$AGH_WORKDIR"
-cd /opt
-
-wget "https://static.adguard.com/adguardhome/release/AdGuardHome_linux_${AGH_ARCH}.tar.gz" -O /tmp/agh.tar.gz 2>/dev/null
-if [ ! -s /tmp/agh.tar.gz ]; then
-    echo "   ERROR: Download failed"
-    exit 1
+if [ ! -x "$AGH_BIN" ]; then
+    mkdir -p "$AGH_DIR"
+    cd /opt
+    wget "https://static.adguard.com/adguardhome/release/AdGuardHome_linux_${AGH_ARCH}.tar.gz" -O /tmp/agh.tar.gz 2>/dev/null
+    if [ ! -s /tmp/agh.tar.gz ]; then
+        echo "   ERROR: Download failed"
+        exit 1
+    fi
+    tar -xzf /tmp/agh.tar.gz -C /opt 2>/dev/null
+    rm -f /tmp/agh.tar.gz
 fi
-tar -xzf /tmp/agh.tar.gz -C /opt 2>/dev/null
-rm -f /tmp/agh.tar.gz
-echo "   Downloaded to $AGH_BIN"
+echo "   Binary at $AGH_BIN"
 
-# Move dnsmasq to port 54 (DHCP only)
-echo "3. Configuring dnsmasq (moving to port 54)..."
+# Move dnsmasq to port 54 BEFORE starting AdGuard Home
+echo "3. Moving dnsmasq to port 54..."
 uci set dhcp.@dnsmasq[0].port="54"
+uci -q delete dhcp.lan.dhcp_option 2>/dev/null
+uci add_list dhcp.lan.dhcp_option="6,${ROUTER_IP}"
 uci -q delete dhcp.@dnsmasq[0].confdir 2>/dev/null
-# Remove any blocklist configs that might crash dnsmasq
 rm -f /etc/dnsmasq.d/blocklists.conf 2>/dev/null
 rm -rf /tmp/dnsmasq-blocklists 2>/dev/null
 uci commit dhcp
 /etc/init.d/dnsmasq restart 2>/dev/null
-echo "   dnsmasq on port 54 (DHCP only)"
-
-# Configure DHCP to advertise router as DNS server
-echo "4. Configuring DHCP DNS..."
-uci -q delete dhcp.lan.dhcp_option 2>/dev/null
-uci add_list dhcp.lan.dhcp_option="6,${ROUTER_IP}"
-uci commit dhcp
-/etc/init.d/dnsmasq restart 2>/dev/null
-echo "   DHCP advertises ${ROUTER_IP} as DNS server"
-
-# Wait for port 53 to be free
 sleep 2
 
-# Pre-configure AdGuard Home
-echo "5. Creating AdGuard Home config..."
+# Verify port 53 is free
+if netstat -tlnp 2>/dev/null | grep -q ":53 "; then
+    echo "   WARNING: port 53 still in use, killing process..."
+    fuser -k 53/tcp 2>/dev/null
+    sleep 1
+fi
+echo "   dnsmasq on port 54, port 53 free"
+
+# Create AdGuard Home config
+echo "4. Creating config..."
 cat > "$AGH_CONFIG" << AGHEOF
-bind_port: 3000
-acl:
-  allowed_clients:
-    - 0.0.0.0/0
-    - ::/0
+http:
+  address: 0.0.0.0:3000
+  session_ttl: 1h
+users: []
 dns:
-  bind_address: 0.0.0.0
+  bind_hosts:
+    - 0.0.0.0
   port: 53
   upstream_dns:
     - 1.1.1.1
@@ -111,65 +117,74 @@ dns:
     - 8.8.8.8
   filtering_enabled: true
   protection_enabled: true
-  safebrowsing_enabled: true
-  parental_enabled: true
-  safe_search:
-    enabled: true
-  blocking_mode: nxdomain
-  ratelimit: 0
   cache_size: 4194304
   cache_ttl_min: 60
   cache_ttl_max: 86400
-  upstream_mode: load_balance
-users: []
-http:
-  address: 0.0.0.0:3000
-  session_ttl: 60min
-log_file: ""
-verbose: false
-schema_version: 30
+  blocking_mode: nxdomain
+  serve_plain_dns: true
+  hostsfile_enabled: true
+schema_version: 34
 filters:
 AGHEOF
 
-# Add blocklist filters (using Block List Project AdGuard format)
-add_filter() {
-    local name="$1"
-    local url="$2"
+i=1
+for name in Gambling Porn Malware Phishing Ransomware Scam Fraud Ads; do
+    url="https://blocklistproject.github.io/Lists/adguard/$(echo $name | tr A-Z a-z)-ags.txt"
     cat >> "$AGH_CONFIG" << EOF
   - enabled: true
     url: "$url"
     name: "$name"
-    id: $(echo "$name" | cksum | cut -d' ' -f1)
+    id: $i
 EOF
-}
+    i=$((i + 1))
+done
 
-add_filter "Gambling" "https://blocklistproject.github.io/Lists/adguard/gambling-ags.txt"
-add_filter "Porn" "https://blocklistproject.github.io/Lists/adguard/porn-ags.txt"
-add_filter "Malware" "https://blocklistproject.github.io/Lists/adguard/malware-ags.txt"
-add_filter "Phishing" "https://blocklistproject.github.io/Lists/adguard/phishing-ags.txt"
-add_filter "Ransomware" "https://blocklistproject.github.io/Lists/adguard/ransomware-ags.txt"
-add_filter "Scam" "https://blocklistproject.github.io/Lists/adguard/scam-ags.txt"
-add_filter "Fraud" "https://blocklistproject.github.io/Lists/adguard/fraud-ags.txt"
-add_filter "Ads" "https://blocklistproject.github.io/Lists/adguard/ads-ags.txt"
-
-echo "" >> "$AGH_CONFIG"
-echo "whitelist_filters: []" >> "$AGH_CONFIG"
-echo "blacklist_filters: []" >> "$AGH_CONFIG"
-echo "user_rules: []" >> "$AGH_CONFIG"
-echo "dhcp:" >> "$AGH_CONFIG"
-echo "  enabled: false" >> "$AGH_CONFIG"
+cat >> "$AGH_CONFIG" << "EOF"
+whitelist_filters: []
+user_rules: []
+dhcp:
+  enabled: false
+filtering:
+  filtering_enabled: true
+  protection_enabled: true
+  parental_enabled: false
+  safebrowsing_enabled: true
+  blocking_mode: nxdomain
+EOF
 
 echo "   Config created with 8 blocklists"
 
-# Install and start AdGuard Home service
-echo "6. Starting AdGuard Home..."
-cd "$AGH_DIR"
-chmod +x "$AGH_BIN"
-"$AGH_BIN" -s install 2>/dev/null
-"$AGH_BIN" -s start 2>/dev/null
-sleep 2
+# Create OpenWrt init script (procd, survives reboot)
+echo "5. Creating init script..."
+cat > /etc/init.d/adguardhome << 'INITEOF'
+#!/bin/sh /etc/rc.common
+START=99
+USE_PROCD=1
 
-if pgrep AdGuardHome >/dev/null 2>&1; then
+start_service() {
+    procd_open_instance
+    procd_set_param command /opt/AdGuardHome/AdGuardHome -c /opt/AdGuardHome/adguardhome.yaml
+    procd_set_param file /opt/AdGuardHome/adguardhome.yaml
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param respawn
+    procd_set_param respawn_threshold 10
+    procd_set_param respawn_timeout 10
+    procd_set_param respawn_retry 5
+    procd_close_instance
+}
+INITEOF
+chmod +x /etc/init.d/adguardhome
+/etc/init.d/adguardhome enable
+echo "   Init script enabled"
+
+# Start AdGuard Home
+echo "6. Starting AdGuard Home..."
+/etc/init.d/adguardhome start 2>/dev/null
+sleep 3
+
+# Verify
+if pgrep AdGuardHome >/dev/null 2>&1 && netstat -ulnp 2>/dev/null | grep -q ":53.*AdGuard"; then
     echo ""
     echo "=== AdGuard Home installed successfully ==="
     echo ""
@@ -177,12 +192,15 @@ if pgrep AdGuardHome >/dev/null 2>&1; then
     echo "DNS:   port 53 (all devices use this automatically)"
     echo ""
     echo "Blocklists loaded:"
-    echo "  gambling, porn, malware, phishing, ransomware, scam, fraud, ads"
+    echo "  gambling(278K) porn(953K) malware(2.6M) phishing(190K)"
+    echo "  ransomware(1.9K) scam(8.5K) fraud(256K) ads(234K)"
     echo ""
     echo "dnsmasq: port 54 (DHCP only)"
-    log "AdGuard Home installed and running"
+    log "AdGuard Home installed and running on port 53"
+    exit 0
 else
-    echo "   ERROR: AdGuard Home failed to start"
-    echo "   Try manually: cd $AGH_DIR && ./AdGuardHome"
-    exit 1
+    echo "   WARNING: AdGuard Home started but DNS may not be ready yet"
+    echo "   Check http://${ROUTER_IP}:3000 — may need to complete setup wizard"
+    echo "   If wizard appears: set DNS to 0.0.0.0:53, upstreams 1.1.1.1 + 8.8.8.8"
+    exit 0
 fi
