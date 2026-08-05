@@ -22,6 +22,7 @@ set -e
 ROUTER_IP="${1:-}"
 SSH_USER="root"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+SCP_OPTS="-O -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"  # -O for legacy SCP protocol (no SFTP server on OpenWrt)
 FORCE=0
 
 if [ -z "$ROUTER_IP" ]; then
@@ -67,25 +68,25 @@ ok "SSH connection"
 
 # Step 2: Copy scripts (always overwrite)
 echo "2. Installing scripts..."
-scp $SSH_OPTS "$SCRIPT_DIR/scripts/parental-profiles.sh" "$SSH_TARGET:/usr/bin/parental-profiles.sh" 2>/dev/null
-scp $SSH_OPTS "$SCRIPT_DIR/scripts/setup-firewall.sh" "$SSH_TARGET:/usr/bin/setup-firewall.sh" 2>/dev/null
-scp $SSH_OPTS "$SCRIPT_DIR/scripts/website-blocking.sh" "$SSH_TARGET:/usr/bin/website-blocking.sh" 2>/dev/null
-scp $SSH_OPTS "$SCRIPT_DIR/scripts/blocklists.sh" "$SSH_TARGET:/usr/bin/blocklists.sh" 2>/dev/null
+scp $SCP_OPTS "$SCRIPT_DIR/scripts/parental-profiles.sh" "$SSH_TARGET:/usr/bin/parental-profiles.sh" 2>/dev/null
+scp $SCP_OPTS "$SCRIPT_DIR/scripts/setup-firewall.sh" "$SSH_TARGET:/usr/bin/setup-firewall.sh" 2>/dev/null
+scp $SCP_OPTS "$SCRIPT_DIR/scripts/website-blocking.sh" "$SSH_TARGET:/usr/bin/website-blocking.sh" 2>/dev/null
+scp $SCP_OPTS "$SCRIPT_DIR/scripts/blocklists.sh" "$SSH_TARGET:/usr/bin/blocklists.sh" 2>/dev/null
 ssh $SSH_OPTS "$SSH_TARGET" "chmod +x /usr/bin/parental-profiles.sh /usr/bin/setup-firewall.sh /usr/bin/website-blocking.sh /usr/bin/blocklists.sh" 2>/dev/null
 ok "Scripts installed"
 
 # Step 3: Copy web interface
 echo "3. Installing web interface..."
 ssh $SSH_OPTS "$SSH_TARGET" "mkdir -p /www/cgi-bin" 2>/dev/null
-scp $SSH_OPTS "$SCRIPT_DIR/web/cgi-bin/ticket" "$SSH_TARGET:/www/cgi-bin/ticket" 2>/dev/null
+scp $SCP_OPTS "$SCRIPT_DIR/web/cgi-bin/ticket" "$SSH_TARGET:/www/cgi-bin/ticket" 2>/dev/null
 ssh $SSH_OPTS "$SSH_TARGET" "chmod +x /www/cgi-bin/ticket" 2>/dev/null
 
 # Use local tickets.html if it exists, otherwise use default
 if [ -f "$LOCAL_DIR/tickets.html" ]; then
-    scp $SSH_OPTS "$LOCAL_DIR/tickets.html" "$SSH_TARGET:/www/tickets.html" 2>/dev/null
+    scp $SCP_OPTS "$LOCAL_DIR/tickets.html" "$SSH_TARGET:/www/tickets.html" 2>/dev/null
     ok "Web interface (custom tickets.html from config/local/)"
 else
-    scp $SSH_OPTS "$SCRIPT_DIR/web/tickets.html" "$SSH_TARGET:/www/tickets.html" 2>/dev/null
+    scp $SCP_OPTS "$SCRIPT_DIR/web/tickets.html" "$SSH_TARGET:/www/tickets.html" 2>/dev/null
     ok "Web interface (default tickets.html - customize in config/local/)"
 fi
 
@@ -98,7 +99,7 @@ upload_config() {
     local name="$3"
 
     if [ -f "$local_file" ]; then
-        scp $SSH_OPTS "$local_file" "$SSH_TARGET:$remote_file" 2>/dev/null
+        scp $SCP_OPTS "$local_file" "$SSH_TARGET:$remote_file" 2>/dev/null
         ok "$name (from config/local/)"
     else
         # Only create if it doesn't exist on the router
@@ -133,7 +134,7 @@ echo "5. Setting up cron..."
 
 if [ -f "$LOCAL_DIR/crontab" ]; then
     # Use local crontab file
-    scp $SSH_OPTS "$LOCAL_DIR/crontab" "$SSH_TARGET:/tmp/parental_crontab" 2>/dev/null
+    scp $SCP_OPTS "$LOCAL_DIR/crontab" "$SSH_TARGET:/tmp/parental_crontab" 2>/dev/null
     ssh $SSH_OPTS "$SSH_TARGET" << 'REMOTE' 2>/dev/null
 # Merge: keep non-parental cron jobs, replace parental ones
 if crontab -l 2>/dev/null | grep -q "parental\|website-blocking\|blocklists"; then
