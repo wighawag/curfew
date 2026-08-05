@@ -1,0 +1,13 @@
+# Reusable block rules (domain lists)
+# Define each rule once, then associate with profiles in parental_websites
+# Format: rule_name|domain1,domain2,domain3
+#
+# Usage in cron:
+#   website-blocking.sh enable eli no_streaming
+#   website-blocking.sh disable eli no_streaming
+
+no_streaming|youtube.com,www.youtube.com,tiktok.com,www.tiktok.com,netflix.com,www.netflix.com,disneyplus.com,www.disneyplus.com,twitch.tv,www.twitch.tv
+
+no_gaming|roblox.com,www.roblox.com,steam.com,store.steampowered.com,epicgames.com,www.epicgames.com
+
+no_social|tiktok.com,www.tiktok.com,snapchat.com,www.snapchat.com,instagram.com,www.instagram.com

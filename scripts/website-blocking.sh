@@ -1,25 +1,18 @@
 #!/bin/sh
 # ============================================================================
-# website-blocking.sh - Per-profile website blocking with time-based groups
+# website-blocking.sh - Per-profile website blocking with reusable block rules
 #
-# Blocks specific websites for specific profiles, independently of the
-# internet on/off schedule. Uses nftables with DNS resolution.
+# Block rules (domain lists) are defined once in block_rules and associated
+# with profiles in parental_websites. This avoids duplicating domain lists.
 #
-# Supports "groups" so you can have different domain lists at different times:
-#   alice|after_school|youtube.com,tiktok.com
-#   alice|evening|youtube.com,tiktok.com,netflix.com,disneyplus.com
+# Config files:
+#   /etc/config/block_rules       rule_name|domain1,domain2,...
+#   /etc/config/parental_websites  profile_name|rule_name
+#   /etc/config/parental_profiles  profile_name|budget|mac1,mac2,...
 #
-# Config file: /etc/config/parental_websites
-# Format: profile_name|group_name|domain1,domain2,domain3
-#    (or backward compat: profile_name|domain1,domain2 → uses "default" group)
-#
-# Usage with cron:
-#   # After school: block YouTube + TikTok
-#   30 15 * * 1-5 /usr/bin/website-blocking.sh enable alice after_school
-#   0 17 * * 1-5 /usr/bin/website-blocking.sh disable alice after_school
-#   # Evening: block all streaming
-#   0 18 * * * /usr/bin/website-blocking.sh enable alice evening
-#   0 20 * * * /usr/bin/website-blocking.sh disable alice evening
+# Cron example:
+#   0 20 * * * website-blocking.sh enable eli no_streaming
+#   0 8 * * * website-blocking.sh disable eli no_streaming
 #
 # Author: wighawag
 # License: AGPL-3.0-only
@@ -27,7 +20,8 @@
 
 set -u
 
-CONFIG="${PARENTAL_WEBSITES_CONFIG:-/etc/config/parental_websites}"
+BLOCK_RULES_CONFIG="${BLOCK_RULES_CONFIG:-/etc/config/block_rules}"
+WEBSITES_CONFIG="${PARENTAL_WEBSITES_CONFIG:-/etc/config/parental_websites}"
 PROFILES_CONFIG="${PARENTAL_CONFIG:-/etc/config/parental_profiles}"
 STATE_DIR="${PARENTAL_STATE_DIR:-/tmp/parental-profiles}"
 NFT_BIN="${NFT:-nft}"
@@ -41,50 +35,32 @@ log() {
     $LOGGER -t parental-websites "$1" 2>/dev/null || echo "[parental-websites] $1" >&2
 }
 
-# Get MACs for a profile from the parental_profiles config
+# Get MACs for a profile from parental_profiles
 get_profile_macs() {
     grep "^$1|" "$PROFILES_CONFIG" 2>/dev/null | cut -d'|' -f3 | tr ',' ' '
 }
 
-# Get domains for a profile+group from the parental_websites config
-# Supports both 2-field (no group) and 3-field (with group) formats
-get_group_domains() {
-    local profile="$1"
-    local group="${2:-default}"
-
-    # Try 3-field format first: profile|group|domains
-    local domains
-    domains=$(grep "^${profile}|${group}|" "$CONFIG" 2>/dev/null | cut -d'|' -f3)
-    if [ -n "$domains" ]; then
-        echo "$domains" | tr ',' '\n' | grep -v '^$'
-        return 0
-    fi
-
-    # Fall back to 2-field format: profile|domains (only for "default" group)
-    if [ "$group" = "default" ]; then
-        # Match lines with exactly 2 fields (profile|domains)
-        grep "^${profile}|" "$CONFIG" 2>/dev/null | while IFS='|' read -r p rest; do
-            # Check if rest contains a pipe (3-field) or not (2-field)
-            if echo "$rest" | grep -q '|'; then
-                continue  # 3-field line, skip
-            fi
-            echo "$rest" | tr ',' '\n' | grep -v '^$'
-        done
-    fi
+# Get domains for a rule from block_rules
+get_rule_domains() {
+    local rule="$1"
+    grep "^${rule}|" "$BLOCK_RULES_CONFIG" 2>/dev/null | cut -d'|' -f2 | tr ',' '\n' | grep -v '^$'
 }
 
-# Check if a profile+group has website blocking configured
-group_has_websites() {
-    local profile="$1"
-    local group="${2:-default}"
-    [ -n "$(get_group_domains "$profile" "$group")" ]
+# Check if a rule is defined in block_rules
+rule_exists() {
+    grep -q "^$1|" "$BLOCK_RULES_CONFIG" 2>/dev/null
 }
 
-# Get the nftables set name for a profile+group
+# Check if a profile+rule association exists in parental_websites
+association_exists() {
+    local profile="$1"
+    local rule="$2"
+    grep -q "^${profile}|${rule}$\|^${profile}|${rule}|" "$WEBSITES_CONFIG" 2>/dev/null
+}
+
+# Get the nftables set name for a profile+rule
 get_set_name() {
-    local profile="$1"
-    local group="${2:-default}"
-    echo "blocked_sites_${profile}_${group}"
+    echo "blocked_sites_${1}_${2}"
 }
 
 # Initialize nftables table if needed
@@ -109,13 +85,11 @@ resolve_domain() {
     fi
 }
 
-# Remove all nftables rules for a profile+group
-remove_group_rules() {
+# Remove all nftables rules for a profile+rule
+remove_rule_entries() {
     local profile="$1"
-    local group="${2:-default}"
-    local set_name
-    set_name=$(get_set_name "$profile" "$group")
-    local rule_tag="block_sites_${profile}_${group}"
+    local rule="$2"
+    local rule_tag="block_sites_${profile}_${rule}"
 
     $NFT_BIN -a list chain inet "$NFT_TABLE" forward 2>/dev/null | \
         grep "$rule_tag" | grep -o 'handle [0-9]*' | awk '{print $2}' | \
@@ -124,132 +98,137 @@ remove_group_rules() {
         done
 }
 
-# Enable website blocking for a profile+group
+# Enable website blocking for a profile+rule
 enable_profile() {
     local profile="$1"
-    local group="${2:-default}"
+    local rule="${2:-default}"
     local set_name
-    set_name=$(get_set_name "$profile" "$group")
+    set_name=$(get_set_name "$profile" "$rule")
 
-    if ! group_has_websites "$profile" "$group"; then
-        echo "Error: profile '$profile' group '$group' has no website blocking configured" >&2
+    # Check the rule exists in block_rules
+    if ! rule_exists "$rule"; then
+        echo "Error: rule '$rule' not found in $BLOCK_RULES_CONFIG" >&2
         return 1
     fi
 
     nft_init
 
-    # Create or flush the per-group IP set
+    # Create or flush the per-rule IP set
     $NFT_BIN list set inet "$NFT_TABLE" "$set_name" 2>/dev/null && \
         $NFT_BIN flush set inet "$NFT_TABLE" "$set_name" 2>/dev/null || \
         $NFT_BIN add set inet "$NFT_TABLE" "$set_name" '{ type ipv4_addr; flags interval; }' 2>/dev/null
 
     # Resolve all domains and add their IPs to the set
     local domains
-    domains=$(get_group_domains "$profile" "$group")
+    domains=$(get_rule_domains "$rule")
     local ip_count=0
     for domain in $domains; do
-        log "Resolving $domain for '$profile/$group'"
+        log "Resolving $domain for '$profile/$rule'"
         for ip in $(resolve_domain "$domain"); do
             $NFT_BIN add element inet "$NFT_TABLE" "$set_name" "{ $ip }" 2>/dev/null && \
                 ip_count=$((ip_count + 1))
         done
     done
 
-    # Remove old rules for this group (if any)
-    remove_group_rules "$profile" "$group"
+    # Remove old rules for this profile+rule
+    remove_rule_entries "$profile" "$rule"
 
     # Add a rule for each MAC in the profile
-    local rule_tag="block_sites_${profile}_${group}"
+    local rule_tag="block_sites_${profile}_${rule}"
     for mac in $(get_profile_macs "$profile"); do
         $NFT_BIN add rule inet "$NFT_TABLE" forward \
             ether saddr "$mac" ip daddr @"$set_name" drop \
             comment "$rule_tag" 2>/dev/null
     done
 
-    echo "enabled" > "$STATE_DIR/${profile}_${group}_websites"
-    log "Website blocking enabled for '$profile/$group' ($ip_count IPs blocked)"
-    echo "Website blocking enabled for '$profile/$group' ($ip_count IPs blocked)"
+    echo "enabled" > "$STATE_DIR/${profile}_${rule}_websites"
+    log "Website blocking enabled for '$profile/$rule' ($ip_count IPs blocked)"
+    echo "Website blocking enabled for '$profile/$rule' ($ip_count IPs blocked)"
     return 0
 }
 
-# Disable website blocking for a profile+group
+# Disable website blocking for a profile+rule
 disable_profile() {
     local profile="$1"
-    local group="${2:-default}"
+    local rule="${2:-default}"
     local set_name
-    set_name=$(get_set_name "$profile" "$group")
+    set_name=$(get_set_name "$profile" "$rule")
 
-    remove_group_rules "$profile" "$group"
+    remove_rule_entries "$profile" "$rule"
 
-    # Flush and delete the set
     $NFT_BIN flush set inet "$NFT_TABLE" "$set_name" 2>/dev/null
     $NFT_BIN delete set inet "$NFT_TABLE" "$set_name" 2>/dev/null
 
-    echo "disabled" > "$STATE_DIR/${profile}_${group}_websites"
-    log "Website blocking disabled for '$profile/$group'"
-    echo "Website blocking disabled for '$profile/$group'"
+    echo "disabled" > "$STATE_DIR/${profile}_${rule}_websites"
+    log "Website blocking disabled for '$profile/$rule'"
+    echo "Website blocking disabled for '$profile/$rule'"
     return 0
 }
 
-# Show status of all website blocking
+# Show status
 show_status() {
-    echo "Profile/Group              | Domains                          | Status"
-    echo "--------------------------|----------------------------------|--------"
-    if [ ! -f "$CONFIG" ]; then
-        echo "(no config file at $CONFIG)"
+    echo "Profile/Rule           | Status"
+    echo "-----------------------|--------"
+    if [ ! -f "$WEBSITES_CONFIG" ]; then
+        echo "(no config at $WEBSITES_CONFIG)"
         return 0
     fi
-    while IFS='|' read -r f1 f2 f3; do
-        # Handle both 2-field and 3-field formats
-        if [ -z "$f3" ]; then
-            # 2-field: f1=profile, f2=domains, group=default
-            local name="$f1" group="default" domains="$f2"
-        else
-            # 3-field: f1=profile, f2=group, f3=domains
-            local name="$f1" group="$f2" domains="$f3"
-        fi
-        [ -z "$name" ] && continue
+    while IFS='|' read -r profile rule; do
+        [ -z "$profile" ] && continue
+        [ -z "$rule" ] && continue
         local status
-        status=$(cat "$STATE_DIR/${name}_${group}_websites" 2>/dev/null || echo "disabled")
-        printf "%-25s | %-32s | %s\n" "$name/$group" "$domains" "$status"
-    done < "$CONFIG"
+        status=$(cat "$STATE_DIR/${profile}_${rule}_websites" 2>/dev/null || echo "disabled")
+        printf "%-22s | %s\n" "$profile/$rule" "$status"
+    done < "$WEBSITES_CONFIG"
 }
 
-# List all configured website blocks
+# List all associations
 list_profiles() {
-    echo "Website blocking configured:"
-    if [ ! -f "$CONFIG" ]; then
-        echo "  (no config file at $CONFIG)"
+    echo "Website blocking associations:"
+    if [ ! -f "$WEBSITES_CONFIG" ]; then
+        echo "  (no config at $WEBSITES_CONFIG)"
         return 0
     fi
-    while IFS='|' read -r f1 f2 f3; do
-        if [ -z "$f3" ]; then
-            local name="$f1" group="default" domains="$f2"
-        else
-            local name="$f1" group="$f2" domains="$f3"
-        fi
-        [ -z "$name" ] && continue
+    while IFS='|' read -r profile rule; do
+        [ -z "$profile" ] && continue
+        [ -z "$rule" ] && continue
         local status
-        status=$(cat "$STATE_DIR/${name}_${group}_websites" 2>/dev/null || echo "disabled")
-        echo "  $name/$group: domains=$domains, status=$status"
-    done < "$CONFIG"
+        status=$(cat "$STATE_DIR/${profile}_${rule}_websites" 2>/dev/null || echo "disabled")
+        local domains
+        domains=$(get_rule_domains "$rule" | tr '\n' ',' | sed 's/,$//')
+        echo "  $profile/$rule: domains=$domains, status=$status"
+    done < "$WEBSITES_CONFIG"
 }
 
-# Refresh all enabled groups (re-resolve domains to update IPs)
-refresh_all() {
-    while IFS='|' read -r f1 f2 f3; do
-        if [ -z "$f3" ]; then
-            local name="$f1" group="default"
-        else
-            local name="$f1" group="$f2"
-        fi
+# List all defined block rules
+list_rules() {
+    echo "Block rules defined:"
+    if [ ! -f "$BLOCK_RULES_CONFIG" ]; then
+        echo "  (no config at $BLOCK_RULES_CONFIG)"
+        return 0
+    fi
+    while IFS='|' read -r name domains; do
         [ -z "$name" ] && continue
+        local count
+        count=$(echo "$domains" | tr ',' '\n' | grep -c '.')
+        echo "  $name: $count domains"
+    done < "$BLOCK_RULES_CONFIG"
+}
+
+# Refresh all enabled rules (re-resolve domains)
+refresh_all() {
+    if [ ! -f "$WEBSITES_CONFIG" ]; then
+        return 0
+    fi
+    while IFS='|' read -r profile rule; do
+        [ -z "$profile" ] && continue
+        [ -z "$rule" ] && continue
         local status
-        status=$(cat "$STATE_DIR/${name}_${group}_websites" 2>/dev/null || echo "disabled")
+        status=$(cat "$STATE_DIR/${profile}_${rule}_websites" 2>/dev/null || echo "disabled")
         if [ "$status" = "enabled" ]; then
-            enable_profile "$name" "$group" 2>/dev/null
+            enable_profile "$profile" "$rule" 2>/dev/null
         fi
-    done < "$CONFIG"
+    done < "$WEBSITES_CONFIG"
     log "Refreshed all website blocking rules"
 }
 
@@ -258,24 +237,21 @@ usage() {
 Usage: website-blocking.sh <command> [args]
 
 Commands:
-  status                          Show status of all website blocking
-  list                            List all configured website blocks
-  enable <profile> [group]        Enable website blocking (default group if none)
-  disable <profile> [group]       Disable website blocking
-  refresh                         Re-resolve domains and update IPs (for cron)
+  status                        Show status of all profile/rule associations
+  list                          List all associations (with domains)
+  rules                         List all defined block rules
+  enable <profile> <rule>       Enable website blocking for a profile
+  disable <profile> <rule>      Disable website blocking for a profile
+  refresh                       Re-resolve domains and update IPs (for cron)
 
-Config: $CONFIG
-  Format: profile|group|domain1,domain2  (with groups)
-      or: profile|domain1,domain2        (without, uses "default" group)
+Config files:
+  $BLOCK_RULES_CONFIG       rule_name|domain1,domain2,...
+  $WEBSITES_CONFIG          profile_name|rule_name
+  $PROFILES_CONFIG          profile_name|budget|mac1,mac2,...
 
 Cron examples:
-  # After school: block YouTube + TikTok
-  30 15 * * 1-5 /usr/bin/website-blocking.sh enable alice after_school
-  0 17 * * 1-5 /usr/bin/website-blocking.sh disable alice after_school
-  # Evening: block all streaming (different domain list)
-  0 18 * * * /usr/bin/website-blocking.sh enable alice evening
-  0 20 * * * /usr/bin/website-blocking.sh disable alice evening
-  # Refresh DNS hourly
+  0 20 * * * /usr/bin/website-blocking.sh enable eli no_streaming
+  0 8 * * * /usr/bin/website-blocking.sh disable eli no_streaming
   0 * * * * /usr/bin/website-blocking.sh refresh
 EOF
 }
@@ -283,17 +259,22 @@ EOF
 case "${1:-}" in
     enable)
         [ -z "${2:-}" ] && { echo "Error: missing profile name" >&2; exit 1; }
-        enable_profile "$2" "${3:-default}"
+        [ -z "${3:-}" ] && { echo "Error: missing rule name" >&2; exit 1; }
+        enable_profile "$2" "$3"
         ;;
     disable)
         [ -z "${2:-}" ] && { echo "Error: missing profile name" >&2; exit 1; }
-        disable_profile "$2" "${3:-default}"
+        [ -z "${3:-}" ] && { echo "Error: missing rule name" >&2; exit 1; }
+        disable_profile "$2" "$3"
         ;;
     status)
         show_status
         ;;
     list)
         list_profiles
+        ;;
+    rules)
+        list_rules
         ;;
     refresh)
         refresh_all
