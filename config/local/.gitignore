@@ -1,0 +1,11 @@
+# Local configuration files (gitignored)
+# Put your actual router configs here:
+#   parental_profiles
+#   parental_websites
+#   mac_allowlist
+#   parental_blocklists
+#   crontab
+#   tickets.html
+*
+!.gitignore
+!README.md
