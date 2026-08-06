@@ -1,7 +1,7 @@
 ---
 title: Running a netns + nftables packet-path harness in a rootless container
 slug: rootless-container-netns-nftables-requirements
-source: 'measured side by side with podman 5.4.2 and docker 29.5.2, both rootless, on Debian, 2026-08-06'
+source: 'measured, 2026-08-06, in layers of differing strength. The rootless capability/sysctl requirements were measured side by side on podman 5.4.2 AND docker 29.5.2 on Debian. The OpenWrt-specific recipe, the CAP_SYS_ADMIN lower bound, the compose sysctls behaviour and the dated suite snapshot were each measured on ONE engine only (podman 5.4.2, or docker for the image probes), so treat the cross-engine equivalence as established for the first group and untested for the rest.'
 ---
 
 Requirements for building a real LAN-to-WAN topology inside a container and asserting on the packet path, established by trial rather than documentation.
@@ -44,9 +44,11 @@ The requirements above were established on Alpine. Reproducing them on `openwrt/
 - **`podman compose` DOES honour the compose `sysctls:` key**, verified directly on podman 5.4.2 delegating to the docker-compose plugin (a service declaring `sysctls: {net.ipv4.ip_forward: "1"}` reads back `1` from `/proc/sys` inside the container). So a compose-driven gate can carry the requirement and no raw `podman run` fallback is needed. Worth recording because the rest of this note was established with `podman run` CLI flags and the two paths are not automatically equivalent; worth re-checking on a machine whose `podman compose` resolves to a different backend. This is not OpenWrt-specific, it is a compose-versus-CLI fact.
 - **`CAP_SYS_ADMIN` is required for `ip netns add`, not just `CAP_NET_ADMIN`.** Measured: with `--cap-add NET_ADMIN` alone, `ip netns add` fails at `mount --make-shared /var/run/netns: Operation not permitted`; adding `SYS_ADMIN` succeeds. Easy to miss if every probe you run happens to pass all three capabilities, because then you never see the boundary.
 
-## A measured baseline for the existing suite
+## Environment snapshot: what this repo's suite did on the image, 2026-08-06
 
-Running the repo's 104-test suite on `openwrt/rootfs:x86-64-25.12.4` with the packages above (before `coreutils-cksum` was added) and no mocks at all:
+A dated snapshot, not durable ground truth: it records how a specific suite behaved on a specific image on a specific day, so a later run producing a different number has something concrete to reconcile against. It will go out of date as tests are added and removed, and that is expected. The durable, external part of it is already in the bullets above (busybox lacks `cksum`; the iptables mock is Alpine-specific).
+
+Running the repo's then-104-test suite on `openwrt/rootfs:x86-64-25.12.4` with the packages above (before `coreutils-cksum` was added) and no mocks at all:
 
 ```
 ok:     102

@@ -28,11 +28,22 @@ The recipe below is measured, not inferred. Each item was found by hitting the f
 - `coreutils-cksum` is required by the AdGuard tests, which derive filter IDs with `cksum`.
 - `nsenter` is needed by the follow-on harness task.
 
-Nothing else needs installing for the harness: the base image already has `/usr/sbin/uhttpd` (to serve a page) and busybox `wget` (to fetch one), which is what the follow-on task's topology uses.
+Nothing else needs installing for the harness: the base image already has `/usr/sbin/uhttpd` (to serve a page) and `/usr/bin/wget` (to fetch one), which is what the follow-on task's topology uses. Note `wget` here is **uclient-fetch**, not busybox wget and not GNU wget; it supports `-q`, `-O <file>` and `--timeout=N | -T N`, which is all the harness needs. There is no `timeout` applet on this image (`coreutils-timeout` is packaged if one is ever wanted), so the fetch client's own `-T` is the way to bound a probe.
+
+**Existing Dockerfile stanzas:** keep the repo `COPY`, `WORKDIR`, the `chmod +x` of the scripts, and the mock-state directory creation. Drop the `ln -sf /usr/sbin/nft /usr/bin/nft` line: the OpenWrt image's `PATH` already covers `/usr/sbin`, so it is redundant. Bare `apk add` works on this image without a preceding `apk update`, so no index refresh is required, though adding one is harmless.
 
 **Capabilities and sysctl, in `docker/docker-compose.yml`, on BOTH the `test` and `shell` services:** add `SYS_ADMIN` and `NET_RAW` to the existing `cap_add`, and add `sysctls: net.ipv4.ip_forward=1`. `--privileged` is NOT required. `podman compose` has been confirmed to honour the `sysctls:` key. `SYS_ADMIN` is what makes `ip netns add` work (measured: with `NET_ADMIN` alone it fails on the bind-mount with a permission error), and the sysctl is what makes the topology forward at all.
 
-**bats is NOT packaged for OpenWrt.** Fetch `bats-core` **v1.11.0** from its GitHub release tarball during the image build, extract to a fixed path, and symlink `bin/bats` onto `PATH` so the existing compose command (`bats test/`) keeps working unchanged. Do NOT run bats' own `install.sh`: it fails with `install: command not found`, because OpenWrt has no coreutils `install`. Pin the version and prefer a checksum, so an upstream change cannot break the gate with no commit in this repo. Fetching at build time is deliberate: committing several dozen third-party files into this repo is a worse review burden than a pinned download.
+**bats is NOT packaged for OpenWrt.** Fetch it during the image build, from this exact URL, and verify this exact digest:
+
+```
+https://github.com/bats-core/bats-core/archive/refs/tags/v1.11.0.tar.gz
+sha256  aeff09fdc8b0c88b3087c99de00cf549356d7a2f6a69e3fcec5e0e861d2f9063   (172044 bytes)
+```
+
+That digest was measured, and confirmed stable across two independent fetches. Use it as a literal in the Dockerfile and fail the build on mismatch. Do NOT download-then-hash-whatever-arrived: that satisfies the wording while defeating the purpose, which is that an upstream change cannot alter the gate without a commit in this repo.
+
+Extract to a fixed path and symlink the entry point so the compose command's bare `bats test/` keeps working, for example extract to `/opt/bats-core` with `--strip-components=1` and symlink `/opt/bats-core/bin/bats` to `/usr/bin/bats`. Do NOT run bats' own `install.sh`: it fails with `install: command not found`, because OpenWrt has no coreutils `install`. Fetching at build time rather than committing the tree is deliberate: several dozen vendored third-party files are a worse review burden than a pinned, digest-checked download.
 
 **`mkdir -p /var/run` in the image.** On OpenWrt `/var/run` symlinks to `/tmp/run`, which procd creates at boot, so it does not exist in a container. Without it `ip netns add` fails, which the follow-on task depends on.
 
@@ -50,8 +61,8 @@ Removing the iptables mock is a CHOICE, not a forced consequence, and worth unde
 - [ ] `uci`, `logger`, `nft` and `/usr/sbin/uhttpd` resolve to the real OpenWrt binaries inside the container
 - [ ] `bats --version` reports the pinned 1.11.0, and bare `bats test/` still works as the compose command invokes it
 - [ ] The bats tarball is fetched at a pinned version and verified against a recorded checksum, since this fetch gates every future build
-- [ ] `ip netns add` succeeds inside the container, proving both the `/var/run` fix and the added `SYS_ADMIN` capability, and `nsenter` is present
-- [ ] `cat /proc/sys/net/ipv4/ip_forward` reads `1` inside the container, proving the compose sysctl took effect
+- [ ] A new `test/environment.bats` proves the environment claims THROUGH THE GATE rather than by a manual side-channel run: `ip netns add` succeeds (proving both the `/var/run` fix and the `SYS_ADMIN` capability), `/proc/sys/net/ipv4/ip_forward` reads `1` (proving the compose sysctl), `bats --version` is 1.11.0, and `uci`, `logger`, `nft`, `uhttpd`, `nsenter` and `cksum` all resolve. These are additive tests, which is why the count bar above is stated relatively
+- [ ] Residual `mock` NAMING (the `MOCK_LOG_DIR` variable, `/tmp/mock-state`, header comments mentioning mocks) is explicitly OUT of scope: the criterion above is about mock implementations, not about renaming things
 - [ ] The shared test helpers keep `reset_mocks`, `assert_mac_blocked` and `assert_mac_not_blocked` working for the tests that use them
 
 ## Blocked by
@@ -64,14 +75,14 @@ Removing the iptables mock is a CHOICE, not a forced consequence, and worth unde
 >
 > Context: this repo controls a home router. Its test suite has been running on Alpine with mocked `uci` and `logger`, which produced confidently wrong conclusions more than once (a claim about nftables JSON support and a claim about package availability were both settled only by testing a real image). Moving to `openwrt/rootfs` removes that class of error. Read `work/notes/findings/rootless-container-netns-nftables-requirements.md` first: it carries the verified recipe and the failures behind each item.
 >
-> Everything you need is in the What-to-build section above, and every item there was established empirically rather than assumed. The exact numbers matter: the suite is 104 tests, you remove 2 iptables-backend cases, and the result must be 102 passing with nothing else broken. If you see a different number, something else broke and you should find out what rather than adjusting the expectation.
+> Everything you need is in the What-to-build section above, and every item there was established empirically rather than assumed. State your outcome RELATIVELY, not as an absolute count: you remove exactly the two iptables-backend cases, you add the environment test file described above, and no other test's result may change. As a sanity anchor the suite is 104 tests at the time of writing, so the likely outcome is 102 plus your new environment tests, but a sibling backlog task may legitimately remove other tests before you land, and that is not a regression.
 >
 > Two things that were predicted to break and do NOT, recorded so you do not go hunting. Dropping `bind-tools` is safe, but be precise about why, because the obvious reason is wrong: the website-blocking tests override the resolver with a mock, yet the profiles tests do NOT and still reach the default resolver path. They survive because busybox on OpenWrt provides `nslookup` and because they assert rule presence rather than resolved contents. Do not remove busybox's resolver on the strength of "it is mocked". Second, replacing the no-op `uci` shim with the real `uci` does not break the blocklists tests, even though they reach `uci commit dhcp` and an init-script restart, because inside the ephemeral container those either succeed harmlessly or fail quietly.
 >
 > Where to look: the container definition and the mock shims live in the docker directory; the test helpers and the iptables-specific cases live in the test directory. `docs/architecture.md` explains how the layers fit together.
 >
-> Do NOT change any script under `scripts/`, any behaviour, or the compose file's capabilities. Capabilities and the netns harness belong to the follow-on task; this one only swaps the environment and proves the existing suite still passes on it.
+> Scope fence: do NOT change any script under `scripts/` and do not change any product behaviour. You DO own the whole container definition, both `docker/Dockerfile` and `docker/docker-compose.yml`, including the capabilities and the sysctl described above. Only the netns harness itself belongs to the follow-on task.
 >
-> FIRST, check this task against current reality (it is a launch snapshot and may have DRIFTED): does it still match the code and the relevant ADRs? If the suite is no longer 104 tests, or the mocks have already moved, do NOT build on the stale premise: route the task to needs-attention with the discrepancy as the reason.
+> FIRST, check this task against current reality (it is a launch snapshot and may have DRIFTED): does it still match the code and the relevant ADRs? Drift that matters here is the mocks having already moved, the two iptables cases being gone, or the base image having changed. A DIFFERENT TEST COUNT IS NOT DRIFT, because a sibling task removes tests independently. If you find real drift, route to needs-attention with the discrepancy rather than building on a stale premise.
 >
 > RECORD non-obvious in-scope decisions durably and link them from the done record. The bats fetch mechanism (pinned tarball versus vendored tree) is exactly such a choice: if you deviate from the pinned-fetch decision above, write the why. An un-recorded in-scope decision is a review finding, not a silent default.
