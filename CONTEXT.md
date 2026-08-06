@@ -1,0 +1,45 @@
+# CONTEXT — my-router domain language
+
+The domain glossary for `my-router`. Agents and skills use THIS vocabulary when naming modules, tests, and discussing the system. Architectural rationale lives in `docs/adr/` (decisions); product framing lives in `work/specs/`.
+
+## What my-router is
+
+Parental control for OpenWrt on a GL.iNet Flint 2 (GL-MT6000): per-child internet schedules, daily time budgets, per-profile website blocking and temporary access tickets, enforced with nftables and AdGuard Home, plus an installer that deploys it to the router over SSH. Guest access is designed but not built.
+
+It is moving from a set of shell scripts to a single Go tool that owns schedules, state and an HTTP UI. The intent is that the Go tool absorbs the logic-bearing scripts rather than sitting beside them; which scripts survive as shell (and why) is an open question being settled by the exploration spec, with `panic-off.sh` the strongest candidate to stay shell precisely because it is the recovery path you run when the tool itself is what broke.
+
+## Core domain terms
+
+- **profile** — a named family member or device group (`eli`, `tia`, `family`) owning a daily budget and a set of devices. The unit everything else acts on: blocks, tickets, budgets and website rules are all per-profile.
+- **device** — one named MAC address. A child typically has several (phone, laptop wired, laptop wireless), and they are blocked and released together as a profile. Per `docs/adr/0003-devices-are-named-and-profiles-group-them.md` a device is becoming a first-class named entity in its own registry, so that a device can be allowed on the network without belonging to any profile. Today, devices exist only as bare MACs inside a profile and their names survive only as comments.
+- **device registry** — the intended home for device names and MAC addresses, separate from the grouping of devices into profiles. Not yet implemented; it is the config-schema half of ADR 0003.
+- **ungoverned device** — a registered device belonging to no profile: allowed on the network with full access, subject only to network-wide policy such as AdGuard filtering. The printer and the cameras are this in intent, and are currently faked as one-device profiles carrying a meaningless budget.
+- **MAC allowlist** — the set of MACs permitted to reach the internet at all. Unknown devices are dropped, which is what stops a child bypassing control by randomising their MAC. Currently derived from profile membership; becomes derived from the device registry under ADR 0003.
+- **ticket** — a time-limited grant of internet access to a whole profile, issued from a phone with no login. Intended to override everything else while it lasts; today it does not, because the budget checker cancels it within 60 seconds and the enforcement spec is what makes the override real.
+- **guest pass** — a time-limited grant to a device that is **not in the device registry** (not on the MAC allowlist), obtained by a visitor entering a passphrase. Note the discriminator is registration, not profile membership: an ungoverned device is registered and permanently allowed, whereas a guest is unregistered and allowed only for the pass's duration.
+- **time budget** — a daily allowance in minutes, shared across all of a profile's devices. A budget minute counts **actual use above a traffic threshold**, decided in `docs/adr/0001-budget-counts-actual-use-gated-by-a-threshold.md`; the measurement mechanism and the threshold value are what the exploration spec still carries. Today's code counts wall-clock minutes from midnight instead, which is a bug, not a definition.
+- **block rule** — a reusable named list of domains (`no_streaming`, `no_gaming`) defined once and applied to any profile, resolved to IPs and enforced as nftables sets.
+- **website blocking** — applying a block rule to a profile for a period, distinct from blocking the internet outright.
+- **schedule** — the recurring times a profile is blocked or has a block rule applied. Currently expressed as crontab lines; moving into config the tool owns, because a schedule that lives only in cron cannot be rendered in a UI or edited from a phone.
+- **block reason** — why a profile is blocked: `schedule`, `budget`, and possibly `manual`. NOT YET IMPLEMENTED; today only `blocked`/`allowed` is recorded, with no reason. Its purpose is to stop the subsystems fighting (a daily budget reset must not clear a bedtime block) and to let a UI say why a child is offline. Two things about it are still open in the enforcement spec: whether a block carries a SET of concurrent reasons or a single one with a precedence rule, and whether `schedule` and `manual` are distinguishable at all, given both come from the same command. Do not build against this term until those are answered.
+- **persisted block state** — per-profile block status, its reason, and the daily-reset day marker, stored outside tmpfs so a reboot does not silently grant internet. NOT YET IMPLEMENTED; today all of it lives in `/tmp` and a reboot does silently grant internet, which is the enforcement spec's headline defect. Distinct from tickets and guest passes, which are kernel timeout sets and are MEANT to die with the router.
+- **enforcement vs state** — the distinction this project keeps getting wrong. **Enforcement** is what nftables will actually do to a packet; **state** is what the state files and logs claim. When they disagree the firewall is right, so status must be derived from the firewall.
+- **packet path** — whether a real packet from a given source MAC actually reaches the internet. The only trustworthy assertion about enforcement, and the thing the test suite historically never checked.
+- **`parental_control` table** — the dedicated `inet` nftables table holding the sets and the forward chain, hooked at priority -10 so it runs ahead of fw4 without mixing into it.
+- **work/ contract** — the on-disk system this repo uses, defined by the reference docs in **`work/protocol/`** (copied here by `setup`): `WORK-CONTRACT.md` (the contract), `CLAIM-PROTOCOL.md`, `REVIEW-PROTOCOL.md`, `TASKING-PROTOCOL.md`, `SURFACE-PROTOCOL.md`, `task-template.md`, `spec-template.md`, `ADR-FORMAT.md`. Three REGIME umbrellas — `notes/` (capture buckets), `tasks/` (the build board), `specs/` (the spec lifecycle) — plus top-level `questions/` and `protocol/`. One markdown file per item, status = the folder it lives in (never a field). Capture buckets: `notes/ideas/` (proposed), `notes/observations/` (spotted, unverified, append-only), `notes/findings/` (verified external/domain ground truth, each with a `source:`). ADRs (`docs/adr/`, format in `work/protocol/ADR-FORMAT.md`) record what WE decided and why.
+- **promptGuidance** — the per-repo NUDGE namespace in `dorfl.json` whose members (currently just `testFirst`) strengthen the wording in the worker's in-band prompt. NOT a gate: the `verify` step is still the only acceptance bar. Omitted ⇒ off; absence is the default.
+
+## Conventions
+
+Standing per-change rules agents must follow in this repo.
+
+<!-- No standing per-change rule recorded (matching ../netcage, which carries the same empty stub — no changeset/CHANGELOG/news-fragment convention). Add yours here, or delete this section. For enforcement, wire your own check into the `dorfl.json` `verify` gate. -->
+
+The dorfl version is PINNED via `dorflCmd` in `dorfl.json` (`npx dorfl@0.11.2`), so bare `dorfl` self-forwards to a fixed version instead of floating with whatever is globally installed. To bump: edit `dorflCmd`, then `dorfl sync`. This repo has no JS manifest, so the pin deliberately uses `npx` rather than introducing a `package.json`.
+
+The `verify` gate runs the test suite inside a container. **Today** that is an Alpine image with `NET_ADMIN` only, and the tests assert on nftables set membership. The enforcement spec changes this to a real `openwrt/rootfs` image with `NET_ADMIN`, `SYS_ADMIN`, `NET_RAW` and `net.ipv4.ip_forward=1` so the tests can build a network topology and assert on the packet path; until that lands, do not assume those capabilities are present. Omitting the sysctl in particular makes every probe read unreachable, including the baseline, which looks like a passing firewall while testing nothing. podman and docker are interchangeable; the gate names podman.
+
+## Skills this repo uses
+
+- Required: `setup` (onboarding/migration), `to-spec`, `to-task`.
+- Recommended: `review`, `grill-me`.

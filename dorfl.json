@@ -1,0 +1,9 @@
+{
+	"dorflCmd": "npx dorfl@0.11.2",
+	"prepare": "podman compose -f docker/docker-compose.yml build test",
+	"verify": "podman compose -f docker/docker-compose.yml run --build --rm test",
+	"harness": "pi",
+	"autoBuild": false,
+	"autoTask": false,
+	"promptGuidance": {"testFirst": true}
+}
