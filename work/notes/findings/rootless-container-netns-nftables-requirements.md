@@ -76,3 +76,16 @@ Both causes are understood: the first is removed deliberately along with the dea
 - **`--listen-address` is ignored without `--bind-interfaces`** (dnsmasq still binds `0.0.0.0`).
 - **Start long-lived daemons from `setup_file`, not `setup`.** A background process launched from bats' per-test `setup` does not reliably survive that subshell exiting, and presents as the daemon "never becoming ready" while the identical commands work by hand. `setsid` plus redirected stdio is the belt-and-braces form.
 - The production topology (AdGuard on 53, dnsmasq on 54 as its upstream) reproduces exactly in one container, so the test exercises the same two-resolver arrangement the router runs.
+
+## Booting OpenWrt's network stack in the container (no PID 1, no privileged)
+
+The rootfs image ships the services but starts none of them, so `ifstatus` cannot answer and tests must pin `PARENTAL_WAN_IF`. Bringing ubusd and netifd up removes that need, and needs neither `--privileged` nor init as PID 1:
+
+- **`mkdir -p /var/run/ubus` first.** Without it ubusd starts but never creates its socket, which presents as "ubusd is running but ubus does not respond". This was the whole reason an earlier attempt concluded PID 1 was required.
+- **`/sbin/init` and `/sbin/procd` both FAIL when backgrounded** (no ubus, no generated config), so do not try to boot the full system; start `ubusd` and `netifd` directly instead.
+- **`/etc/config/network` does not exist in the image** (a real board generates it during first boot), so write it. Better for a test anyway: the topology is explicit rather than board-derived.
+- **Bridge ports must exist BEFORE netifd starts**, as they would on real hardware, or netifd declines to create the bridge. With them present, netifd creates and addresses `br-lan` itself.
+- **busybox `pgrep -x` matches nothing** on this image, and `pgrep -f netifd` matches the test runner's own command line, so killing what it returns would kill the runner. Use `killall`, which matches on process name and does neither.
+- **Stopping netifd in teardown is mandatory, not tidiness.** The enforcement scripts let `ifstatus` OVERRIDE `PARENTAL_WAN_IF`, so a surviving netifd silently changes WAN resolution for every other test file in the suite.
+
+With that in place `ifstatus wan` reports `pppoe-wan` and the scripts resolve their interfaces unaided, which is the branch that carried a real enforcement failure (commit c20d341).
