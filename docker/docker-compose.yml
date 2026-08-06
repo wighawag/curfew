@@ -3,8 +3,20 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    # NET_ADMIN alone is not enough: SYS_ADMIN is what lets `ip netns add`
+    # bind-mount its namespace (measured: it fails without it).
+    #
+    # The ip_forward sysctl is DEFENSIVE, not load-bearing on every host. A
+    # container's network namespace inherits the host's value, which is 1 on
+    # a typical developer machine, so the topology usually forwards without
+    # it. Setting it explicitly means the suite does not silently depend on a
+    # host setting it does not control.
     cap_add:
       - NET_ADMIN
+      - SYS_ADMIN
+      - NET_RAW
+    sysctls:
+      - net.ipv4.ip_forward=1
     volumes:
       - ../:/opt/my-router
     working_dir: /opt/my-router
@@ -17,22 +29,13 @@ services:
       dockerfile: docker/Dockerfile
     cap_add:
       - NET_ADMIN
+      - SYS_ADMIN
+      - NET_RAW
+    sysctls:
+      - net.ipv4.ip_forward=1
     volumes:
       - ../:/opt/my-router
     working_dir: /opt/my-router
     entrypoint: sh
     stdin_open: true
     tty: true
-
-  # Full OpenWrt emulation via QEMU (requires KVM support)
-  # Uses albrechtloh/openwrt-docker for real OpenWrt testing
-  # Uncomment to use, requires KVM and privileged mode
-  #
-  # openwrt:
-  #   image: albrechtloh/openwrt-docker:latest
-  #   privileged: true
-  #   environment:
-  #     - LAN_IF=veth
-  #     - WAN_IF=veth
-  #   ports:
-  #     - "8006:8006"  # Web UI

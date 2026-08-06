@@ -1,57 +1,51 @@
-# Test environment for parental control scripts
-# Uses Alpine Linux with REAL nftables (same nft binary as OpenWrt)
+# Test environment for the parental control scripts.
 #
-# We can't run the mediatek ARM firmware on x86, but nftables behaves
-# identically regardless of distro. We use real nft + mock uci only.
+# Real OpenWrt userland, matching the router's release line, with NO mocked
+# system tools: uci, logger, nft, uhttpd and busybox behaviour are the real
+# things. See docs/adr/0005-test-environment-is-a-real-openwrt-image.md for
+# why, and work/notes/findings/rootless-container-netns-nftables-requirements.md
+# for the measurements behind each step below.
 #
 # Usage:
-#   docker compose -f docker/docker-compose.yml run --rm test
-#   docker compose -f docker/docker-compose.yml run --rm shell
+#   podman compose -f docker/docker-compose.yml run --build --rm test
+#   podman compose -f docker/docker-compose.yml run --build --rm shell
 
-FROM alpine:3.20
+FROM openwrt/rootfs:x86-64-25.12.4
 
-# Install:
-# - BusyBox (OpenWrt uses BusyBox)
-# - bats-core for testing
-# - nftables (REAL nft binary, same as OpenWrt uses)
-# - bind-tools (nslookup for website-blocking.sh DNS resolution)
-# - coreutils, grep, sed for script dependencies
-RUN apk add --no-cache \
-    busybox \
-    busybox-extras \
-    bash \
-    bats \
-    nftables \
-    bind-tools \
-    coreutils \
-    grep \
-    sed \
-    curl
+# OpenWrt package names differ from Alpine's, and busybox is missing pieces
+# the test tooling needs. Each of these has a measured failure behind it:
+#   bash             bats is a bash program; OpenWrt ships only ash
+#   ip-full          busybox `ip` has no `link add` and no `netns`
+#   coreutils-nl     bats calls `nl`; without it it runs 0 of N tests silently
+#   coreutils-cksum  test/setup-adguard.bats derives filter IDs with `cksum`
+#   nsenter          `ip netns exec` cannot work here (it remounts /sys)
+RUN apk add --no-cache bash ip-full coreutils-nl coreutils-cksum nsenter
 
-# nft is installed at /usr/sbin/nft, create symlink to /usr/bin for PATH
-RUN ln -sf /usr/sbin/nft /usr/bin/nft
+# bats is not packaged for OpenWrt at all, so fetch it pinned and verified.
+# The digest is a literal on purpose: an upstream change must not be able to
+# alter the gate without a commit in this repo. Note bats' own install.sh
+# cannot be used (OpenWrt has no coreutils `install`), and busybox tar has no
+# --strip-components, so extract as-is and symlink the versioned path.
+ARG BATS_VERSION=1.11.0
+ARG BATS_SHA256=aeff09fdc8b0c88b3087c99de00cf549356d7a2f6a69e3fcec5e0e861d2f9063
+RUN wget -q -O /tmp/bats.tar.gz \
+      "https://github.com/bats-core/bats-core/archive/refs/tags/v${BATS_VERSION}.tar.gz" \
+ && echo "${BATS_SHA256}  /tmp/bats.tar.gz" | sha256sum -c - \
+ && mkdir -p /opt \
+ && tar -xzf /tmp/bats.tar.gz -C /opt \
+ && ln -sf "/opt/bats-core-${BATS_VERSION}/bin/bats" /usr/bin/bats \
+ && rm -f /tmp/bats.tar.gz
 
-# Copy project files
+# /var is a symlink to /tmp on OpenWrt and /var/run is created at boot by
+# procd, which never runs in a container. Without this `ip netns add` fails.
+RUN mkdir -p /var/run
+
 COPY . /opt/my-router/
 WORKDIR /opt/my-router
 
-# Make scripts executable
 RUN chmod +x scripts/*.sh web/cgi-bin/ticket
 
-# Create state directory
+# State directory used by the test helpers.
 RUN mkdir -p /tmp/mock-state
 
-# Mock uci - OpenWrt-specific, not available in Alpine
-RUN printf '#!/bin/sh\nif echo "$@" | grep -q "get network.wan.device"; then\n  echo "eth1"\n  exit 0\nfi\nexit 0\n' > /usr/local/bin/mock-uci && chmod +x /usr/local/bin/mock-uci
-RUN ln -sf /usr/local/bin/mock-uci /usr/bin/uci
-
-# Mock logger - logs to file instead of syslog
-RUN printf '#!/bin/sh\necho "$@" >> /tmp/mock-state/logger.log\n' > /usr/local/bin/mock-logger && chmod +x /usr/local/bin/mock-logger
-RUN ln -sf /usr/local/bin/mock-logger /usr/bin/logger
-
-# Mock iptables for iptables fallback tests (real nft is used for nft tests)
-COPY docker/mock-iptables.sh /usr/local/bin/mock-iptables
-RUN chmod +x /usr/local/bin/mock-iptables
-
-# Default: run all tests
 CMD ["bats", "test/"]

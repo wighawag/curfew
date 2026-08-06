@@ -26,7 +26,7 @@ How my-router is put together today. This describes our own code, so the code is
 
 **Configuration.** Pipe-delimited flat files rather than UCI. `parental_profiles` (`name|budget|mac,mac`) is the single source of truth for both profile membership and the MAC allowlist; `block_rules` (`rule|domain,domain`) defines reusable domain lists; `parental_blocklists` is a URL list; `device_ips` drives static DHCP leases. Real values live in the gitignored `config/local/`, with `.example` templates committed.
 
-**Tests (bats in a container).** The suite runs against a real `nft` binary with `NET_ADMIN`, asserting on set membership and rule presence. The enforcement spec adds a network-namespace harness that asserts on the packet path instead, because set membership was never sufficient to prove enforcement.
+**Tests (bats in a container).** The suite runs on a real OpenWrt userland (`openwrt/rootfs`) with no mocked system tools, so `uci`, `logger`, `nft` and `uhttpd` are the real binaries. Most tests assert on nftables set membership and rule presence. A network-namespace harness (`test/test_helper/netns.bash`) additionally builds a real LAN-to-WAN topology and asserts on the **packet path**, because set membership was never sufficient to prove enforcement: the suite was green while the firewall enforced nothing. See `docs/adr/0004-tests-assert-on-the-packet-path.md` and `docs/adr/0005-test-environment-is-a-real-openwrt-image.md`.
 
 ## Seams worth knowing
 
