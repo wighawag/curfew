@@ -93,11 +93,19 @@ netns_setup() {
     _netns_run internet ip link set lo up
     _netns_run internet ip route add default via "$NETNS_ROUTER_WAN_IP"
 
-    # The internet host
+    # The internet host.
+    #
+    # NOTE the absence of -f, and the redirected stdio. uhttpd's -f means "do
+    # NOT fork to background", so `uhttpd -f ... &` leaves a foreground server
+    # holding our stdout forever: bats then never sees EOF on its output pipe
+    # and the whole suite hangs AFTER the last test passes. That is exactly the
+    # defect recorded in work/notes/findings/uhttpd-cgi-timeout-and-backgrounded-children.md,
+    # and it was reproduced here by ignoring it. Let the daemon daemonize, and
+    # detach its stdio so it can never hold the pipe open.
     mkdir -p "$NETNS_DOCROOT"
     echo "$NETNS_PAGE" > "$NETNS_DOCROOT/index.html"
-    _netns_run internet /usr/sbin/uhttpd -f -h "$NETNS_DOCROOT" -p "$NETNS_INTERNET_IP":80 &
-    echo $! > "$NETNS_PIDFILE"
+    _netns_run internet /usr/sbin/uhttpd -h "$NETNS_DOCROOT" -p "$NETNS_INTERNET_IP":80 \
+        >/dev/null 2>&1 </dev/null
 
     # Wait for readiness rather than racing it. No timeout applet on this
     # image, so bound each attempt with the fetch client's own -T.
@@ -135,12 +143,31 @@ netns_probe() {
     _netns_run client wget -q -T 3 -O /dev/null "http://$NETNS_INTERNET_IP/" 2>/dev/null
 }
 
+# Kill any server this harness started. Uses pgrep, NOT pkill: pkill is absent
+# on this image, and the previous `pkill ... || true` failed silently, which is
+# how five stray servers accumulated unnoticed.
+netns_stop_server() {
+    local pids p
+    # `|| true` is load-bearing: pgrep exits 1 when nothing matches, and bats
+    # runs setup/teardown under errexit, so a bare assignment aborts the whole
+    # setup on the common case of there being nothing to clean up.
+    pids=$(pgrep -f "uhttpd -h $NETNS_DOCROOT" 2>/dev/null || true)
+    for p in $pids; do
+        kill "$p" 2>/dev/null || true
+    done
+    return 0
+}
+
+# How many servers this harness has left running. 0 is the only healthy value;
+# harness.bats asserts it, because a survivor does not fail a test, it hangs
+# the entire suite after the last one passes.
+netns_server_count() {
+    pgrep -f "uhttpd -h $NETNS_DOCROOT" 2>/dev/null | grep -c . || true
+}
+
 netns_teardown() {
-    if [ -f "$NETNS_PIDFILE" ]; then
-        kill "$(cat "$NETNS_PIDFILE")" 2>/dev/null || true
-        rm -f "$NETNS_PIDFILE"
-    fi
-    pkill -f "uhttpd -f -h $NETNS_DOCROOT" 2>/dev/null || true
+    netns_stop_server
+    rm -f "$NETNS_PIDFILE"
     ip netns delete client 2>/dev/null || true
     ip netns delete internet 2>/dev/null || true
     ip link delete "$NETNS_LAN_IF" 2>/dev/null || true

@@ -68,6 +68,18 @@ teardown() {
     [ "$status" -eq 0 ]
 }
 
+@test "teardown leaves no server running" {
+    # A leaked server does NOT fail a test. It keeps the output pipe open, so
+    # bats never sees EOF and the whole suite hangs AFTER the last test passes,
+    # which looks like a green run that never ends. That happened: five stray
+    # servers accumulated, one per test, because the server was started with
+    # -f (do NOT fork) in the background and the cleanup used pkill, which does
+    # not exist on this image and failed silently under `|| true`.
+    [ "$(netns_server_count)" -ge 1 ]
+    netns_teardown
+    [ "$(netns_server_count)" -eq 0 ]
+}
+
 @test "the harness writes nothing into the mounted repository" {
     # The compose file bind-mounts the repo read-write, so a harness that
     # wrote fixtures under it would dirty the host worktree. Neither git nor
