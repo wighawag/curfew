@@ -118,18 +118,9 @@ teardown() {
 @test "block is idempotent (blocking twice doesn't add duplicate rules)" {
     sh "$SCRIPT" block alice
     sh "$SCRIPT" block alice
-    # With nft sets, adding an element twice is a no-op (set has unique elements)
-    # With iptables, we check the mock state file
-    if [ "${PARENTAL_FIREWALL:-nft}" = "iptables" ]; then
-        state_file="$MOCK_LOG_DIR/iptables_state"
-        count=$(grep -c "^DROP aa:bb:cc:dd:ee:01$" "$state_file")
-        [ "$count" -eq 1 ]
-    else
-        # With nft, the set should contain the MAC only once
-        # nft sets are inherently unique, so this is guaranteed by nft itself
-        # We just verify the MAC is in the set
-        assert_mac_blocked "aa:bb:cc:dd:ee:01"
-    fi
+    # nft sets hold unique elements, so adding twice is inherently a no-op.
+    # Verifying the MAC is present is all this can assert.
+    assert_mac_blocked "aa:bb:cc:dd:ee:01"
 }
 
 @test "unblock is idempotent (unblocking when not blocked doesn't error)" {
@@ -358,23 +349,6 @@ teardown() {
     export PARENTAL_FIREWALL="nft"
     sh "$SCRIPT" block alice
     run sh "$SCRIPT" ticket alice 30
-    [ "$status" -eq 0 ]
-    assert_mac_not_blocked "aa:bb:cc:dd:ee:01"
-}
-
-@test "block works with iptables backend" {
-    export PARENTAL_FIREWALL="iptables"
-    export IPTABLES="/usr/local/bin/mock-iptables"
-    run sh "$SCRIPT" block alice
-    [ "$status" -eq 0 ]
-    assert_mac_blocked "aa:bb:cc:dd:ee:01"
-}
-
-@test "unblock works with iptables backend" {
-    export PARENTAL_FIREWALL="iptables"
-    export IPTABLES="/usr/local/bin/mock-iptables"
-    sh "$SCRIPT" block alice
-    run sh "$SCRIPT" unblock alice
     [ "$status" -eq 0 ]
     assert_mac_not_blocked "aa:bb:cc:dd:ee:01"
 }

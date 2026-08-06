@@ -111,7 +111,7 @@ blocklists.sh update                   # Re-download blocklists now
 docker compose -f docker/docker-compose.yml run --rm test
 ```
 
-81 tests with real nftables (Alpine + NET_ADMIN, same `nft` binary as OpenWrt).
+113 tests on a real OpenWrt userland (`openwrt/rootfs`), with no mocked system tools. Most assert on nftables state; a network-namespace harness additionally builds a real LAN-to-WAN topology and asserts on the **packet path**, which is the only evidence that distinguishes "the ruleset looks right" from "the packet is dropped".
 
 ## Project structure
 
@@ -125,7 +125,7 @@ my-router/
 │   ├── setup-firewall.sh      # MAC allowlist (block unknown devices)
 │   └── blocklists.sh          # Global gambling/porn/malware filtering
 ├── web/tickets.html           # Phone UI for tickets
-├── test/                      # 81 bats tests
+├── test/                      # 113 bats tests (incl. packet-path harness)
 ├── docker/                    # Test environment
 └── docs/                      # Examples and guides
 ```
