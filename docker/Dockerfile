@@ -36,6 +36,21 @@ RUN wget -q -O /tmp/bats.tar.gz \
  && ln -sf "/opt/bats-core-${BATS_VERSION}/bin/bats" /usr/bin/bats \
  && rm -f /tmp/bats.tar.gz
 
+# AdGuard Home owns DNS filtering on the router (docs/adr/0002), and until now
+# nothing tested it: the existing tests wrote their own YAML and grepped it,
+# never starting the thing. Pinned and digest-checked for the same reason bats
+# is: an upstream release must not be able to change what the gate tests.
+# The router's installer deliberately tracks 'latest' instead; that difference
+# is intentional, since a test needs reproducibility more than freshness.
+ARG AGH_VERSION=v0.107.78
+ARG AGH_SHA256=2070f644644be8299232f4a7bff857036fb1423563c1bf8c787e07aaf4f88278
+RUN wget -q -O /tmp/agh.tar.gz \
+      "https://github.com/AdguardTeam/AdGuardHome/releases/download/${AGH_VERSION}/AdGuardHome_linux_amd64.tar.gz" \
+ && echo "${AGH_SHA256}  /tmp/agh.tar.gz" | sha256sum -c - \
+ && mkdir -p /opt \
+ && tar -xzf /tmp/agh.tar.gz -C /opt \
+ && rm -f /tmp/agh.tar.gz
+
 # /var is a symlink to /tmp on OpenWrt and /var/run is created at boot by
 # procd, which never runs in a container. Without this `ip netns add` fails.
 RUN mkdir -p /var/run

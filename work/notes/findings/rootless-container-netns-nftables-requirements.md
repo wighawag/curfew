@@ -67,3 +67,12 @@ Both causes are understood: the first is removed deliberately along with the dea
 ## Real OpenWrt images are available for testing
 
 `openwrt/rootfs` publishes images matching router releases, including `x86-64-25.12.4`, `x86-64-25.12-SNAPSHOT` and the 24.10 line. A pulled image provides real busybox ash, `uci`, `ubus`, `procd`, `crontab`, the real `nft` build and real `uhttpd`, which removes the need to mock `uci` and `logger` or to substitute busybox httpd for uhttpd. The architecture difference from an aarch64 router is irrelevant for nftables semantics, shell behaviour and HTTP; it matters only for testing a compiled binary.
+
+## Running AdGuard Home in the test container
+
+- **AdGuard Home runs fine** on this image (v0.107.78, amd64, 12.4 MB). The router's installer fetches an UNPINNED "latest" URL; for tests, pin the GitHub release URL and verify the digest, so an upstream release cannot silently change what the gate tests. Both URLs served byte-identical content when checked.
+- **Use a fixture upstream, not the internet.** Reserved TLDs such as `.test` return NXDOMAIN from real resolvers regardless of filtering, so "NXDOMAIN" against a live upstream does NOT prove AdGuard blocked anything. Point AdGuard at a local dnsmasq serving `--address=` fixtures, and every domain then resolves unless AdGuard blocks it.
+- **`dnsmasq --no-resolv` answers REFUSED to everything**, including names it has an `--address=` entry for, which looks exactly like the resolver under test being broken. Omit it; `--address`-matched names are answered locally without consulting any upstream, so determinism does not require it.
+- **`--listen-address` is ignored without `--bind-interfaces`** (dnsmasq still binds `0.0.0.0`).
+- **Start long-lived daemons from `setup_file`, not `setup`.** A background process launched from bats' per-test `setup` does not reliably survive that subshell exiting, and presents as the daemon "never becoming ready" while the identical commands work by hand. `setsid` plus redirected stdio is the belt-and-braces form.
+- The production topology (AdGuard on 53, dnsmasq on 54 as its upstream) reproduces exactly in one container, so the test exercises the same two-resolver arrangement the router runs.
