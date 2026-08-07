@@ -32,7 +32,7 @@ Usage:
   curfew install <host> [flags]   first-time setup: daemon, settings, service
   curfew update <host> [flags]    update the daemon binary, keeping its settings
   curfew push <host> [flags]      send your local device list to the router
-  curfew pull <host> [flags]      fetch the router's device list
+  curfew pull <host> [flags]      merge the router's device list into yours
   curfew version
 
 The host is an ssh destination, for example root@192.168.1.1.
@@ -99,6 +99,38 @@ func hostAndFlags(fs *flag.FlagSet, args []string) (string, error) {
 
 func defaultRegistryPath() string {
 	return filepath.Join("config", "local", "devices.json")
+}
+
+// basePath is where the last state the laptop and the router agreed on is
+// recorded. It is what makes "has the other side changed since we last
+// synced?" answerable at all, and therefore what lets push and pull refuse
+// instead of overwriting.
+func basePath(registryPath string) string {
+	return filepath.Join(filepath.Dir(registryPath), ".devices.base.json")
+}
+
+func conflictPath(registryPath string) string {
+	return filepath.Join(filepath.Dir(registryPath), "devices.conflict.txt")
+}
+
+// fetchRemote reads the router's list. A router with no list yet is an empty
+// registry, which is correct: nothing has been agreed, so everything local
+// looks like an addition.
+func fetchRemote(runner deploy.Runner) (*registry.Registry, error) {
+	tmp, err := os.CreateTemp("", "curfew-remote-*.json")
+	if err != nil {
+		return nil, err
+	}
+	tmp.Close()
+	defer os.Remove(tmp.Name())
+	present, err := deploy.FetchRegistry(runner, tmp.Name())
+	if err != nil {
+		return nil, err
+	}
+	if !present {
+		return &registry.Registry{Devices: []registry.Device{}}, nil
+	}
+	return registry.Load(tmp.Name())
 }
 
 func cmdInstall(args []string) error {
@@ -178,18 +210,48 @@ func cmdInstall(args []string) error {
 // buildDaemon cross-compiles the router binary with the local Go toolchain.
 // CGO is off so the result is static and depends on nothing in the router's
 // userland.
+// buildDaemon cross-compiles the router binary from the CURRENT WORKING TREE.
+//
+// This is the point worth knowing: install and update do not need a release or
+// a tag. They build whatever source you are sitting on and push that, so a
+// change can be tried on the real router while it is still being argued about.
+// Tagging is only for distributing the LAPTOP binary to other machines.
 func buildDaemon(goarch string) (string, error) {
 	if _, err := exec.LookPath("go"); err != nil {
 		return "", fmt.Errorf("no Go toolchain found to build the daemon; " +
 			"install Go, or pass -binary with a prebuilt daemon")
 	}
+	if _, err := os.Stat(filepath.Join("cmd", "curfew-daemon")); err != nil {
+		return "", fmt.Errorf("no ./cmd/curfew-daemon here, so there is nothing to build.\n" +
+			"       Run this from a curfew checkout to deploy your working tree, " +
+			"or pass -binary with a prebuilt daemon")
+	}
 	out := filepath.Join(os.TempDir(), fmt.Sprintf("curfew-daemon-%s", goarch))
-	cmd := exec.Command("go", "build", "-o", out, "./cmd/curfew-daemon")
+	cmd := exec.Command("go", "build",
+		"-ldflags", "-X main.version="+devVersion(),
+		"-o", out, "./cmd/curfew-daemon")
 	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+goarch, "CGO_ENABLED=0")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("building the daemon for %s: %w\n%s", goarch, err, output)
 	}
 	return out, nil
+}
+
+// devVersion labels a working-tree build so `curfew-daemon -version` on the
+// router says which commit is running, and whether it had uncommitted changes.
+// Without it every iteration reports "dev" and you cannot tell what you are
+// looking at, which matters most precisely when you are iterating.
+func devVersion() string {
+	rev, err := exec.Command("git", "rev-parse", "--short", "HEAD").Output()
+	if err != nil {
+		return "dev"
+	}
+	v := "dev+" + strings.TrimSpace(string(rev))
+	if out, err := exec.Command("git", "status", "--porcelain").Output(); err == nil &&
+		len(strings.TrimSpace(string(out))) > 0 {
+		v += "-dirty"
+	}
+	return v
 }
 
 // cmdImport converts the legacy pipe-delimited profiles into a device
@@ -271,27 +333,111 @@ func cmdUpdate(args []string) error {
 func cmdPush(args []string) error {
 	fs := flag.NewFlagSet("push", flag.ContinueOnError)
 	path := fs.String("registry", defaultRegistryPath(), "local device list to send")
+	force := fs.Bool("force", false, "overwrite the router even if it has changed since the last sync")
 	host, err := hostAndFlags(fs, args)
 	if err != nil {
 		return err
 	}
-	if err := deploy.Push(deploy.SSHRunner{Host: host}, *path); err != nil {
+	runner := deploy.SSHRunner{Host: host}
+
+	local, err := registry.Load(*path)
+	if err != nil {
 		return err
 	}
-	fmt.Printf("pushed %s to %s\n", *path, host)
+	remote, err := fetchRemote(runner)
+	if err != nil {
+		return err
+	}
+	base, err := registry.Load(basePath(*path))
+	if err != nil {
+		return err
+	}
+
+	// Refuse rather than overwrite. Devices can be added, renamed and removed
+	// on the router's own page, and silently discarding that is exactly the
+	// kind of quiet data loss this project is trying to stop doing.
+	if !*force && !registry.Equal(remote, base) {
+		return fmt.Errorf("the router's device list has changed since your last sync, "+
+			"so pushing would discard those changes.\n"+
+			"       Run 'curfew pull %s' to merge them in first, or "+
+			"'curfew push %s --force' to overwrite the router anyway", host, host)
+	}
+
+	if err := deploy.Push(runner, *path); err != nil {
+		return err
+	}
+	if err := registry.Save(basePath(*path), local); err != nil {
+		return err
+	}
+	_ = os.Remove(conflictPath(*path))
+	fmt.Printf("pushed %d device(s) to %s\n", len(local.Devices), host)
 	return nil
 }
 
 func cmdPull(args []string) error {
 	fs := flag.NewFlagSet("pull", flag.ContinueOnError)
 	path := fs.String("registry", defaultRegistryPath(), "where to write the device list")
+	force := fs.Bool("force", false, "take the router's list wholesale, discarding local changes")
 	host, err := hostAndFlags(fs, args)
 	if err != nil {
 		return err
 	}
-	if err := deploy.Pull(deploy.SSHRunner{Host: host}, *path); err != nil {
+	runner := deploy.SSHRunner{Host: host}
+
+	remote, err := fetchRemote(runner)
+	if err != nil {
 		return err
 	}
-	fmt.Printf("pulled %s from %s\n", *path, host)
+	if *force {
+		if err := registry.Save(*path, remote); err != nil {
+			return err
+		}
+		if err := registry.Save(basePath(*path), remote); err != nil {
+			return err
+		}
+		_ = os.Remove(conflictPath(*path))
+		fmt.Printf("pulled %d device(s) from %s, discarding local changes\n", len(remote.Devices), host)
+		return nil
+	}
+
+	local, err := registry.Load(*path)
+	if err != nil {
+		return err
+	}
+	base, err := registry.Load(basePath(*path))
+	if err != nil {
+		return err
+	}
+
+	merged, conflicts := registry.Merge3(base, local, remote)
+	if len(conflicts) > 0 {
+		report := registry.RenderConflicts(conflicts)
+		cp := conflictPath(*path)
+		if writeErr := os.WriteFile(cp, []byte(report), 0o600); writeErr != nil {
+			return fmt.Errorf("writing the conflict report: %w", writeErr)
+		}
+		fmt.Fprint(os.Stderr, report)
+		return fmt.Errorf("%d device(s) conflict; nothing was changed. Details in %s", len(conflicts), cp)
+	}
+
+	if err := registry.Save(*path, merged); err != nil {
+		return err
+	}
+	// The base becomes what the ROUTER holds, not the merged result: the
+	// router does not have the merge yet, so that is still the last agreed
+	// point. A push straight after this then succeeds.
+	if err := registry.Save(basePath(*path), remote); err != nil {
+		return err
+	}
+	_ = os.Remove(conflictPath(*path))
+
+	if registry.Equal(merged, local) {
+		fmt.Printf("already up to date with %s (%d device(s))\n", host, len(merged.Devices))
+	} else {
+		fmt.Printf("merged %s into %s (%d device(s))\n", host, *path, len(merged.Devices))
+	}
+	if !registry.Equal(merged, remote) {
+		fmt.Printf("your list now differs from the router; run 'curfew push %s' to send it\n", host)
+	}
 	return nil
 }

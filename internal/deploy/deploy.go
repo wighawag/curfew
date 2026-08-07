@@ -402,6 +402,24 @@ func Verify(r Runner) (int, error) {
 	return count, nil
 }
 
+// FetchRegistry reads the router's device list into localPath. It reports
+// whether the router had one at all, so "the router has no list yet" is
+// distinguishable from "the download failed", which would otherwise be treated
+// as an empty list and quietly wipe devices.
+func FetchRegistry(r Runner, localPath string) (bool, error) {
+	out, err := r.Run(fmt.Sprintf("[ -s %s ] && echo yes || echo no", RemoteRegistry))
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(out) != "yes" {
+		return false, nil
+	}
+	if err := r.Download(RemoteRegistry, localPath); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Push copies the local registry to the router and reloads the service.
 func Push(r Runner, localPath string) error {
 	if _, err := os.Stat(localPath); err != nil {

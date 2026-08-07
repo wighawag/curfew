@@ -62,11 +62,28 @@ ssh root@192.168.1.1 "ifstatus wan | grep l3_device"
 | `curfew install <host>` | laptop | First-time setup: daemon, settings, service, device list |
 | `curfew update <host>` | laptop | Update the daemon binary, keeping the router's settings and devices |
 | `curfew push <host>` | laptop | Send your local device list to the router |
-| `curfew pull <host>` | laptop | Fetch the router's device list |
+| `curfew pull <host>` | laptop | Merge the router's device list into yours |
 | `curfew version` | laptop | Print the version |
 | `curfew-daemon -version` | router | Print the version running on the router |
 
 Your existing ssh configuration, keys and agent are used as-is.
+
+## Keeping the two lists in step
+
+Devices can be added, renamed and removed in two places: your local file, and the router's own page. So `push` and `pull` behave like a tiny version control system rather than a blind copy.
+
+Both remember the last state the two sides agreed on. `push` refuses if the router has changed since then, instead of discarding those changes. `pull` performs a **three-way merge**: a rename on your laptop and an addition on the router are not a conflict and merge silently, because the list is keyed by MAC and can be merged structurally rather than as text.
+
+Only a device genuinely changed on both sides stops the world. Then nothing is applied, and a report names each side:
+
+```
+aa:bb:cc:00:00:02  (renamed differently on both sides)
+    last agreed : tablet
+    your laptop : tia tablet
+    the router  : living room tablet
+```
+
+Resolve by editing your local list and pushing, or take a side wholesale with `--force` on either command.
 
 ## What it does today
 
