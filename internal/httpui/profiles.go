@@ -44,6 +44,12 @@ type ProfileView struct {
 	NeedsDevices bool
 	// Warning is the text for that, phrased for the case at hand.
 	Warning string
+	// StateLabel and StateClass are what the badge shows. Computed here rather
+	// than branched in the template so the empty-profile case can state the
+	// schedule's verdict ("would be blocked") instead of being flattened into
+	// "allowed", which hid the fact that a window was active.
+	StateLabel string
+	StateClass string
 }
 
 // Drifted reports a disagreement between the firewall and the schedule.
@@ -122,10 +128,10 @@ func (s *Server) profileViews(now time.Time) ([]ProfileView, error) {
 		}
 
 		switch {
-		case len(p.Devices) == 0 && v.ShouldBeBlocked:
-			v.Reason = "not blocked: there are no devices in this profile"
 		case len(p.Devices) == 0:
-			v.Reason = "not blocked: there are no devices in this profile"
+			// No reason line: the badge and the warning already say it, and a
+			// third phrasing of the same fact is noise.
+			v.Reason = ""
 		case v.Partial:
 			v.Reason = fmt.Sprintf("only %d of %d devices are blocked", blockedCount, len(p.Devices))
 		case v.Blocked && v.ShouldBeBlocked:
@@ -138,6 +144,20 @@ func (s *Server) profileViews(now time.Time) ([]ProfileView, error) {
 			v.Reason = "no schedule"
 		default:
 			v.Reason = "outside every window"
+		}
+		// The badge. An empty profile reports what the schedule WOULD do, since
+		// saying "allowed" there concealed an active window.
+		switch {
+		case v.Drifted():
+			v.StateClass, v.StateLabel = "drift", v.Reason
+		case v.NeedsDevices && v.ShouldBeBlocked:
+			v.StateClass, v.StateLabel = "idle", "no devices, would be blocked"
+		case v.NeedsDevices:
+			v.StateClass, v.StateLabel = "idle", "no devices, would be allowed"
+		case v.Blocked:
+			v.StateClass, v.StateLabel = "off", "blocked"
+		default:
+			v.StateClass, v.StateLabel = "on", "allowed"
 		}
 		out = append(out, v)
 	}
@@ -425,6 +445,7 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
  .off { background: #fdecea; color: #b00020; }
  .on  { background: #e7f6ec; color: #0a7d28; }
  .drift { background: #fff4e5; color: #8a5300; border: 1px solid #f0c48a; }
+ .idle { background: #eef2f7; color: #33506e; border: 1px solid #c9d6e4; }
  .warnline { background: #fff4e5; color: #8a5300; border: 1px solid #f0c48a;
              border-radius: .3rem; padding: .35rem .5rem; margin-top: .5rem; font-size: .85rem; }
  .muted { color: #666; font-size: .85rem; }
@@ -451,13 +472,7 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
 <div class="profile">
   <div class="head">
     <h2>{{.Name}}</h2>
-    {{if .Drifted}}
-      <span class="state drift">{{.Reason}}</span>
-    {{else if .Blocked}}
-      <span class="state off">blocked</span>
-    {{else}}
-      <span class="state on">allowed</span>
-    {{end}}
+    <span class="state {{.StateClass}}">{{.StateLabel}}</span>
     <span class="muted">{{if not .Drifted}}{{.Reason}}{{end}}</span>
   </div>
   {{if .NeedsDevices}}<div class="warnline">{{.Warning}}</div>{{end}}

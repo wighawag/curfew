@@ -835,11 +835,46 @@ func TestProfileWithNoDevicesNeverReportsDrift(t *testing.T) {
 	if v.Drifted() {
 		t.Errorf("a profile with no devices cannot drift, got reason %q", v.Reason)
 	}
-	if !strings.Contains(v.Reason, "no devices") {
-		t.Errorf("the reason should explain there is nothing to enforce, got %q", v.Reason)
-	}
 	if !v.NeedsDevices || v.Warning == "" {
 		t.Error("a profile with no devices should carry a warning")
+	}
+	// The badge must report the schedule's verdict. Flattening this to
+	// "allowed" concealed the fact that a window was active.
+	if v.StateLabel != "no devices, would be blocked" {
+		t.Errorf("badge should state what would happen, got %q", v.StateLabel)
+	}
+}
+
+func TestEmptyProfileOutsideAWindowSaysWouldBeAllowed(t *testing.T) {
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{{Name: "eli"}}}
+	srv, _, _ := newProfileServer(t, nil, ps, nil, nil)
+	views, err := srv.profileViews(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if views[0].StateLabel != "no devices, would be allowed" {
+		t.Errorf("got %q", views[0].StateLabel)
+	}
+}
+
+func TestBadgeLabelsForTheOrdinaryStates(t *testing.T) {
+	// The control: the empty-profile wording must not have leaked into the
+	// normal cases.
+	mac := "aa:bb:cc:dd:ee:01"
+	blockedPS := &schedule.Profiles{Profiles: []schedule.Profile{{
+		Name: "eli", Devices: []string{mac},
+		Windows: []schedule.Window{{Days: schedule.AllDays, Start: "00:00", End: "23:59"}}}}}
+	srv, _, _ := newProfileServer(t, []registry.Device{{MAC: mac}}, blockedPS, []string{mac}, []string{mac})
+	views, _ := srv.profileViews(time.Now())
+	if views[0].StateLabel != "blocked" || views[0].StateClass != "off" {
+		t.Errorf("blocked profile: got %q/%q", views[0].StateLabel, views[0].StateClass)
+	}
+
+	freePS := &schedule.Profiles{Profiles: []schedule.Profile{{Name: "eli", Devices: []string{mac}}}}
+	srv2, _, _ := newProfileServer(t, []registry.Device{{MAC: mac}}, freePS, []string{mac}, nil)
+	views2, _ := srv2.profileViews(time.Now())
+	if views2[0].StateLabel != "allowed" || views2[0].StateClass != "on" {
+		t.Errorf("allowed profile: got %q/%q", views2[0].StateLabel, views2[0].StateClass)
 	}
 }
 
