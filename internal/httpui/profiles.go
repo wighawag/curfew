@@ -36,6 +36,14 @@ type ProfileView struct {
 	// project exists to make visible rather than hide.
 	ShouldBeBlocked bool
 	Reason          string
+	// NeedsDevices flags a profile with no devices. It is a warning rather
+	// than a neutral state because a schedule with nothing to apply it to
+	// enforces nothing while looking configured, which is the shape of every
+	// failure this project exists to surface. Shown whether or not a window
+	// happens to be active right now.
+	NeedsDevices bool
+	// Warning is the text for that, phrased for the case at hand.
+	Warning string
 }
 
 // Drifted reports a disagreement between the firewall and the schedule.
@@ -104,11 +112,20 @@ func (s *Server) profileViews(now time.Time) ([]ProfileView, error) {
 		v.Blocked = len(p.Devices) > 0 && blockedCount == len(p.Devices)
 		v.Partial = blockedCount > 0 && blockedCount < len(p.Devices)
 
+		v.NeedsDevices = len(p.Devices) == 0
 		switch {
-		case len(p.Devices) == 0 && len(p.Windows) == 0:
-			v.Reason = "no devices and no schedule"
+		case v.NeedsDevices && len(p.Windows) > 0:
+			v.Warning = fmt.Sprintf("no devices assigned, so these %d window(s) block nothing",
+				len(p.Windows))
+		case v.NeedsDevices:
+			v.Warning = "no devices assigned, and no windows yet"
+		}
+
+		switch {
+		case len(p.Devices) == 0 && v.ShouldBeBlocked:
+			v.Reason = "not blocked: there are no devices in this profile"
 		case len(p.Devices) == 0:
-			v.Reason = "no devices yet, so this schedule affects nothing"
+			v.Reason = "not blocked: there are no devices in this profile"
 		case v.Partial:
 			v.Reason = fmt.Sprintf("only %d of %d devices are blocked", blockedCount, len(p.Devices))
 		case v.Blocked && v.ShouldBeBlocked:
@@ -408,7 +425,8 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
  .off { background: #fdecea; color: #b00020; }
  .on  { background: #e7f6ec; color: #0a7d28; }
  .drift { background: #fff4e5; color: #8a5300; border: 1px solid #f0c48a; }
- .idle { background: #eee; color: #555; }
+ .warnline { background: #fff4e5; color: #8a5300; border: 1px solid #f0c48a;
+             border-radius: .3rem; padding: .35rem .5rem; margin-top: .5rem; font-size: .85rem; }
  .muted { color: #666; font-size: .85rem; }
  ul { margin: .5rem 0; padding-left: 1.1rem; }
  li { font-size: .9rem; margin-bottom: .2rem; }
@@ -435,8 +453,6 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
     <h2>{{.Name}}</h2>
     {{if .Drifted}}
       <span class="state drift">{{.Reason}}</span>
-    {{else if not .Devices}}
-      <span class="state idle">no devices</span>
     {{else if .Blocked}}
       <span class="state off">blocked</span>
     {{else}}
@@ -444,6 +460,7 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
     {{end}}
     <span class="muted">{{if not .Drifted}}{{.Reason}}{{end}}</span>
   </div>
+  {{if .NeedsDevices}}<div class="warnline">{{.Warning}}</div>{{end}}
 
   <ul>
   {{range $i, $w := .Windows}}

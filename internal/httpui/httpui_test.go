@@ -838,6 +838,71 @@ func TestProfileWithNoDevicesNeverReportsDrift(t *testing.T) {
 	if !strings.Contains(v.Reason, "no devices") {
 		t.Errorf("the reason should explain there is nothing to enforce, got %q", v.Reason)
 	}
+	if !v.NeedsDevices || v.Warning == "" {
+		t.Error("a profile with no devices should carry a warning")
+	}
+}
+
+// A schedule with nothing to apply it to enforces nothing while looking
+// configured. That must be warned about whether or not a window happens to be
+// active at the moment you look.
+func TestProfileWithWindowsButNoDevicesWarnsOutsideTheWindowToo(t *testing.T) {
+	// A window that is definitely NOT active now.
+	now := time.Now()
+	dead := now.Add(3 * time.Hour)
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{{
+		Name: "eli",
+		Windows: []schedule.Window{{
+			Days:  []schedule.Day{schedule.Day(strings.ToLower(dead.Format("Mon")))},
+			Start: dead.Format("15:04"), End: dead.Add(time.Hour).Format("15:04"),
+		}},
+	}}}
+	srv, _, _ := newProfileServer(t, nil, ps, nil, nil)
+	views, err := srv.profileViews(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := views[0]
+	if v.ShouldBeBlocked {
+		t.Skip("the generated window happens to cover now; not the case under test")
+	}
+	if !v.NeedsDevices {
+		t.Fatal("the warning must not depend on a window being active")
+	}
+	if !strings.Contains(v.Warning, "block nothing") {
+		t.Errorf("the warning should say the windows do nothing, got %q", v.Warning)
+	}
+	if v.Drifted() {
+		t.Error("still not drift")
+	}
+}
+
+func TestProfileWithDevicesCarriesNoWarning(t *testing.T) {
+	// The control: without this, "always warn" would pass the tests above.
+	mac := "aa:bb:cc:dd:ee:01"
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{{Name: "eli", Devices: []string{mac}}}}
+	srv, _, _ := newProfileServer(t, []registry.Device{{MAC: mac}}, ps, []string{mac}, nil)
+	views, err := srv.profileViews(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if views[0].NeedsDevices || views[0].Warning != "" {
+		t.Errorf("a profile with devices must not be warned about: %q", views[0].Warning)
+	}
+}
+
+func TestHomeRendersTheNoDevicesWarning(t *testing.T) {
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{{
+		Name:    "eli",
+		Windows: []schedule.Window{{Days: schedule.AllDays, Start: "22:00", End: "08:00"}},
+	}}}
+	srv, _, _ := newProfileServer(t, nil, ps, nil, nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	assertWholePage(t, rec)
+	if !strings.Contains(rec.Body.String(), "no devices assigned") {
+		t.Error("the warning should be visible on the page, not only in the struct")
+	}
 }
 
 // The opposite failure: counting "any device blocked" as blocked would let a
