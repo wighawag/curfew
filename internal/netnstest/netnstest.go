@@ -136,6 +136,10 @@ func Require(t *testing.T) *Topology {
 	// runner's stdout open and hang the suite after the last test passes.
 	mustRun(t, "mkdir -p /tmp/mr-docroot")
 	mustRun(t, F("printf '%%s' %s > /tmp/mr-docroot/index.html", pageBody))
+	// A body big enough that fetching it moves an accounting counter past a
+	// realistic activity threshold. Upstream is only about 1.4% of downstream
+	// (measured), so this is sized by that ratio rather than by intuition.
+	mustRun(t, "dd if=/dev/zero of=/tmp/mr-docroot/burn.bin bs=1024 count=8192 2>/dev/null")
 	mustRun(t, InNS("internet", "/usr/sbin/uhttpd -h /tmp/mr-docroot -p %s:80", InternetIP)+" >/dev/null 2>&1 </dev/null")
 
 	ready := false
@@ -159,6 +163,10 @@ func teardown(t *testing.T) {
 	_, _ = run(t, F("ip link delete %s 2>/dev/null", LANIf))
 	_, _ = run(t, F("ip link delete %s 2>/dev/null", WANIf))
 	_, _ = run(t, F("nft delete table inet %s 2>/dev/null", contract.Table))
+	// Accounting lives in its own table, so it needs its own teardown. Leaving
+	// it behind would carry one test's counters into the next, where a budget
+	// already spent would look like a budget that ran out on its own.
+	_, _ = run(t, F("nft delete table inet %s 2>/dev/null", contract.AccountingTable))
 	_, _ = run(t, "rm -rf /tmp/mr-docroot")
 }
 
@@ -186,7 +194,30 @@ func (n *Topology) Reaches() bool {
 
 // DeleteTable removes the curfew table, simulating a recovery path or a fresh
 // boot before anything has been applied.
+//
+// It deliberately leaves the ACCOUNTING table alone, because that is what the
+// documented escape hatch does: `nft delete table inet curfew` and nothing
+// else. A test that tore down both would not be exercising the hatch a person
+// actually runs.
 func (n *Topology) DeleteTable() {
 	n.t.Helper()
 	mustRun(n.t, F("nft delete table inet %s", contract.Table))
+}
+
+// DeleteAccountingTable removes the accounting table, simulating a reboot or
+// somebody flushing the ruleset by hand: the case where the counter goes
+// BACKWARDS under a running daemon.
+func (n *Topology) DeleteAccountingTable() {
+	n.t.Helper()
+	mustRun(n.t, F("nft delete table inet %s", contract.AccountingTable))
+}
+
+// Burn generates real upstream traffic from the current source MAC, returning
+// whether it got through. It fetches a body large enough to move a counter
+// past a realistic activity threshold, which is what lets a packet-path test
+// drive a budget to exhaustion against the REAL counter rather than a fake.
+func (n *Topology) Burn() bool {
+	n.t.Helper()
+	out, err := run(n.t, InNS("client", "wget -q -T 3 -O /dev/null http://%s/burn.bin", InternetIP))
+	return err == nil && !strings.Contains(out, "download timed out")
 }

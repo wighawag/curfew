@@ -138,6 +138,8 @@ Note what is NOT load-bearing here, because an earlier draft claimed it was: der
 
 **Tickets are an override that lapses, not a mutation.** A ticket adds MACs to `ticket_macs` with a kernel timeout and changes nothing else, so when it expires the profile falls back to whatever the reasons say at that moment, with no bookkeeping and no saved-rules dance. Verified: a ticket issued inside a blocked window frees the profile, and on expiry the window is still in force. Two rules complete it. Blocking CANCELS any live ticket, in the core, so that a later unblock cannot resurrect one. Unblocking before ticketing is a FRONTEND gesture, not a fused operation: the ticket page performs an unblock and then an issue as two explicit calls, so "give a blocked child 30 minutes" is visibly two decisions and the ticket still lapses back to the schedule rather than to the block that was deliberately cleared.
 
+> **SUPERSEDED, and deliberately not edited otherwise.** The rule below (state the list in exactly ONE place, never restate it in prose) still holds and is the reason this note exists rather than a quiet rewrite. The PLACE has moved: the authoritative list is now the `blockstate.State` type in `internal/blockstate`, which cannot drift from what is actually written to disk, whereas this spec is a launch snapshot that is explicitly not maintained. `docs/adr/0009-the-budget-continuity-model.md` records the move and the members budget added. Read the four below as the list AS OF THIS SPEC, not as current truth.
+
 **Block state is persisted outside tmpfs. THIS is the authoritative list of what persists, and nothing else in this spec may restate it.** Per profile, exactly four things:
 
 1. the `manual` reason

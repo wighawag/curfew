@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/wighawag/curfew/internal/blockstate"
+	"github.com/wighawag/curfew/internal/budget"
 	"github.com/wighawag/curfew/internal/enforce"
 	"github.com/wighawag/curfew/internal/policy"
 	"github.com/wighawag/curfew/internal/registry"
@@ -29,15 +30,22 @@ import (
 // fakeFirewall stands in for nftables so the UI is testable without a kernel.
 type fakeSchedule struct{ ps *schedule.Profiles }
 
+// Load and Save copy EVERY field, including the household budget settings.
+// A double that quietly drops a field is not a dumb double, it is a double
+// with an opinion: it would make a budget setting that never reaches the
+// policy layer look like one that works.
 func (f *fakeSchedule) Load() (*schedule.Profiles, error) {
 	if f.ps == nil {
 		return &schedule.Profiles{Profiles: []schedule.Profile{}}, nil
 	}
-	cp := &schedule.Profiles{Profiles: append([]schedule.Profile(nil), f.ps.Profiles...)}
-	return cp, nil
+	cp := *f.ps
+	cp.Profiles = append([]schedule.Profile(nil), f.ps.Profiles...)
+	return &cp, nil
 }
 func (f *fakeSchedule) Save(ps *schedule.Profiles) error {
-	f.ps = &schedule.Profiles{Profiles: append([]schedule.Profile(nil), ps.Profiles...)}
+	cp := *ps
+	cp.Profiles = append([]schedule.Profile(nil), ps.Profiles...)
+	f.ps = &cp
 	return nil
 }
 
@@ -135,18 +143,42 @@ type memState struct {
 	saveErr error
 }
 
+// Load copies every member of the persisted state (the authoritative list is
+// the blockstate.State type itself). Dropping the budget members here would
+// make a spent allowance vanish on every read, so the page would show a fresh
+// budget while the firewall blocked the child.
 func (m *memState) Load() (*blockstate.State, error) {
 	if m.st == nil {
 		return &blockstate.State{ManualBlocked: []string{}}, nil
 	}
-	return &blockstate.State{ManualBlocked: append([]string(nil), m.st.ManualBlocked...)}, nil
+	cp := &blockstate.State{
+		ManualBlocked: append([]string(nil), m.st.ManualBlocked...),
+		BudgetDay:     m.st.BudgetDay,
+	}
+	if m.st.Budget != nil {
+		cp.Budget = map[string]budget.State{}
+		for k, v := range m.st.Budget {
+			cp.Budget[k] = v
+		}
+	}
+	return cp, nil
 }
 
 func (m *memState) Save(s *blockstate.State) error {
 	if m.saveErr != nil {
 		return m.saveErr
 	}
-	m.st = &blockstate.State{ManualBlocked: append([]string(nil), s.ManualBlocked...)}
+	cp := &blockstate.State{
+		ManualBlocked: append([]string(nil), s.ManualBlocked...),
+		BudgetDay:     s.BudgetDay,
+	}
+	if s.Budget != nil {
+		cp.Budget = map[string]budget.State{}
+		for k, v := range s.Budget {
+			cp.Budget[k] = v
+		}
+	}
+	m.st = cp
 	return nil
 }
 

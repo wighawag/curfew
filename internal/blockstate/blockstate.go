@@ -29,25 +29,164 @@ import (
 	"slices"
 	"sort"
 	"strings"
+
+	"github.com/wighawag/curfew/internal/budget"
 )
 
 // DefaultPath is where the daemon keeps this file on the router.
 const DefaultPath = "/etc/config/curfew/state.json"
 
-// State is the persisted block state.
+// State is THE AUTHORITATIVE LIST of everything that must survive a reboot.
 //
-// Today it carries exactly one member. The other three items on the
-// authoritative list in the enforcement spec (the usage counter, the
-// daily-reset day marker, and the schedule reason while it is still
-// edge-driven) belong here too as the policy layer reaches them; the schedule
-// reason is already derived from the clock in this implementation and so needs
-// no member.
+// This type is the single place that list is stated. The enforcement spec
+// carried it in prose and required that no other document restate it, because
+// three successive drafts each dropped a different member while retyping it.
+// The spec is a launch snapshot that is explicitly not maintained, so the list
+// now lives HERE, in the thing that cannot drift from what is actually
+// written to disk, and every document points at this type instead of copying
+// it. If you add a member, add it here and nowhere else.
+//
+// The members, and why each one cannot be derived:
+//
+//  1. ManualBlocked — a DECISION, with nothing to recompute it from.
+//  2. BudgetDay — which budget day the counters below belong to. Without it a
+//     reboot looks like a new day and hands back a spent allowance.
+//  3. Budget[profile].Usage — how much of today has been used.
+//  4. Budget[profile].Session — how much of the current unbroken session has
+//     been used.
+//  5. Budget[profile].LastActive — what the continuity gap is measured from.
+//  6. Budget[profile].CooldownUntil — when a spent continuous allowance
+//     refills.
+//
+// What is deliberately NOT here:
+//
+//   - The `budget` REASON. It is derived from members 3 to 6 against the
+//     profile's limits on every check, never stored and never restored, so it
+//     cannot latch and a stale one cannot survive.
+//   - The `schedule` reason. The policy layer derives it from the clock on
+//     every tick, so the member the enforcement spec reserved for it is not
+//     needed at all.
+//   - The previous counter reading the sampler subtracts from. It baselines a
+//     kernel counter that dies with the table, so persisting it would keep a
+//     number whose meaning had already gone. It lives in memory.
+//   - Tickets, which are kernel timeout state and are meant to die with the
+//     router.
 type State struct {
 	// ManualBlocked names the profiles a parent has blocked until they lift
 	// it. Profile NAMES rather than MACs, because a manual block acts on a
 	// whole profile and must keep applying to a device added to that profile
 	// afterwards.
 	ManualBlocked []string `json:"manual_blocked"`
+
+	// BudgetDay is the budget day the counters below belong to, as
+	// budget.DayFormat. It is GLOBAL because the reset time is global (ADR
+	// 0009). Empty means nothing has been accounted yet.
+	BudgetDay string `json:"budget_day,omitempty"`
+
+	// Budget holds each profile's live budget counters, keyed by profile name
+	// for the same reason ManualBlocked is: a device added to a profile joins
+	// that profile's allowance rather than getting a fresh one.
+	Budget map[string]budget.State `json:"budget,omitempty"`
+}
+
+// EffectiveDay is the budget day the counters should be read and written
+// under, given what the clock currently says.
+//
+// It is normally just the computed day. The exception is the whole reason this
+// function exists: a clock that has jumped BACKWARDS must not be allowed to
+// address an earlier day, because every read under an earlier day returns zero
+// state and the next write would then overwrite a spent allowance with a fresh
+// one. An OpenWrt router has no RTC and boots at the epoch, so this is a
+// routine event rather than a corner case.
+//
+// Every caller that reads or writes budget state goes through here, which is
+// what makes the rule impossible to apply on one path and forget on the other.
+// RollOver enforces the same direction, and having both is deliberate: this
+// one keeps the READS consistent, that one keeps the WRITES safe.
+func (s *State) EffectiveDay(computed string) string {
+	if s.BudgetDay != "" && computed < s.BudgetDay {
+		return s.BudgetDay
+	}
+	return computed
+}
+
+// BudgetFor returns a profile's budget state AS OF the given budget day.
+//
+// The rollover is applied here, as a derivation rather than an event: if the
+// stored counters belong to an earlier day, this returns zero state, whether
+// or not any tick has got round to writing that zero down. That is what makes
+// a daemon which was down across the reset time still see the new day, and it
+// is the same discipline internal/schedule uses for windows.
+func (s *State) BudgetFor(profile, day string) budget.State {
+	if s.BudgetDay != day {
+		return budget.State{}
+	}
+	return s.Budget[profile]
+}
+
+// RollOver moves the budget counters to a new day, zeroing everything the
+// budget owns and touching nothing else.
+//
+// It reports whether anything changed. Note what it CANNOT do: it has no
+// access to ManualBlocked and no notion of a schedule, so a reset can never
+// clear a reason it does not own. The implementation this replaces called
+// unblock_profile unconditionally on rollover and silently cancelled bedtime;
+// here that bug is not merely fixed but unavailable.
+//
+// It refuses to move BACKWARDS. A router with no RTC boots at the epoch, and
+// a rollover to 1970 would hand every child a fresh allowance on every power
+// cut, which is precisely the reboot-grants-internet failure this file exists
+// to prevent. The cost is that a clock wrongly set into the FUTURE freezes the
+// rollover until real time catches up, which is the rarer fault and the one
+// that errs towards staying blocked.
+func (s *State) RollOver(day string) bool {
+	if s.BudgetDay == day {
+		return false
+	}
+	if s.BudgetDay != "" && day < s.BudgetDay {
+		return false
+	}
+	s.BudgetDay = day
+	s.Budget = nil
+	return true
+}
+
+// SetBudget records a profile's budget state, reporting whether it changed.
+// Zero state is stored as absence, so an untouched household writes nothing.
+func (s *State) SetBudget(profile string, b budget.State) bool {
+	cur, had := s.Budget[profile]
+	if b.Zero() {
+		if !had {
+			return false
+		}
+		delete(s.Budget, profile)
+		return true
+	}
+	if had && cur.Usage == b.Usage && cur.Session == b.Session &&
+		cur.LastActive.Equal(b.LastActive) && cur.CooldownUntil.Equal(b.CooldownUntil) {
+		return false
+	}
+	if s.Budget == nil {
+		s.Budget = map[string]budget.State{}
+	}
+	s.Budget[profile] = b
+	return true
+}
+
+// ForgetBudget drops budget state for profiles that no longer exist, so a
+// deleted profile's counters cannot come back to life under a reused name.
+func (s *State) ForgetBudget(known map[string]bool) bool {
+	changed := false
+	for name := range s.Budget {
+		if !known[name] {
+			delete(s.Budget, name)
+			changed = true
+		}
+	}
+	if len(s.Budget) == 0 {
+		s.Budget = nil
+	}
+	return changed
 }
 
 // IsBlocked reports whether this profile carries a manual block.

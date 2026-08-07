@@ -36,7 +36,14 @@ import (
 // exactly the kind of change that would do this by accident.
 const TableName = "curfew_probe"
 
-const setName = "probe_macs"
+const (
+	setName     = "probe_macs"
+	counterName = "probe_counter"
+	// neighbourTable is a second throwaway table, used to show that replacing
+	// one table leaves another's counters alone. Also NOT contract.Table and
+	// NOT contract.AccountingTable, for the same reason TableName is neither.
+	neighbourTable = "curfew_probe_two"
+)
 
 // The probe's own MACs. They are never matched against anything, since there
 // is no chain: they exist only to be set elements.
@@ -115,9 +122,11 @@ func (r Report) String() string {
 // as a fact being false and must not be reported as one. A Report with a
 // failing check means the kernel answered, and answered wrongly.
 func Run() (Report, error) {
-	if TableName == contract.Table {
-		return Report{}, fmt.Errorf("refusing to run: the probe table is named %q, "+
-			"which is the ENFORCEMENT table; a probe must never write there", TableName)
+	for _, name := range []string{TableName, neighbourTable} {
+		if name == contract.Table || name == contract.AccountingTable {
+			return Report{}, fmt.Errorf("refusing to run: a probe table is named %q, "+
+				"which is a LIVE table; a probe must never write there", name)
+		}
 	}
 	var r Report
 	if b, err := os.ReadFile("/proc/sys/kernel/osrelease"); err == nil {
@@ -130,7 +139,9 @@ func Run() (Report, error) {
 	}
 	// A previous run that died would otherwise fail the create below.
 	dropTable(conn)
+	dropNamed(conn, neighbourTable)
 	defer dropTable(conn)
+	defer dropNamed(conn, neighbourTable)
 
 	// 1. Does this kernel accept an ether_addr set with the timeout flag? On a
 	//    kernel without it, everything about tickets is impossible.
@@ -207,7 +218,74 @@ func Run() (Report, error) {
 	_, stillThere := readElement(conn, expiringMAC)
 	r.add("the kernel reclaims an expired element with no process involved", !stillThere, "")
 
+	// 6. The facts BUDGET ACCOUNTING relies on. Same argument as for tickets:
+	//    these are the kernel's behaviours, not this program's, and the test
+	//    suite measures them on whatever kernel built the tests rather than on
+	//    the router. A board or firmware without named counter objects would
+	//    make every budget silently read zero, which is a child with unlimited
+	//    internet and a page that says otherwise.
+	probeCounters(conn, &r)
+
 	return r, nil
+}
+
+// probeCounters measures whether this kernel supports the named counter
+// objects budget accounting is built on.
+//
+// It stays inside the probe's own tables, with no chain and no hook, so
+// nothing here can be reached by a packet: the counter is written to directly
+// rather than by traffic, which is enough to establish that the kernel accepts
+// the object, reports it back, and keeps it while a DIFFERENT table is
+// replaced. Whether traffic actually increments it is settled by the
+// packet-path tests in internal/accounting, which cannot run on a live router.
+func probeCounters(conn *nftables.Conn, r *Report) {
+	table := &nftables.Table{Family: nftables.TableFamilyINet, Name: TableName}
+	conn.AddObj(&nftables.CounterObj{Table: table, Name: counterName, Bytes: 1234, Packets: 7})
+	if err := conn.Flush(); err != nil {
+		// Not fatal to the run: tickets may work perfectly on a kernel with no
+		// counter objects, and reporting that is more useful than refusing to
+		// print the ticket results at all.
+		r.add("the kernel accepts a named counter object", false, err.Error())
+		return
+	}
+	r.add("the kernel accepts a named counter object", true, "")
+
+	bytes, found := readCounter(conn, counterName)
+	r.add("a named counter reads back the value it was given", found && bytes == 1234,
+		fmt.Sprintf("got %d, want 1234", bytes))
+
+	// The one that decided where the counters live: a whole-table replace must
+	// not disturb a counter in a DIFFERENT table. Measured in the test image;
+	// this asks the router.
+	other := conn.AddTable(&nftables.Table{Family: nftables.TableFamilyINet, Name: neighbourTable})
+	conn.AddObj(&nftables.CounterObj{Table: other, Name: "probe_neighbour"})
+	if err := conn.Flush(); err != nil {
+		r.add("a second table can be created alongside the first", false, err.Error())
+		return
+	}
+	conn.DelTable(&nftables.Table{Family: nftables.TableFamilyINet, Name: neighbourTable})
+	if err := conn.Flush(); err != nil {
+		r.add("a second table can be removed again", false, err.Error())
+		return
+	}
+	after, stillThere := readCounter(conn, counterName)
+	r.add("a counter survives a whole-table replace of a DIFFERENT table",
+		stillThere && after == 1234, fmt.Sprintf("got %d, want 1234", after))
+}
+
+func readCounter(conn *nftables.Conn, name string) (uint64, bool) {
+	objs, err := conn.GetObjects(&nftables.Table{
+		Family: nftables.TableFamilyINet, Name: TableName,
+	})
+	if err != nil {
+		return 0, false
+	}
+	for _, o := range objs {
+		if c, ok := o.(*nftables.CounterObj); ok && c.Name == name {
+			return c.Bytes, true
+		}
+	}
+	return 0, false
 }
 
 func (r *Report) add(what string, ok bool, detail string) {
@@ -244,23 +322,36 @@ func readElement(conn *nftables.Conn, key []byte) (time.Duration, bool) {
 	return 0, false
 }
 
-// Present reports whether the probe left a table behind, which should never be
-// true once Run has returned.
+// Present reports whether the probe left EITHER of its tables behind, which
+// should never be true once Run has returned.
 func Present() (bool, error) {
 	conn, err := nftables.New()
 	if err != nil {
 		return false, err
 	}
-	return tableExists(conn)
+	for _, name := range []string{TableName, neighbourTable} {
+		present, err := namedTableExists(conn, name)
+		if err != nil {
+			return false, err
+		}
+		if present {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func tableExists(conn *nftables.Conn) (bool, error) {
+	return namedTableExists(conn, TableName)
+}
+
+func namedTableExists(conn *nftables.Conn, name string) (bool, error) {
 	tables, err := conn.ListTablesOfFamily(nftables.TableFamilyINet)
 	if err != nil {
 		return false, err
 	}
 	for _, t := range tables {
-		if t.Name == TableName {
+		if t.Name == name {
 			return true, nil
 		}
 	}
@@ -268,13 +359,24 @@ func tableExists(conn *nftables.Conn) (bool, error) {
 }
 
 // dropTable removes the probe's own table and nothing else. It names TableName
-// and never contract.Table, so it cannot disturb enforcement even when it goes
-// wrong.
+// and never a live table, so it cannot disturb enforcement or accounting even
+// when it goes wrong.
 func dropTable(conn *nftables.Conn) {
-	present, err := tableExists(conn)
+	dropNamed(conn, TableName)
+}
+
+// dropNamed removes one of the probe's tables, refusing outright to touch a
+// live one. The guard is here as well as in Run because this is the function
+// that actually deletes, and a diagnostic that can delete the enforcement
+// table is not a diagnostic.
+func dropNamed(conn *nftables.Conn, name string) {
+	if name == contract.Table || name == contract.AccountingTable {
+		return
+	}
+	present, err := namedTableExists(conn, name)
 	if err != nil || !present {
 		return
 	}
-	conn.DelTable(&nftables.Table{Family: nftables.TableFamilyINet, Name: TableName})
+	conn.DelTable(&nftables.Table{Family: nftables.TableFamilyINet, Name: name})
 	_ = conn.Flush()
 }

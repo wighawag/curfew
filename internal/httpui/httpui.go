@@ -19,6 +19,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/wighawag/curfew/internal/budget"
 	"github.com/wighawag/curfew/internal/registry"
 )
 
@@ -59,6 +60,12 @@ type Core interface {
 	// ManuallyBlocked reports the parent's INTENT, against which what the
 	// firewall is doing can be compared.
 	ManuallyBlocked() (map[string]bool, error)
+	// BudgetStatus reports each profile's allowance, what it has spent, and
+	// the traffic actually observed in the last accounting interval.
+	BudgetStatus() (map[string]budget.Status, error)
+	// AccountingInterval is what the observed byte figure is measured over.
+	// Zero means accounting is off.
+	AccountingInterval() time.Duration
 }
 
 // Store loads and saves the device registry.

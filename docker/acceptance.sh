@@ -18,6 +18,12 @@ rm -f .acceptance/*.test .acceptance/curfew-daemon
 CGO_ENABLED=0 go test -c -o .acceptance/enforce.test ./internal/enforce
 CGO_ENABLED=0 go test -c -o .acceptance/policy.test ./internal/policy
 
+# internal/accounting measures traffic with real nftables counters, and every
+# claim it makes (that a blocked device burns nothing, that a counter survives
+# an enforcement rebuild, that accounting changes no verdict) is only credible
+# against a real kernel and a real packet.
+CGO_ENABLED=0 go test -c -o .acceptance/accounting.test ./internal/accounting
+
 # The kernel probe both measures a kernel and claims to be safe on a live
 # router. The second half is a packet-path assertion, so it belongs here.
 CGO_ENABLED=0 go test -c -o .acceptance/kernelprobe.test ./internal/kernelprobe

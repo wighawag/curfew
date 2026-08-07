@@ -106,7 +106,15 @@ Status is read from the **firewall**, never from re-evaluating the schedule or r
 
 The daemon re-asserts the ruleset on a timer, so a table wiped by hand, by a recovery path, or by anything else heals itself on the next tick. That re-assertion replaces the whole table in one transaction and carries live tickets across it with the time they have left, so a reconcile can neither cut a ticket short nor quietly restart its clock.
 
-Time budgets, guest passes and website blocking are designed but not built. The decisions behind them are recorded in `docs/adr/` so they land as decisions rather than guesses.
+It also does **daily time budgets**, counted as actual use rather than as wall-clock time.
+
+A profile can have four limits, all optional, and a profile with none of them is unlimited: a **total for the day** (4h), a **limit on one unbroken stretch** (2h), the **inactivity that ends a stretch** (10m), and **how long to wait after burning a stretch** (30m). Two more settings are for the whole household rather than per child: **when the day rolls over** (03:00 by default, because children are awake at midnight) and **how much traffic counts as using the internet**.
+
+A minute only counts if the devices actually sent something. An idle phone in a pocket burns nothing, a blocked child burns nothing while they are blocked, and a ticket overrides a spent budget exactly as it overrides a bedtime. The decisions behind the continuity model, and the measurements behind where the counters live, are in `docs/adr/0009-the-budget-continuity-model.md`.
+
+**The activity threshold's default is a guess, and the daemon says so at every startup.** How many bytes a minute mean "in use" cannot be worked out from first principles; it has to be measured against the devices in your house. So the home page shows what each profile actually sent in the last interval, for every profile including the ones with no budget, and you set `activity_threshold_bytes_per_minute` once you have watched an idle device for an evening. Until you do, expect it to be somewhat wrong in one direction or the other.
+
+Guest passes and website blocking are designed but not built. The decisions behind them are recorded in `docs/adr/` so they land as decisions rather than guesses.
 
 ## If something goes wrong
 
@@ -116,6 +124,8 @@ A wrong ruleset costs WAN, never LAN, so **SSH always works**. To remove all pol
 ssh root@192.168.1.1 'nft delete table inet curfew'
 ssh root@192.168.1.1 '/etc/init.d/curfew stop'     # or it reconciles straight back
 ```
+
+One table, not two. Budget accounting lives in a second table, `curfew_accounting`, which holds counters and no verdicts, so leaving it in place cannot block anything: a packet-path test asserts that a client reaches the internet with the enforcement table deleted and the accounting table still present. Remove it too if you want a clean ruleset (`nft delete table inet curfew_accounting`), but nothing depends on you remembering to.
 
 The daemon deliberately leaves the ruleset in place when it exits. Stopping it must not silently open the household's internet; removing policy is an explicit act.
 
@@ -142,7 +152,9 @@ It is safe to run at any time, including with the family online. It works in its
 
 The daemon's settings (WAN interface, listen address, credentials) live in `daemon.conf` as data rather than baked into the service definition. That is what lets `curfew update` replace the binary without being told them again, and it means updating can never change them by accident. `install` writes that file; `update` deliberately never touches it, nor the device list.
 
-`state.json` holds the manual blocks. It is state rather than configuration, and `push` and `pull` deliberately never touch it: it belongs to the router, and copying a laptop's idea of who is grounded over the top of it would undo a decision made on a phone five minutes earlier.
+`state.json` holds the manual blocks and the budget counters. It is state rather than configuration, and `push` and `pull` deliberately never touch it: it belongs to the router, and copying a laptop's idea of who is grounded, or of how much of today a child has used, over the top of it would undo something decided on a phone five minutes earlier. The budgets themselves are configuration and live in `profiles.json`, which push and pull do carry.
+
+The authoritative list of what is in `state.json` is the `blockstate.State` type in `internal/blockstate`, deliberately stated in exactly one place: three drafts of the spec that preceded it each dropped a different member while retyping the list in prose.
 
 `/etc/config/` is the only location OpenWrt's sysupgrade keep list preserves by default, which is measured, not assumed. `curfew install` registers the binary and the init script for preservation too, so a firmware upgrade cannot leave you with a config that says who is allowed and a firewall that allows everyone.
 

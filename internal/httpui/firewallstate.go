@@ -2,8 +2,10 @@ package httpui
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/wighawag/curfew/internal/budget"
 	"github.com/wighawag/curfew/internal/contract"
 )
 
@@ -98,6 +100,61 @@ func (f *firewallState) ticketLeft(macs []string) (time.Duration, bool) {
 		}
 	}
 	return shortest, true
+}
+
+// budgetLines renders a profile's allowance, and what its devices actually
+// sent in the last accounting interval.
+//
+// The observed figure is shown for EVERY profile, including those with no
+// budget at all, and that is the point of it rather than an oversight: the
+// activity threshold's default is an unvalidated guess, ADR 0001 requires it
+// to be calibrated against real IDLE devices, and the idle devices in a house
+// are exactly the ones nobody has given a budget. Without this line a
+// household has no way to replace the guess with a measurement.
+func budgetLines(b budget.Status, interval time.Duration) (allowance, observed string) {
+	if !b.Limits.Unlimited() {
+		parts := []string{fmt.Sprintf("used %s today", humanDuration(b.Used))}
+		if b.DailyOK {
+			parts = append(parts, fmt.Sprintf("%s of %s left",
+				humanDuration(b.DailyLeft), b.Limits.Daily))
+		}
+		if b.SessionOK {
+			parts = append(parts, fmt.Sprintf("%s of this stretch's %s left",
+				humanDuration(b.SessionLeft), b.Limits.Continuous))
+		}
+		allowance = strings.Join(parts, " \u00b7 ")
+	}
+	if b.ObservedOK && interval > 0 {
+		state := "idle"
+		if b.ObservedActive {
+			state = "counted as use"
+		}
+		observed = fmt.Sprintf("last %s: %s upstream (%s)",
+			humanInterval(interval), humanBytes(b.ObservedBytes), state)
+	}
+	return allowance, observed
+}
+
+// humanInterval renders a sampling interval, which unlike a budget may be well
+// under a minute in a test.
+func humanInterval(d time.Duration) string {
+	if d < time.Minute {
+		return d.String()
+	}
+	return humanDuration(d)
+}
+
+// humanBytes renders a byte count. Exact below a kilobyte, because the numbers
+// that matter for calibration are the small ones a sleeping phone produces.
+func humanBytes(n uint64) string {
+	switch {
+	case n < 1024:
+		return fmt.Sprintf("%d B", n)
+	case n < 1024*1024:
+		return fmt.Sprintf("%.1f KB", float64(n)/1024)
+	default:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1024*1024))
+	}
 }
 
 // humanDuration renders a duration the way a parent would say it. It rounds

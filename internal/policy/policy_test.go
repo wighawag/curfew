@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/wighawag/curfew/internal/blockstate"
+	"github.com/wighawag/curfew/internal/budget"
 	"github.com/wighawag/curfew/internal/enforce"
 	"github.com/wighawag/curfew/internal/registry"
 	"github.com/wighawag/curfew/internal/schedule"
@@ -84,11 +85,15 @@ type memState struct {
 	saves   int
 }
 
+// Load and Save copy EVERY member of the persisted state. The authoritative
+// list of those members is the blockstate.State type itself; a double that
+// quietly drops one would make a spent budget vanish on every read, so the
+// core would keep handing back an allowance the file had already recorded.
 func (m *memState) Load() (*blockstate.State, error) {
 	if m.st == nil {
 		return &blockstate.State{ManualBlocked: []string{}}, nil
 	}
-	return &blockstate.State{ManualBlocked: append([]string(nil), m.st.ManualBlocked...)}, nil
+	return copyState(m.st), nil
 }
 
 func (m *memState) Save(s *blockstate.State) error {
@@ -96,8 +101,22 @@ func (m *memState) Save(s *blockstate.State) error {
 	if m.saveErr != nil {
 		return m.saveErr
 	}
-	m.st = &blockstate.State{ManualBlocked: append([]string(nil), s.ManualBlocked...)}
+	m.st = copyState(s)
 	return nil
+}
+
+func copyState(s *blockstate.State) *blockstate.State {
+	cp := &blockstate.State{
+		ManualBlocked: append([]string(nil), s.ManualBlocked...),
+		BudgetDay:     s.BudgetDay,
+	}
+	if s.Budget != nil {
+		cp.Budget = map[string]budget.State{}
+		for k, v := range s.Budget {
+			cp.Budget[k] = v
+		}
+	}
+	return cp
 }
 
 // household is the standard fixture: eli with two devices and a bedtime, dad

@@ -142,3 +142,94 @@ func TestDaemonEnforcesAPersistedManualBlockBeforeItServes(t *testing.T) {
 		t.Errorf("an authenticated request got %d, want 200", got)
 	}
 }
+
+// The budget half of the same boot-path claim.
+//
+// Nothing else covers the daemon WIRING accounting up: internal/policy proves
+// the core blocks on a spent budget when it is given an accountant, but the
+// core is given one here, by this binary, and a startup that forgot to would
+// pass every test in that package. It would also fail silently in the worst
+// possible way: no counters, so no usage, so every budget in the house reads
+// as untouched forever while the page cheerfully shows "4h left".
+func TestDaemonRestoresASpentBudgetAndBuildsAccountingBeforeItServes(t *testing.T) {
+	net := netnstest.Require(t)
+	bin := daemonBinary(t)
+
+	const spent = "aa:bb:cc:dd:ee:01"
+	const free = "aa:bb:cc:dd:ee:03"
+	dir := t.TempDir()
+	regPath := filepath.Join(dir, "devices.json")
+	profPath := filepath.Join(dir, "profiles.json")
+	statePath := filepath.Join(dir, "state.json")
+
+	write(t, regPath, fmt.Sprintf(`{"devices":[{"mac":%q},{"mac":%q}]}`, spent, free))
+	write(t, profPath, fmt.Sprintf(
+		`{"profiles":[`+
+			`{"name":"eli","devices":[%q],"windows":[],"budget":{"daily":"4h"}},`+
+			`{"name":"dad","devices":[%q],"windows":[]}]}`,
+		spent, free))
+	// The state from before the reboot: eli has used the whole day. The budget
+	// REASON is deliberately absent from this file, because it is derived from
+	// the usage counter; if it had to be stored, this test could not be written
+	// this way at all.
+	today := time.Now().UTC()
+	if today.Hour() < 3 {
+		today = today.AddDate(0, 0, -1)
+	}
+	write(t, statePath, fmt.Sprintf(
+		`{"manual_blocked":[],"budget_day":%q,"budget":{"eli":{"usage":"4h1m0s"}}}`,
+		today.Format("2006-01-02")))
+
+	cmd := exec.Command(bin,
+		"-registry", regPath, "-profiles", profPath, "-state", statePath,
+		"-lan", netnstest.LANIf, "-wan", netnstest.WANIf,
+		"-listen", "127.0.0.1:18081", "-user", "parent", "-password", "hunter2",
+		"-timezone", "UTC", "-reconcile", "2s")
+	var out strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting the daemon: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	up := false
+	for range 50 {
+		resp, err := (&http.Client{Timeout: 2 * time.Second}).Get("http://127.0.0.1:18081/")
+		if err == nil {
+			resp.Body.Close()
+			up = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !up {
+		t.Fatalf("the daemon never started serving. Its output was:\n%s", out.String())
+	}
+
+	net.SetClientMAC(spent)
+	if net.Reaches() {
+		t.Errorf("a reboot handed back a spent daily budget. The daemon said:\n%s", out.String())
+	}
+	// Control: the profile with no budget must be online, so the drop above is
+	// the budget and not a daemon that blocks everything.
+	net.SetClientMAC(free)
+	if !net.Reaches() {
+		t.Errorf("a profile with no budget lost its internet. The daemon said:\n%s", out.String())
+	}
+
+	// The accounting table must exist, or usage would never advance again and
+	// tomorrow's budget would be unspendable rather than merely wrong.
+	if _, err := net.Run("nft list table inet curfew_accounting"); err != nil {
+		t.Errorf("the daemon did not build the accounting table at startup:\n%s", out.String())
+	}
+	// And it must say out loud that the activity threshold is a guess. A
+	// guessed constant presented as a measured one is the single most likely
+	// thing to make this feature feel arbitrary in a house.
+	if !strings.Contains(out.String(), "UNCALIBRATED") {
+		t.Errorf("the daemon did not warn that the activity threshold is uncalibrated:\n%s", out.String())
+	}
+}

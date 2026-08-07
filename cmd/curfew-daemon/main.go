@@ -25,7 +25,9 @@ import (
 	// of quiet wrongness this project exists to remove. Costs ~450 KB.
 	_ "time/tzdata"
 
+	"github.com/wighawag/curfew/internal/accounting"
 	"github.com/wighawag/curfew/internal/blockstate"
+	"github.com/wighawag/curfew/internal/budget"
 	"github.com/wighawag/curfew/internal/enforce"
 	"github.com/wighawag/curfew/internal/httpui"
 	"github.com/wighawag/curfew/internal/kernelprobe"
@@ -84,7 +86,8 @@ func run(args []string, stderr *os.File) int {
 	fs.StringVar(&opt.password, "password", envOr("CURFEW_PASSWORD", ""),
 		"HTTP basic auth password (empty disables authentication, with a warning)")
 	fs.DurationVar(&opt.reconcile, "reconcile", time.Minute,
-		"how often to re-check that the firewall still matches the registry")
+		"how often to re-check that the firewall still matches the registry, and "+
+			"how often budget usage is accounted for")
 	fs.StringVar(&opt.timezone, "timezone", envOr("CURFEW_TZ", ""),
 		"IANA timezone for schedules, e.g. Europe/London (default: the system zone, which on OpenWrt is UTC)")
 	showVersion := fs.Bool("version", false, "print the version and exit")
@@ -149,8 +152,35 @@ func run(args []string, stderr *os.File) int {
 	if len(st.ManualBlocked) > 0 {
 		log.Info("restoring manual blocks", "profiles", st.ManualBlocked)
 	}
+	if len(st.Budget) > 0 {
+		log.Info("restoring budget usage", "day", st.BudgetDay, "profiles", len(st.Budget))
+	}
 
-	core := policy.New(store, sched, state, fw, loc, log)
+	acct, err := accounting.New(accounting.Config{LANInterface: opt.lan, WANInterface: opt.wan})
+	if err != nil {
+		log.Error("cannot set up budget accounting", "error", err)
+		return 1
+	}
+
+	profiles, err := sched.Load()
+	if err != nil {
+		log.Error("cannot read the schedule", "path", opt.profilesPath, "error", err)
+		return 1
+	}
+	threshold := profiles.Budget.Threshold()
+	core := policy.New(store, sched, state, fw, loc, log).
+		WithAccounting(acct, opt.reconcile, threshold)
+	if threshold == budget.DefaultActivityThreshold &&
+		profiles.Budget.ActivityThresholdBytesPerMinute == 0 {
+		// Said out loud, every start, because ADR 0001 requires this number to
+		// be calibrated against real idle devices and the default is not. A
+		// guessed constant presented as a measured one is how a budget comes to
+		// feel arbitrary in a house.
+		log.Warn("the activity threshold is the UNCALIBRATED default",
+			"bytes_per_minute", threshold,
+			"why_it_matters", "too low and an idle phone burns the allowance overnight; too high and light use is free",
+			"how_to_fix", "watch the observed rates on the home page for an evening, then set budget_settings.activity_threshold_bytes_per_minute")
+	}
 
 	// Enforce BEFORE serving. Coming up with the page available but the
 	// ruleset unapplied is precisely the state that lies about being in
@@ -159,7 +189,7 @@ func run(args []string, stderr *os.File) int {
 	// This is also the boot restore: the desired state it applies includes the
 	// manual blocks read back off disk, so a reboot cannot hand a grounded
 	// child their internet back.
-	if err := core.Reconcile(); err != nil {
+	if err := core.Tick(); err != nil {
 		log.Error("cannot apply the ruleset; refusing to start", "error", err)
 		return 1
 	}
@@ -278,7 +308,10 @@ func reconcileLoop(ctx context.Context, log *slog.Logger, core *policy.Core, eve
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := core.Reconcile(); err != nil {
+			// Tick, not Reconcile: this is the one caller that also MEASURES.
+			// The UI's own reconciles must not advance the budget, or a parent
+			// tapping buttons would burn a child's afternoon.
+			if err := core.Tick(); err != nil {
 				log.Error("reconcile failed", "error", err)
 			}
 		}

@@ -99,3 +99,36 @@ var Tiers = []Tier{
 
 // HookPriority runs this table ahead of fw4 without mixing into it.
 const HookPriority = -10
+
+// Budget accounting lives in its OWN table, and that separation is forced
+// rather than tidy.
+//
+// internal/enforce replaces the WHOLE enforcement table on every apply, and an
+// apply happens on every drift: every schedule boundary, every device edit,
+// every block. A counter living in that table is therefore destroyed several
+// times a night. Measured, not reasoned: a named counter created in the curfew
+// table read {bytes:4242} before an apply and was GONE afterwards (0 objects
+// present), while the same counter in a separate table read identically before
+// and after. Budget accounting would have been quietly wrong rather than
+// visibly broken, which is the failure mode this project exists to remove.
+//
+// Tickets survive that same replace only because they are explicitly read back
+// and re-emitted. Counters could have been carried the same way; a separate
+// table is chosen instead because it is what ADR 0001's hook-priority split
+// already points at, and because it needs no carry-over step that a future
+// change can forget. See docs/adr/0009-the-budget-continuity-model.md.
+const (
+	// AccountingTable holds counters ONLY. Nothing in it can affect a packet.
+	AccountingTable = "curfew_accounting"
+	// AccountingChain is hooked at AccountingPriority and contains counter
+	// rules with no verdict.
+	AccountingChain = "accounting"
+)
+
+// AccountingPriority runs accounting AFTER enforcement, which is what makes
+// accounting count only traffic that SURVIVED enforcement. Without that a
+// blocked device's retries would burn the child's allowance, contradicting
+// ADR 0001. Measured on the packet path: with enforcement at -10 and
+// accounting at 0, a schedule-blocked device's retries moved the counter by
+// exactly 0 bytes, and so did a manually blocked device's.
+const AccountingPriority = 0

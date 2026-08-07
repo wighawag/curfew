@@ -74,6 +74,16 @@ type ProfileView struct {
 	// "allowed", which hid the fact that a window was active.
 	StateLabel string
 	StateClass string
+	// Budget is this profile's allowance line, empty when it has none.
+	Budget string
+	// Observed is what the profile's devices actually sent in the last
+	// accounting interval, shown for EVERY profile including unbudgeted ones.
+	//
+	// It is on the page because the activity threshold's default is an
+	// unvalidated guess and ADR 0001 requires it to be calibrated against real
+	// idle household devices. This is the calibration surface: leave a device
+	// alone, read what it sends, set the threshold above it.
+	Observed string
 }
 
 // Drifted reports a disagreement between the firewall and the schedule.
@@ -114,6 +124,11 @@ func (s *Server) profileViews(now time.Time) ([]ProfileView, error) {
 	if err != nil {
 		return nil, err
 	}
+	budgets, err := s.core.BudgetStatus()
+	if err != nil {
+		return nil, err
+	}
+	interval := s.core.AccountingInterval()
 	name := map[string]string{}
 	for _, d := range reg.Devices {
 		name[d.MAC] = d.Name
@@ -130,11 +145,17 @@ func (s *Server) profileViews(now time.Time) ([]ProfileView, error) {
 			v.TicketLeft = humanDuration(left)
 		}
 		windowActive := p.BlockedAt(now)
+		overBudget := budgets[p.Name].Blocked
 		// What SHOULD be true, as the reason set of ADR 0006 computes it: a
-		// manual block on its own is enough, and a schedule block is overridden
-		// by a live ticket. A manual block is NOT, which is the rule that stops
-		// a child ticketing their way out of being grounded.
-		v.ShouldBeBlocked = v.ManuallyBlocked || (windowActive && !hasTicket)
+		// manual block on its own is enough, and a schedule or BUDGET block is
+		// overridden by a live ticket. A manual block is NOT, which is the rule
+		// that stops a child ticketing their way out of being grounded.
+		//
+		// The budget belongs in this expression for the same reason it belongs
+		// in the chain's blocked set: leaving it out would make every spent
+		// allowance render as DRIFT, so the page would cry wolf about the one
+		// thing it exists to report honestly.
+		v.ShouldBeBlocked = v.ManuallyBlocked || ((windowActive || overBudget) && !hasTicket)
 
 		blockedCount := 0
 		byReason := map[string]int{}
@@ -157,6 +178,8 @@ func (s *Server) profileViews(now time.Time) ([]ProfileView, error) {
 		allManual := len(p.Devices) > 0 && byReason[contract.ReasonManual] == len(p.Devices)
 		allTicketed := len(p.Devices) > 0 && byReason[contract.ReasonTicket] == len(p.Devices)
 		v.ManualEnforced = allManual
+
+		v.Budget, v.Observed = budgetLines(budgets[p.Name], interval)
 
 		v.NeedsDevices = len(p.Devices) == 0
 		switch {
@@ -191,6 +214,19 @@ func (s *Server) profileViews(now time.Time) ([]ProfileView, error) {
 			v.Reason = "and inside a blocked window, so unblocking leaves them blocked"
 		case allManual:
 			v.Reason = "until you unblock them"
+		case v.Blocked && overBudget:
+			// Named before the generic window case, because "inside a blocked
+			// window" is a plainly wrong explanation for a child who is offline
+			// because they used up their afternoon. Both reasons are reported
+			// when both are live: ADR 0006 chose a reason SET precisely so a
+			// page can say "bedtime, and over budget" rather than pick one.
+			v.Reason = string(budgets[p.Name].Reason)
+			if left := budgets[p.Name].CooldownLeft; left > 0 {
+				v.Reason += ", back in " + humanDuration(left)
+			}
+			if windowActive {
+				v.Reason = "inside a blocked window, and " + v.Reason
+			}
 		case allTicketed && windowActive:
 			v.Reason = "then the window takes over again"
 		case allTicketed:
@@ -211,6 +247,8 @@ func (s *Server) profileViews(now time.Time) ([]ProfileView, error) {
 			v.StateClass, v.StateLabel = "idle", "no devices, would be blocked"
 		case v.NeedsDevices:
 			v.StateClass, v.StateLabel = "idle", "no devices, would be allowed"
+		case v.Blocked && overBudget && !allManual:
+			v.StateClass, v.StateLabel = "off", string(budgets[p.Name].Reason)
 		case v.Blocked && allManual:
 			v.StateClass, v.StateLabel = "off", "blocked by you"
 		case v.Blocked:
@@ -624,6 +662,8 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
     <span class="muted">{{if not .Drifted}}{{.Reason}}{{end}}</span>
   </div>
   {{if .NeedsDevices}}<div class="warnline">{{.Warning}}</div>{{end}}
+  {{if .Budget}}<div class="muted">budget: {{.Budget}}</div>{{end}}
+  {{if .Observed}}<div class="muted">{{.Observed}}</div>{{end}}
 
   <div class="actions">
     {{if .ManuallyBlocked}}

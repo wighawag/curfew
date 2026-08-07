@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/wighawag/curfew/internal/budget"
 )
 
 func TestAMissingFileIsEmptyStateSoAFirstRunNeedsNoBootstrap(t *testing.T) {
@@ -126,5 +129,168 @@ func TestTheSuiteNeverTouchesTheRealStateFile(t *testing.T) {
 	}
 	if beforeErr == nil && after.ModTime() != before.ModTime() {
 		t.Errorf("%s was modified by a test", DefaultPath)
+	}
+}
+
+// The budget members of the authoritative persisted-state list. Each of these
+// is a case where losing the value silently hands a child internet back.
+
+func TestBudgetStateSurvivesARoundTripToDisk(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	when := time.Date(2026, 8, 7, 19, 30, 0, 0, time.UTC)
+	st := &State{
+		ManualBlocked: []string{"tia"},
+		BudgetDay:     "2026-08-07",
+		Budget: map[string]budget.State{"eli": {
+			Usage: budget.D(90 * time.Minute), Session: budget.D(20 * time.Minute),
+			LastActive: when, CooldownUntil: when.Add(30 * time.Minute),
+		}},
+	}
+	if err := Save(path, st); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	back, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := back.Budget["eli"]
+	if got.Usage != st.Budget["eli"].Usage || got.Session != st.Budget["eli"].Session {
+		t.Errorf("usage or session lost across a restart: %+v", got)
+	}
+	if !got.LastActive.Equal(when) {
+		t.Errorf("last_active lost: %v", got.LastActive)
+	}
+	if !got.CooldownUntil.Equal(when.Add(30 * time.Minute)) {
+		t.Errorf("cooldown lost: %v", got.CooldownUntil)
+	}
+	if back.BudgetDay != "2026-08-07" {
+		t.Errorf("the day marker is what stops a reboot looking like a new day, got %q", back.BudgetDay)
+	}
+	// And the manual block is still there, because they are separate members
+	// and neither write touches the other.
+	if !back.IsBlocked("tia") {
+		t.Error("the manual block was lost when budget state was added")
+	}
+}
+
+func TestBudgetForAppliesTheRolloverAsADerivation(t *testing.T) {
+	st := &State{BudgetDay: "2026-08-07",
+		Budget: map[string]budget.State{"eli": {Usage: budget.D(4 * time.Hour)}}}
+	if got := st.BudgetFor("eli", "2026-08-07"); got.Usage == 0 {
+		t.Error("within the same budget day the usage must stand")
+	}
+	// A new day, and nothing has written the zero down yet. The derivation
+	// must already see it, which is what makes a daemon that was down across
+	// the reset time still start the new day correctly.
+	if got := st.BudgetFor("eli", "2026-08-08"); got.Usage != 0 {
+		t.Errorf("a new budget day must read as zero usage before any tick writes it, got %s", got.Usage)
+	}
+}
+
+func TestRollOverClearsOnlyWhatTheBudgetOwns(t *testing.T) {
+	st := &State{ManualBlocked: []string{"eli"}, BudgetDay: "2026-08-07",
+		Budget: map[string]budget.State{"eli": {Usage: budget.D(4 * time.Hour)}}}
+	if !st.RollOver("2026-08-08") {
+		t.Fatal("a new day must roll over")
+	}
+	if len(st.Budget) != 0 {
+		t.Errorf("the rollover must zero the budget counters, got %+v", st.Budget)
+	}
+	// The defect being replaced: the old implementation called unblock
+	// unconditionally on rollover and silently cancelled bedtime.
+	if !st.IsBlocked("eli") {
+		t.Error("the daily reset lifted a manual block, which it does not own")
+	}
+	if st.RollOver("2026-08-08") {
+		t.Error("rolling over to the same day again must be a no-op")
+	}
+}
+
+// A router with no RTC boots at the epoch. A backwards rollover would hand
+// every child a fresh allowance on every power cut, which is the exact
+// reboot-grants-internet defect this file exists to prevent.
+func TestRollOverRefusesToGoBackwards(t *testing.T) {
+	st := &State{BudgetDay: "2026-08-07",
+		Budget: map[string]budget.State{"eli": {Usage: budget.D(4 * time.Hour)}}}
+	if st.RollOver("1970-01-01") {
+		t.Error("a clock that jumped backwards must not start a new budget day")
+	}
+	if st.Budget["eli"].Usage == 0 {
+		t.Error("a backwards clock wiped a spent allowance")
+	}
+	if st.BudgetDay != "2026-08-07" {
+		t.Errorf("the day marker moved backwards to %q", st.BudgetDay)
+	}
+	// Forward still works, so the guard is not simply "never roll over".
+	if !st.RollOver("2026-08-08") {
+		t.Error("a forward rollover must still happen")
+	}
+}
+
+func TestSetBudgetStoresZeroStateAsAbsence(t *testing.T) {
+	st := &State{}
+	if !st.SetBudget("eli", budget.State{Usage: budget.D(time.Minute)}) {
+		t.Error("a new value is a change")
+	}
+	if st.SetBudget("eli", budget.State{Usage: budget.D(time.Minute)}) {
+		t.Error("an unchanged value must not report a change, or the file is rewritten every tick")
+	}
+	if !st.SetBudget("eli", budget.State{}) {
+		t.Error("dropping back to zero is a change")
+	}
+	if _, present := st.Budget["eli"]; present {
+		t.Error("zero state must be stored as absence, so an idle household writes nothing")
+	}
+}
+
+func TestForgetBudgetDropsProfilesThatNoLongerExist(t *testing.T) {
+	st := &State{Budget: map[string]budget.State{
+		"eli": {Usage: budget.D(time.Hour)}, "ghost": {Usage: budget.D(time.Hour)},
+	}}
+	if !st.ForgetBudget(map[string]bool{"eli": true}) {
+		t.Error("a departed profile is a change")
+	}
+	if _, present := st.Budget["ghost"]; present {
+		t.Error("a deleted profile's counters must not survive to be inherited by a reused name")
+	}
+	if _, present := st.Budget["eli"]; !present {
+		t.Error("a live profile's counters must be kept")
+	}
+}
+
+// A state file written before budgets existed must still load. Refusing it
+// would take the household's manual blocks down on the first upgrade.
+func TestAStateFileFromBeforeBudgetsStillLoads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte(`{"manual_blocked":["eli"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := Load(path)
+	if err != nil {
+		t.Fatalf("an older state file must still load, got %v", err)
+	}
+	if !st.IsBlocked("eli") {
+		t.Error("the manual block was lost")
+	}
+	if st.BudgetDay != "" || len(st.Budget) != 0 {
+		t.Errorf("an older file has no budget state, got day=%q budget=%+v", st.BudgetDay, st.Budget)
+	}
+}
+
+func TestEffectiveDayRefusesToAddressAnEarlierDay(t *testing.T) {
+	st := &State{BudgetDay: "2026-08-07"}
+	if got := st.EffectiveDay("1970-01-01"); got != "2026-08-07" {
+		t.Errorf("a backwards clock must keep addressing the stored day, got %q", got)
+	}
+	if got := st.EffectiveDay("2026-08-07"); got != "2026-08-07" {
+		t.Errorf("the same day must be itself, got %q", got)
+	}
+	if got := st.EffectiveDay("2026-08-08"); got != "2026-08-08" {
+		t.Errorf("a forward clock must address the new day, got %q", got)
+	}
+	// A first run has no stored day, so whatever the clock says is right.
+	empty := &State{}
+	if got := empty.EffectiveDay("2026-08-07"); got != "2026-08-07" {
+		t.Errorf("with no stored day the clock decides, got %q", got)
 	}
 }

@@ -20,6 +20,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/wighawag/curfew/internal/budget"
 )
 
 // Day is a day of the week, stored as a short lowercase name so the config is
@@ -160,13 +162,18 @@ func (w Window) Contains(t time.Time) bool {
 	return (w.hasDay(today) && now >= s) || (w.hasDay(yesterday) && now < e)
 }
 
-// Profile is a named group of devices with its own schedule.
+// Profile is a named group of devices with its own schedule and its own daily
+// budget.
 type Profile struct {
 	Name string `json:"name"`
 	// Devices are MAC addresses, canonical lowercase, referencing the device
 	// registry. A MAC here that is not registered simply matches nothing.
 	Devices []string `json:"devices"`
 	Windows []Window `json:"windows"`
+	// Budget is this profile's daily time allowance. Every field in it is
+	// optional and an absent budget means UNLIMITED, which is what a parent, a
+	// printer and a camera all need. See internal/budget.
+	Budget budget.Limits `json:"budget,omitzero"`
 }
 
 // BlockedAt reports whether this profile should be blocked at t.
@@ -182,6 +189,13 @@ func (p Profile) BlockedAt(t time.Time) bool {
 // Profiles is the whole schedule config.
 type Profiles struct {
 	Profiles []Profile `json:"profiles"`
+	// Budget holds the budget knobs that belong to the household rather than
+	// to a child: when the day rolls over, and how much traffic counts as use.
+	// They live here, with the policy they modify, rather than in daemon.conf,
+	// because they are decisions a parent makes and must travel with push and
+	// pull; daemon.conf is deployment settings that `curfew update`
+	// deliberately never touches.
+	Budget budget.Settings `json:"budget_settings,omitzero"`
 }
 
 // Find returns a profile by name.
@@ -219,6 +233,9 @@ func (ps *Profiles) BlockedMACs(t time.Time) []string {
 func (ps *Profiles) Validate() error {
 	var problems []string
 	names := map[string]bool{}
+	if err := ps.Budget.Validate(); err != nil {
+		problems = append(problems, fmt.Sprintf("budget_settings: %v", err))
+	}
 	for _, p := range ps.Profiles {
 		if strings.TrimSpace(p.Name) == "" {
 			problems = append(problems, "a profile has no name")
@@ -232,6 +249,9 @@ func (ps *Profiles) Validate() error {
 			if err := w.Validate(); err != nil {
 				problems = append(problems, fmt.Sprintf("profile %q window %d: %v", p.Name, i+1, err))
 			}
+		}
+		if err := p.Budget.Validate(); err != nil {
+			problems = append(problems, fmt.Sprintf("profile %q budget: %v", p.Name, err))
 		}
 	}
 	if len(problems) > 0 {
@@ -364,15 +384,24 @@ func sameSet(a, b []Day) bool {
 // is authored and its order is what a person sees on the page.
 func Equal(a, b *Profiles) bool {
 	ai, bi := map[string]Profile{}, map[string]Profile{}
+	var sa, sb budget.Settings
 	if a != nil {
+		sa = a.Budget
 		for _, p := range a.Profiles {
 			ai[p.Name] = p
 		}
 	}
 	if b != nil {
+		sb = b.Budget
 		for _, p := range b.Profiles {
 			bi[p.Name] = p
 		}
+	}
+	// The household budget knobs are part of the schedule for push and pull.
+	// Leaving them out would make a changed reset time invisible to the merge,
+	// so one side would silently keep the other's day boundary.
+	if sa != sb {
+		return false
 	}
 	if len(ai) != len(bi) {
 		return false
@@ -380,6 +409,9 @@ func Equal(a, b *Profiles) bool {
 	for name, pa := range ai {
 		pb, ok := bi[name]
 		if !ok || len(pa.Windows) != len(pb.Windows) || len(pa.Devices) != len(pb.Devices) {
+			return false
+		}
+		if pa.Budget != pb.Budget {
 			return false
 		}
 		for i := range pa.Windows {

@@ -10,13 +10,20 @@ import (
 // The probe creates and DELETES tables. Pointing it at the enforcement table
 // would turn a diagnostic that is advertised as safe on a live router into an
 // outage for the whole household.
-func TestTheProbeNeverNamesTheEnforcementTable(t *testing.T) {
-	if TableName == contract.Table {
-		t.Fatalf("the probe table is %q, which is the enforcement table", TableName)
-	}
-	if !strings.Contains(TableName, "probe") {
-		t.Errorf("the probe table %q should be obviously a probe to anyone reading "+
-			"nft list tables on a router at 2am", TableName)
+func TestTheProbeNeverNamesALiveTable(t *testing.T) {
+	// Both of the probe's tables, against both of the live ones. Accounting is
+	// as live as enforcement: deleting it would zero every child's usage for
+	// the day, which is quieter than an outage and therefore worse.
+	for _, probe := range []string{TableName, neighbourTable} {
+		for _, live := range []string{contract.Table, contract.AccountingTable} {
+			if probe == live {
+				t.Fatalf("a probe table is %q, which is a live table", probe)
+			}
+		}
+		if !strings.Contains(probe, "probe") {
+			t.Errorf("the probe table %q should be obviously a probe to anyone reading "+
+				"nft list tables on a router at 2am", probe)
+		}
 	}
 }
 
