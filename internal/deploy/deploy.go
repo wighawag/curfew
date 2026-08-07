@@ -17,6 +17,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/wighawag/curfew/internal/contract"
 )
 
 // Runner executes commands against the router. It is an interface so the
@@ -283,12 +285,12 @@ func Install(r Runner, opt InstallOptions) error {
 // lie being removed. The only evidence that the daemon is enforcing is the
 // kernel's own set.
 func Verify(r Runner) (int, error) {
-	out, err := r.Run("nft list set inet parental_control allowed_macs 2>&1 || true")
+	out, err := r.Run(fmt.Sprintf("nft list set inet %s %s 2>&1 || true", contract.Table, contract.AllowedSet))
 	if err != nil {
 		return 0, err
 	}
 	if strings.Contains(out, "No such file") || strings.Contains(out, "does not exist") {
-		return 0, fmt.Errorf("the parental_control table is not present: the daemon is not enforcing.\n%s", strings.TrimSpace(out))
+		return 0, fmt.Errorf("the %s table is not present: the daemon is not enforcing.\n%s", contract.Table, strings.TrimSpace(out))
 	}
 	i := strings.Index(out, "elements = {")
 	if i < 0 {

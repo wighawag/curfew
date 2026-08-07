@@ -1,5 +1,5 @@
 // Package enforce owns the nftables ruleset. It is the ONLY thing that writes
-// to the parental_control table.
+// to the curfew table.
 //
 // Two properties are deliberate and load-bearing:
 //
@@ -28,20 +28,18 @@ import (
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
+
+	"github.com/wighawag/curfew/internal/contract"
 )
 
+// The object names live in internal/contract because internal/deploy needs
+// them too, and the laptop binary may not import this package.
 const (
-	// TableName is the dedicated table. It is deliberately separate from
-	// OpenWrt's fw4 so the two never mix.
-	TableName = "parental_control"
-	// AllowedSet holds every registered MAC.
-	AllowedSet = "allowed_macs"
-	// PolicyChain holds the ordering contract.
-	PolicyChain = "parental"
-	// BaseChain is the hooked chain that narrows to LAN-to-WAN.
-	BaseChain = "forward"
-	// HookPriority runs this table ahead of fw4 without mixing into it.
-	HookPriority = -10
+	TableName    = contract.Table
+	AllowedSet   = contract.AllowedSet
+	PolicyChain  = contract.PolicyChain
+	BaseChain    = contract.BaseChain
+	HookPriority = contract.HookPriority
 )
 
 // Config names the interfaces the policy applies between. Both are required:

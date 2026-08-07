@@ -1,6 +1,8 @@
 # Architecture
 
-How curfew is put together today. This describes our own code, so the code is the current truth and this document is an orientation map, not a specification. Decisions and their rationale live in `docs/adr/`; intended changes live in `work/specs/`.
+> **This document describes the LEGACY shell implementation**, now under `legacy/`, which is being replaced by the Go tool. It is kept because that shell system is what ran on the router, and because every defect it records is the reason the replacement is shaped the way it is. For the Go tool see the README and `docs/adr/`.
+
+How the shell implementation is put together. This describes our own code, so the code is the current truth and this document is an orientation map, not a specification. Decisions and their rationale live in `docs/adr/`; intended changes live in `work/specs/`.
 
 ## The layers
 

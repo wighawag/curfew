@@ -166,7 +166,7 @@ func cmdInstall(args []string) error {
 	if count == 0 {
 		fmt.Fprintln(os.Stderr, "\nWARNING: the allowlist is EMPTY, so nothing on the LAN can reach the internet.")
 		fmt.Fprintln(os.Stderr, "         Run 'curfew import' then 'curfew push <host>', or add devices on the page.")
-		fmt.Fprintf(os.Stderr, "         To undo everything right now: ssh %s 'nft delete table inet parental_control'\n", host)
+		fmt.Fprintf(os.Stderr, "         To undo everything right now: ssh %s 'nft delete table inet curfew'\n", host)
 	}
 	fmt.Printf("device page: http://<router>%s\n", *listen)
 	return nil
