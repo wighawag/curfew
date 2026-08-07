@@ -178,3 +178,43 @@ func TestLoadRejectsGarbageMACInFile(t *testing.T) {
 		t.Error("want an error for an unparseable MAC in the file, got nil")
 	}
 }
+
+func TestRenameChangesTheName(t *testing.T) {
+	r := &Registry{}
+	if err := r.Add("aa:bb:cc:dd:ee:01", "old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Rename("AA:BB:CC:DD:EE:01", "new name"); err != nil {
+		t.Fatalf("rename by a different spelling should work: %v", err)
+	}
+	if r.Devices[0].Name != "new name" {
+		t.Errorf("want the name updated, got %q", r.Devices[0].Name)
+	}
+}
+
+// Rename is strict where Add is an upsert. A rename racing a removal must not
+// resurrect the device: resurrecting an entry in an allowlist hands back
+// internet access nobody asked to restore.
+func TestRenameRefusesAnUnregisteredMAC(t *testing.T) {
+	r := &Registry{}
+	if err := r.Rename("aa:bb:cc:dd:ee:09", "ghost"); err == nil {
+		t.Fatal("want an error renaming an unregistered MAC")
+	}
+	if len(r.Devices) != 0 {
+		t.Errorf("a failed rename must not insert anything, got %+v", r.Devices)
+	}
+}
+
+func TestRenameToEmptyIsAllowed(t *testing.T) {
+	// Clearing a name is legitimate: the name is optional in the first place.
+	r := &Registry{}
+	if err := r.Add("aa:bb:cc:dd:ee:01", "named"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Rename("aa:bb:cc:dd:ee:01", "  "); err != nil {
+		t.Fatal(err)
+	}
+	if r.Devices[0].Name != "" {
+		t.Errorf("want the name cleared, got %q", r.Devices[0].Name)
+	}
+}

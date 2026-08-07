@@ -27,6 +27,12 @@ func (f *fakeRunner) Run(cmd string) (string, error) {
 	if strings.Contains(cmd, "uname -m") {
 		return "aarch64\n", nil
 	}
+	if strings.Contains(cmd, RemoteRegistry) && strings.Contains(cmd, "echo yes") {
+		if f.existing[RemoteRegistry] {
+			return "yes\n", nil
+		}
+		return "no\n", nil
+	}
 	return "", nil
 }
 
@@ -338,5 +344,41 @@ func TestInstallFailsWhenThePushedBinaryCannotRun(t *testing.T) {
 	// And it must stop BEFORE wiring the service up.
 	if r.ranMatching("enable") || r.ranMatching("restart") {
 		t.Error("the service must not be enabled or started after a failed exec check")
+	}
+}
+
+// Re-running install to update the binary must not discard devices added or
+// renamed on the router's own page. Shipping the local list exists only to
+// avoid ever starting with an empty allowlist; making the router match the
+// laptop is what push is for, and it is an explicit act.
+func TestInstallDoesNotOverwriteARegistryTheRouterAlreadyHas(t *testing.T) {
+	reg := filepath.Join(t.TempDir(), "devices.json")
+	if err := os.WriteFile(reg, []byte(`{"devices":[{"mac":"aa:bb:cc:dd:ee:01"}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := &fakeRunner{existing: map[string]bool{RemoteRegistry: true}}
+	if err := Install(r, InstallOptions{
+		WAN: "pppoe-wan", BinaryPath: tempBinary(t), RegistryPath: reg,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if r.uploadedTo(RemoteRegistry) {
+		t.Error("install overwrote the router's device list; router-side edits would be lost")
+	}
+}
+
+func TestInstallShipsTheListWhenTheRouterHasNone(t *testing.T) {
+	reg := filepath.Join(t.TempDir(), "devices.json")
+	if err := os.WriteFile(reg, []byte(`{"devices":[{"mac":"aa:bb:cc:dd:ee:01"}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := &fakeRunner{existing: map[string]bool{}}
+	if err := Install(r, InstallOptions{
+		WAN: "pppoe-wan", BinaryPath: tempBinary(t), RegistryPath: reg,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !r.uploadedTo(RemoteRegistry) {
+		t.Error("a first install must ship the list, or the allowlist starts empty")
 	}
 }

@@ -83,6 +83,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/devices", s.handleAddDevice)
+	mux.HandleFunc("/devices/rename", s.handleRenameDevice)
 	mux.HandleFunc("/api/devices", s.handleAPIDevices)
 	return s.withAuth(s.withNoStore(mux))
 }
@@ -230,6 +231,45 @@ func (s *Server) handleAddDevice(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
+// handleRenameDevice changes a device's name.
+//
+// It does NOT touch the firewall, and that is deliberate rather than an
+// omission: the allowlist is keyed on MAC, so a name is pure metadata and
+// renaming cannot change who has internet. Reconciling here would put the
+// ruleset at risk for an operation that has no business affecting it.
+func (s *Server) handleRenameDevice(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	mac := r.FormValue("mac")
+	name := r.FormValue("name")
+
+	reg, err := s.store.Load()
+	if err != nil {
+		s.log.Error("loading registry", "error", err)
+		http.Error(w, "failed to read the registry", http.StatusInternalServerError)
+		return
+	}
+	if err := reg.Rename(mac, name); err != nil {
+		// Includes the not-registered case, which must not silently insert.
+		http.Redirect(w, r, "/?error="+template.URLQueryEscaper(err.Error()), http.StatusSeeOther)
+		return
+	}
+	if err := s.store.Save(reg); err != nil {
+		s.log.Error("saving registry", "error", err)
+		http.Error(w, "failed to save the registry", http.StatusInternalServerError)
+		return
+	}
+	s.log.Info("device renamed", "mac", mac, "name", name)
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 type pageData struct {
 	Devices []DeviceView
 	Error   string
@@ -251,6 +291,9 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
  .no  { color: #b00020; font-weight: 600; }
  .warn { background: #fff4e5; }
  form { display: grid; gap: .6rem; }
+ form.rename { display: flex; gap: .3rem; margin: 0; }
+ form.rename input { padding: .4rem; font-size: .9rem; }
+ form.rename button { padding: .4rem .6rem; font-size: .85rem; }
  input { padding: .6rem; font-size: 1rem; width: 100%; box-sizing: border-box; }
  button { padding: .7rem; font-size: 1rem; }
  .err { background: #fdecea; color: #b00020; padding: .6rem; margin-bottom: 1rem; }
@@ -264,8 +307,18 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
 <tr><th>Name</th><th>MAC</th><th>Allowed</th></tr>
 {{range .Devices}}
 <tr{{if .Unregistered}} class="warn"{{end}}>
-  <td>{{if .Name}}{{.Name}}{{else}}<span class="muted">unnamed</span>{{end}}
-      {{if .Unregistered}}<br><span class="muted">not in the registry</span>{{end}}</td>
+  <td>
+    {{if .Unregistered}}
+      <span class="muted">not in the registry</span>
+    {{else}}
+      <form method="POST" action="/devices/rename" class="rename">
+        <input type="hidden" name="mac" value="{{.MAC}}">
+        <input name="name" value="{{.Name}}" placeholder="unnamed" aria-label="name for {{.MAC}}"
+               autocapitalize="none" autocomplete="off">
+        <button type="submit">Save</button>
+      </form>
+    {{end}}
+  </td>
   <td><code>{{.MAC}}</code></td>
   <td>{{if .Allowed}}<span class="yes">yes</span>{{else}}<span class="no">no</span>{{end}}</td>
 </tr>
@@ -279,6 +332,8 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
   <input name="name" placeholder="name (optional)" autocomplete="off">
   <button type="submit">Allow this device</button>
 </form>
+<p class="muted">Edit a name and press Save. Names are labels only: the allowlist
+works on MAC addresses, so renaming never changes who has internet.</p>
 <p class="muted">The Allowed column is read from the firewall itself, not from the
 saved list, so if the two ever disagree you will see it here.</p>
 </body>

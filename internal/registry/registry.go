@@ -71,6 +71,25 @@ func (r *Registry) Add(mac, name string) error {
 	return nil
 }
 
+// Rename changes a registered device's name. Unlike Add it is STRICT: renaming
+// a MAC that is not registered is an error rather than a quiet insert.
+// Otherwise a rename racing a removal would silently resurrect the device, and
+// resurrecting an entry in an allowlist means handing back internet access
+// nobody asked to restore.
+func (r *Registry) Rename(mac, name string) error {
+	canonical, err := NormaliseMAC(mac)
+	if err != nil {
+		return err
+	}
+	for i := range r.Devices {
+		if r.Devices[i].MAC == canonical {
+			r.Devices[i].Name = strings.TrimSpace(name)
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s", ErrNotFound, canonical)
+}
+
 // Remove deregisters a device, which also removes it from the allowlist.
 func (r *Registry) Remove(mac string) error {
 	canonical, err := NormaliseMAC(mac)

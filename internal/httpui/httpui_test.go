@@ -263,3 +263,88 @@ func TestIndexRendersDevices(t *testing.T) {
 		t.Errorf("want no-store, got %q", rec.Header().Get("Cache-Control"))
 	}
 }
+
+func TestRenameDevice(t *testing.T) {
+	srv, store, fw := newTestServer(t,
+		[]registry.Device{{MAC: "aa:bb:cc:dd:ee:01", Name: "old"}},
+		[]string{"aa:bb:cc:dd:ee:01"})
+	before := fw.applyCall
+	rec := post(t, srv.Handler(), "/devices/rename", url.Values{
+		"mac": {"aa:bb:cc:dd:ee:01"}, "name": {"eli laptop"},
+	})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("want 303, got %d: %s", rec.Code, rec.Body)
+	}
+	if store.reg.Devices[0].Name != "eli laptop" {
+		t.Errorf("name not saved: %+v", store.reg.Devices[0])
+	}
+	// A name is metadata. Touching the ruleset for it would put enforcement at
+	// risk for an operation that cannot affect who has internet.
+	if fw.applyCall != before {
+		t.Errorf("renaming must not touch the firewall, Apply called %d times", fw.applyCall-before)
+	}
+	if store.reg.Devices[0].MAC != "aa:bb:cc:dd:ee:01" {
+		t.Errorf("the MAC must not change: %+v", store.reg.Devices[0])
+	}
+}
+
+func TestRenameUnknownDeviceDoesNotInsert(t *testing.T) {
+	srv, store, _ := newTestServer(t, nil, nil)
+	rec := post(t, srv.Handler(), "/devices/rename", url.Values{
+		"mac": {"aa:bb:cc:dd:ee:09"}, "name": {"ghost"},
+	})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("want a redirect carrying the error, got %d", rec.Code)
+	}
+	if len(store.reg.Devices) != 0 {
+		t.Errorf("a rename must never register a new device: %+v", store.reg.Devices)
+	}
+}
+
+func TestRenameRejectsGET(t *testing.T) {
+	srv, store, _ := newTestServer(t,
+		[]registry.Device{{MAC: "aa:bb:cc:dd:ee:01", Name: "old"}}, nil)
+	req := httptest.NewRequest(http.MethodGet, "/devices/rename?mac=aa:bb:cc:dd:ee:01&name=hacked", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("want 405, got %d", rec.Code)
+	}
+	if store.reg.Devices[0].Name != "old" {
+		t.Error("a GET must not rename anything")
+	}
+}
+
+func TestRenameIsAuthenticated(t *testing.T) {
+	store := &memStore{reg: &registry.Registry{Devices: []registry.Device{{MAC: "aa:bb:cc:dd:ee:01", Name: "old"}}}}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := New(store, &fakeFirewall{}, log, "parent", "hunter2")
+	rec := post(t, srv.Handler(), "/devices/rename", url.Values{
+		"mac": {"aa:bb:cc:dd:ee:01"}, "name": {"intruder"},
+	})
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("want 401, got %d", rec.Code)
+	}
+	if store.reg.Devices[0].Name != "old" {
+		t.Error("an unauthenticated rename must change nothing")
+	}
+}
+
+func TestIndexOffersARenameFormForRegisteredDevicesOnly(t *testing.T) {
+	srv, _, _ := newTestServer(t,
+		[]registry.Device{{MAC: "aa:bb:cc:dd:ee:01", Name: "eli"}},
+		[]string{"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:99"}) // ...:99 is unregistered
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, `action="/devices/rename"`) {
+		t.Error("registered devices should get a rename form")
+	}
+	if strings.Count(body, `action="/devices/rename"`) != 1 {
+		t.Errorf("only the registered device should be renameable, got %d forms",
+			strings.Count(body, `action="/devices/rename"`))
+	}
+	if !strings.Contains(body, "not in the registry") {
+		t.Error("the unregistered MAC should still be flagged rather than made nameable")
+	}
+}

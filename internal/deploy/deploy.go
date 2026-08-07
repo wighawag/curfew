@@ -242,8 +242,19 @@ func Install(r Runner, opt InstallOptions) error {
 		return err
 	}
 
-	// Ship the device list before anything starts, when there is one.
-	if opt.RegistryPath != "" {
+	// Ship the local device list ONLY when the router has none.
+	//
+	// The point is to avoid ever starting with an empty allowlist, which would
+	// take the whole household off the internet. It is NOT to make the router
+	// match the laptop: devices can be added and renamed on the router's own
+	// page, and an install run later to update the binary must not silently
+	// discard those edits. Making the router match the laptop is what `push`
+	// is for, and it is an explicit act.
+	remoteHas, err := r.Run(fmt.Sprintf("[ -s %s ] && echo yes || echo no", RemoteRegistry))
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(remoteHas) != "yes" && opt.RegistryPath != "" {
 		if _, statErr := os.Stat(opt.RegistryPath); statErr == nil {
 			if err := r.Upload(opt.RegistryPath, RemoteRegistry); err != nil {
 				return err
