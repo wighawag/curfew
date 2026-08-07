@@ -86,9 +86,9 @@ teardown() {
     # diff is installed in this image, so snapshot with find and compare the
     # strings directly rather than reaching for a tool that is not there.
     local before after
-    before=$(find /opt/my-router -path /opt/my-router/.git -prune -o -print | sort)
+    before=$(find /opt/curfew -path /opt/curfew/.git -prune -o -print | sort)
     netns_client_mac "$ALLOWED_MAC"
     netns_probe || true
-    after=$(find /opt/my-router -path /opt/my-router/.git -prune -o -print | sort)
+    after=$(find /opt/curfew -path /opt/curfew/.git -prune -o -print | sort)
     [ "$before" = "$after" ]
 }

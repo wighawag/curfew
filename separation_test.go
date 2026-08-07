@@ -20,7 +20,7 @@ func TestLaptopBinaryCannotImportEnforcement(t *testing.T) {
 	}
 	for _, dep := range strings.Split(string(out), "\n") {
 		switch strings.TrimSpace(dep) {
-		case "github.com/wighawag/my-router/internal/enforce":
+		case "github.com/wighawag/curfew/internal/enforce":
 			t.Error("the laptop binary imports internal/enforce. It must not: " +
 				"the whole point of the two-binary split is that the laptop tool " +
 				"cannot rewrite a firewall. Move the logic behind the deploy layer.")
@@ -34,11 +34,11 @@ func TestLaptopBinaryCannotImportEnforcement(t *testing.T) {
 // The daemon is the one that SHOULD have it. Without this control the test
 // above would pass just as happily if the enforcement package were deleted.
 func TestDaemonBinaryDoesImportEnforcement(t *testing.T) {
-	out, err := exec.Command("go", "list", "-deps", "./cmd/my-router-daemon").Output()
+	out, err := exec.Command("go", "list", "-deps", "./cmd/curfew-daemon").Output()
 	if err != nil {
 		t.Fatalf("go list -deps: %v", err)
 	}
-	if !strings.Contains(string(out), "github.com/wighawag/my-router/internal/enforce") {
+	if !strings.Contains(string(out), "github.com/wighawag/curfew/internal/enforce") {
 		t.Error("the daemon does not import internal/enforce, so the check above proves nothing")
 	}
 }

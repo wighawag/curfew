@@ -17,7 +17,7 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/wighawag/my-router/internal/registry"
+	"github.com/wighawag/curfew/internal/registry"
 )
 
 // Firewall is the enforcement surface this package needs. Narrow on purpose,
@@ -90,7 +90,7 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.authOK(r) {
-			w.Header().Set("WWW-Authenticate", `Basic realm="my-router", charset="UTF-8"`)
+			w.Header().Set("WWW-Authenticate", `Basic realm="curfew", charset="UTF-8"`)
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
@@ -240,7 +240,7 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>my-router devices</title>
+<title>curfew devices</title>
 <style>
  body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem; max-width: 40rem; }
  h1 { font-size: 1.3rem; }

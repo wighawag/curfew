@@ -48,7 +48,7 @@ The test suite currently runs some cases against a mock iptables via `PARENTAL_F
 
 ## Prompt
 
-> Remove the iptables fallback backend from the my-router parental control scripts, leaving nftables as the sole firewall implementation.
+> Remove the iptables fallback backend from the curfew parental control scripts, leaving nftables as the sole firewall implementation.
 >
 > Context: this repo controls a home router running OpenWrt 25.12, which ships nftables only. The iptables path was kept for backward compatibility with older OpenWrt versions and the repo owner has decided it should go. It is never exercised on the target hardware, and it doubles the code that must be reasoned about for any firewall change.
 >

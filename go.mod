@@ -1,4 +1,4 @@
-module github.com/wighawag/my-router
+module github.com/wighawag/curfew
 
 go 1.26
 

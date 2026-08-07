@@ -1,6 +1,6 @@
 # Architecture
 
-How my-router is put together today. This describes our own code, so the code is the current truth and this document is an orientation map, not a specification. Decisions and their rationale live in `docs/adr/`; intended changes live in `work/specs/`.
+How curfew is put together today. This describes our own code, so the code is the current truth and this document is an orientation map, not a specification. Decisions and their rationale live in `docs/adr/`; intended changes live in `work/specs/`.
 
 ## The layers
 

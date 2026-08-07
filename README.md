@@ -1,4 +1,4 @@
-# my-router
+# curfew
 
 Profile-based parental control system for OpenWrt on the GL.iNet Flint 2 (GL-MT6000).
 
@@ -8,17 +8,17 @@ Profile-based parental control system for OpenWrt on the GL.iNet Flint 2 (GL-MT6
 
 Two binaries, and the split is a safety property rather than tidiness.
 
-**`my-router`** runs on your laptop and does three things: `install`, `push`, `pull`. It cannot enforce anything, because it does not import the enforcement code at all. Running the wrong command on a laptop therefore cannot rewrite that laptop's own firewall. A test asserts this against the real import graph, so it cannot rot.
+**`curfew`** runs on your laptop and does three things: `install`, `push`, `pull`. It cannot enforce anything, because it does not import the enforcement code at all. Running the wrong command on a laptop therefore cannot rewrite that laptop's own firewall. A test asserts this against the real import graph, so it cannot rot.
 
-**`my-router-daemon`** runs on the router. It owns the nftables ruleset and serves the device page on port 8080.
+**`curfew-daemon`** runs on the router. It owns the nftables ruleset and serves the device page on port 8080.
 
 ```sh
 # install (or update) the router, from your laptop
-my-router install root@192.168.1.1 --wan pppoe-wan --password <choose-one>
+curfew install root@192.168.1.1 --wan pppoe-wan --password <choose-one>
 
 # move the device list around
-my-router pull root@192.168.1.1     # router  -> config/local/devices.json
-my-router push root@192.168.1.1     # config/local/devices.json -> router
+curfew pull root@192.168.1.1     # router  -> config/local/devices.json
+curfew push root@192.168.1.1     # config/local/devices.json -> router
 ```
 
 `--wan` is required and deliberately not guessed: on this router's PPPoE line the live device is `pppoe-wan`, not the configured `eth1`, and guessing it is exactly how enforcement silently matches nothing. Check with `ssh <host> ifstatus wan`.
@@ -74,7 +74,7 @@ The acceptance run sends real packets through a real LAN-to-WAN topology and ass
 ### 3. Fill in your configs
 
 ```bash
-cd ~/dev/github/wighawag/my-router/config/local
+cd ~/dev/github/wighawag/curfew/config/local
 ```
 
 Edit the pre-created files with your actual values:
@@ -98,7 +98,7 @@ ssh root@192.168.1.1 "cat /tmp/dhcp.leases"
 ### 4. Run the installer
 
 ```bash
-cd ~/dev/github/wighawag/my-router
+cd ~/dev/github/wighawag/curfew
 ./install.sh 192.168.1.1
 ```
 
@@ -156,7 +156,7 @@ docker compose -f docker/docker-compose.yml run --rm test
 ## Project structure
 
 ```
-my-router/
+curfew/
 ├── config/local/              # Your actual configs (gitignored)
 ├── install.sh                 # One-command installer (idempotent)
 ├── scripts/

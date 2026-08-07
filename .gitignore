@@ -1,5 +1,5 @@
 # Build and acceptance artifacts
 /.acceptance/
-/my-router
-/my-router-daemon
+/curfew
+/curfew-daemon
 /dist/

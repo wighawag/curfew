@@ -69,7 +69,7 @@ func (f *fakeRunner) ranMatching(sub string) bool {
 
 func tempBinary(t *testing.T) string {
 	t.Helper()
-	p := filepath.Join(t.TempDir(), "my-router-daemon")
+	p := filepath.Join(t.TempDir(), "curfew-daemon")
 	if err := os.WriteFile(p, []byte("#!/bin/true\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +225,7 @@ func TestInitScriptShape(t *testing.T) {
 		RemoteBinary,
 		`-wan "pppoe-wan"`,
 		`-lan "br-lan"`,
-		"MYROUTER_PASSWORD=",
+		"CURFEW_PASSWORD=",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("init script missing %q:\n%s", want, s)
@@ -283,7 +283,7 @@ func TestInstallStillCreatesAnEmptyRegistryWhenNoneIsGiven(t *testing.T) {
 // Measured against the real OpenWrt image: /lib/upgrade/keep.d/ lists
 // "/etc/config/" and nothing else that would cover an arbitrary /etc/<app>
 // directory. An earlier version of this code stored the registry in
-// /etc/my-router/, which a sysupgrade would have deleted, bringing the router
+// /etc/curfew/, which a sysupgrade would have deleted, bringing the router
 // back with an empty allowlist and the whole household offline. This is a
 // non-obvious constraint that a future refactor would happily undo, so it is
 // pinned here rather than left to a comment.

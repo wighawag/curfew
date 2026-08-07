@@ -36,7 +36,7 @@ Note that the recovery script deliberately restores dnsmasq to port 53 and remov
 
 ## Prompt
 
-> Retire the dead dnsmasq-based global blocklist mechanism from the my-router parental control system, after verifying that AdGuard Home covers the same filtering categories.
+> Retire the dead dnsmasq-based global blocklist mechanism from the curfew parental control system, after verifying that AdGuard Home covers the same filtering categories.
 >
 > Context: this repo controls a home router running OpenWrt. It has two global DNS filtering mechanisms, and only one is live. AdGuard Home owns port 53 and dnsmasq was moved to port 54 for DHCP only, so the dnsmasq blocklists are inert. Read `docs/adr/0002-adguard-home-owns-dns-filtering.md` first: it records why AdGuard replaced dnsmasq (dnsmasq could not handle blocklists of the required size) and that the dnsmasq path is legacy.
 >

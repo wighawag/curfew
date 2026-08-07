@@ -87,14 +87,14 @@ func (s SSHRunner) Download(remotePath, localPath string) error {
 // still reads neighbouring configs.
 //
 // The BINARY is deliberately not preserved: /usr/sbin is not in the keep list,
-// so a sysupgrade removes it and you re-run `my-router install`, which ships a
+// so a sysupgrade removes it and you re-run `curfew install`, which ships a
 // fresh binary and leaves the preserved device list alone.
 const (
-	RemoteBinary   = "/usr/sbin/my-router-daemon"
-	RemoteConfDir  = "/etc/config/my-router"
-	RemoteRegistry = "/etc/config/my-router/devices.json"
-	RemoteInit     = "/etc/init.d/my-router"
-	ServiceName    = "my-router"
+	RemoteBinary   = "/usr/sbin/curfew-daemon"
+	RemoteConfDir  = "/etc/config/curfew"
+	RemoteRegistry = "/etc/config/curfew/devices.json"
+	RemoteInit     = "/etc/init.d/curfew"
+	ServiceName    = "curfew"
 	// RemoteKeepList registers our files for preservation across a firmware
 	// upgrade. Without it a sysupgrade removes the daemon AND its service
 	// definition, so the router comes back enforcing nothing, with every
@@ -108,7 +108,7 @@ const (
 	// installed packages, not by reading the sysupgrade script, which is not
 	// present in the rootfs test image. Confirm on the real router before
 	// relying on it, and see the fallback in the comment on RemoteConfDir.
-	RemoteKeepList = "/lib/upgrade/keep.d/my-router"
+	RemoteKeepList = "/lib/upgrade/keep.d/curfew"
 )
 
 // GoArch maps what `uname -m` reports on the router to a GOARCH. Detecting
@@ -146,7 +146,7 @@ func DetectArch(r Runner) (string, error) {
 // image at /lib/functions/procd.sh).
 func initScript(wan, lan, listen, user, password string) string {
 	return fmt.Sprintf(`#!/bin/sh /etc/rc.common
-# my-router: parental control daemon. Managed by the my-router tool.
+# curfew: parental control daemon. Managed by the curfew tool.
 START=99
 USE_PROCD=1
 
@@ -157,7 +157,7 @@ start_service() {
         -lan %q \
         -wan %q \
         -listen %q
-    procd_set_param env MYROUTER_USER=%q MYROUTER_PASSWORD=%q
+    procd_set_param env CURFEW_USER=%q CURFEW_PASSWORD=%q
     procd_set_param respawn
     procd_set_param stdout 1
     procd_set_param stderr 1
@@ -212,7 +212,7 @@ func Install(r Runner, opt InstallOptions) error {
 		return err
 	}
 
-	local, err := os.CreateTemp("", "my-router-init-*")
+	local, err := os.CreateTemp("", "curfew-init-*")
 	if err != nil {
 		return fmt.Errorf("creating temp init script: %w", err)
 	}
@@ -247,7 +247,7 @@ func Install(r Runner, opt InstallOptions) error {
 	}
 
 	// Register for preservation across a firmware upgrade, before starting.
-	keep, err := os.CreateTemp("", "my-router-keep-*")
+	keep, err := os.CreateTemp("", "curfew-keep-*")
 	if err != nil {
 		return fmt.Errorf("creating temp keep list: %w", err)
 	}

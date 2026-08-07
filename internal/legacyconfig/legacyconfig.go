@@ -15,7 +15,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/wighawag/my-router/internal/registry"
+	"github.com/wighawag/curfew/internal/registry"
 )
 
 // Profile is one line of the legacy parental_profiles file.

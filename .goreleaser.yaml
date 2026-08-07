@@ -2,24 +2,24 @@ version: 2
 
 # Two binaries with deliberately different target sets.
 #
-#   my-router         runs on your LAPTOP. It only drives ssh/scp, so it builds
+#   curfew         runs on your LAPTOP. It only drives ssh/scp, so it builds
 #                     for whatever you run there, macOS included.
-#   my-router-daemon  runs on the ROUTER. It talks netlink to a Linux kernel,
+#   curfew-daemon  runs on the ROUTER. It talks netlink to a Linux kernel,
 #                     so it is Linux-only, and it covers the architectures
 #                     OpenWrt devices actually ship (the GL-MT6000 is arm64).
 #
 # Both are CGO-free and static, so the daemon depends on nothing in the
 # router's userland.
 
-project_name: my-router
+project_name: curfew
 
 before:
   hooks:
     - go mod tidy
 
 builds:
-  - id: my-router
-    binary: my-router
+  - id: curfew
+    binary: curfew
     main: .
     env:
       - CGO_ENABLED=0
@@ -28,9 +28,9 @@ builds:
     goos: [linux, darwin]
     goarch: [amd64, arm64]
 
-  - id: my-router-daemon
-    binary: my-router-daemon
-    main: ./cmd/my-router-daemon
+  - id: curfew-daemon
+    binary: curfew-daemon
+    main: ./cmd/curfew-daemon
     env:
       - CGO_ENABLED=0
     ldflags:
@@ -43,14 +43,14 @@ archives:
   # The two binaries ship in SEPARATE archives on purpose. Bundling them would
   # invite installing the daemon on a laptop, and keeping the enforcement code
   # off the laptop is the reason there are two binaries at all.
-  - id: my-router
-    ids: [my-router]
-    name_template: "my-router_{{ .Os }}_{{ .Arch }}"
+  - id: curfew
+    ids: [curfew]
+    name_template: "curfew_{{ .Os }}_{{ .Arch }}"
     files: [LICENSE, README.md]
 
-  - id: my-router-daemon
-    ids: [my-router-daemon]
-    name_template: "my-router-daemon_{{ .Os }}_{{ .Arch }}"
+  - id: curfew-daemon
+    ids: [curfew-daemon]
+    name_template: "curfew-daemon_{{ .Os }}_{{ .Arch }}"
     files: [LICENSE]
 
 checksum:

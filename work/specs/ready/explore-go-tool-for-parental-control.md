@@ -65,7 +65,7 @@ Deliberately few, since deciding them is the work.
 
 **Recorded decisions that constrain this exploration.** Three ADRs already fix parts of the answer and must not be re-litigated by a spike: budget semantics are actual-use gated by a threshold (`0001`), so the accounting mechanism must be able to measure traffic per profile; AdGuard Home owns DNS filtering and its own configuration is unmanaged state that a config story must capture (`0002`); and the config schema splits into a device registry plus profiles that group devices by name, with ungoverned devices allowed but unrestricted (`0003`). Whatever config format this exploration lands on has to express `0003` and carry AdGuard's hand-made settings.
 
-**House style is the default, not a question.** Follow `../netcage` unless there is a reason not to: module path `github.com/wighawag/my-router`, `main.go` plus `version.go` at root, `cmd/`, `internal/<pkg>/`, ADRs in `docs/adr/`. (Verified: netcage is a Go tool at that layout.)
+**House style is the default, not a question.** Follow `../netcage` unless there is a reason not to: module path `github.com/wighawag/curfew`, `main.go` plus `version.go` at root, `cmd/`, `internal/<pkg>/`, ADRs in `docs/adr/`. (Verified: netcage is a Go tool at that layout.)
 
 ### The six questions this spec launched with, now decided
 

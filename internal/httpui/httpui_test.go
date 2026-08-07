@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wighawag/my-router/internal/registry"
+	"github.com/wighawag/curfew/internal/registry"
 )
 
 // fakeFirewall stands in for nftables so the UI is testable without a kernel.

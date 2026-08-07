@@ -1,26 +1,26 @@
 #!/bin/sh
-# my-router installer: download the latest release and put the LAPTOP binary
+# curfew installer: download the latest release and put the LAPTOP binary
 # on your PATH.
 #
-#   curl -fsSL https://raw.githubusercontent.com/wighawag/my-router/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/wighawag/curfew/main/install.sh | sh
 #
 # Options (environment variables):
-#   MYROUTER_VERSION  version tag to install (default: latest, e.g. v0.1.0)
+#   CURFEW_VERSION  version tag to install (default: latest, e.g. v0.1.0)
 #   PREFIX            install dir (default: $HOME/.local/bin)
 #
-# This installs `my-router`, which runs on your LAPTOP and only does
+# This installs `curfew`, which runs on your LAPTOP and only does
 # install/push/pull over ssh. It deliberately does NOT install
-# my-router-daemon: that one belongs on the router and is put there by
-# `my-router install`, which fetches the right architecture for your device.
+# curfew-daemon: that one belongs on the router and is put there by
+# `curfew install`, which fetches the right architecture for your device.
 # Keeping the enforcement binary off your laptop is the point of the split.
 set -eu
 
-REPO="wighawag/my-router"
-BIN="my-router"
+REPO="wighawag/curfew"
+BIN="curfew"
 
-info() { printf '%s\n' "my-router-install: $*" >&2; }
+info() { printf '%s\n' "curfew-install: $*" >&2; }
 err() {
-	printf '%s\n' "my-router-install: error: $*" >&2
+	printf '%s\n' "curfew-install: error: $*" >&2
 	exit 1
 }
 
@@ -38,17 +38,17 @@ aarch64 | arm64) goarch=arm64 ;;
 *) err "unsupported architecture $arch" ;;
 esac
 
-version="${MYROUTER_VERSION:-}"
+version="${CURFEW_VERSION:-}"
 if [ -z "$version" ]; then
 	version="$(
 		wget -qO- "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null ||
 			curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest"
 	)" || err "cannot reach the GitHub API to find the latest release"
 	version="$(printf '%s' "$version" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
-	[ -n "$version" ] || err "could not determine the latest version; set MYROUTER_VERSION"
+	[ -n "$version" ] || err "could not determine the latest version; set CURFEW_VERSION"
 fi
 
-archive="my-router_${goos}_${goarch}.tar.gz"
+archive="curfew_${goos}_${goarch}.tar.gz"
 url="https://github.com/${REPO}/releases/download/${version}/${archive}"
 
 tmp="$(mktemp -d)"

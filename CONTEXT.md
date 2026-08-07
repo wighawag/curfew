@@ -1,8 +1,8 @@
-# CONTEXT — my-router domain language
+# CONTEXT — curfew domain language
 
-The domain glossary for `my-router`. Agents and skills use THIS vocabulary when naming modules, tests, and discussing the system. Architectural rationale lives in `docs/adr/` (decisions); product framing lives in `work/specs/`.
+The domain glossary for `curfew`. Agents and skills use THIS vocabulary when naming modules, tests, and discussing the system. Architectural rationale lives in `docs/adr/` (decisions); product framing lives in `work/specs/`.
 
-## What my-router is
+## What curfew is
 
 Parental control for OpenWrt on a GL.iNet Flint 2 (GL-MT6000): per-child internet schedules, daily time budgets, per-profile website blocking and temporary access tickets, enforced with nftables and AdGuard Home, plus an installer that deploys it to the router over SSH. Guest access is designed but not built.
 

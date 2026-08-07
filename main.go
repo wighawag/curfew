@@ -1,9 +1,9 @@
-// Command my-router runs ON YOUR LAPTOP. It installs the router daemon and
+// Command curfew runs ON YOUR LAPTOP. It installs the router daemon and
 // moves configuration to and from the router. It does three things: install,
 // push, pull.
 //
 // It deliberately cannot enforce anything. The enforcement code lives only in
-// the my-router-daemon binary, and this package does not import it, so running
+// the curfew-daemon binary, and this package does not import it, so running
 // the wrong command here can never rewrite your laptop's own firewall. That
 // separation is the reason there are two binaries rather than one with a flag.
 package main
@@ -16,23 +16,23 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/wighawag/my-router/internal/deploy"
-	"github.com/wighawag/my-router/internal/legacyconfig"
-	"github.com/wighawag/my-router/internal/registry"
+	"github.com/wighawag/curfew/internal/deploy"
+	"github.com/wighawag/curfew/internal/legacyconfig"
+	"github.com/wighawag/curfew/internal/registry"
 )
 
 func main() {
 	os.Exit(run(os.Args[1:]))
 }
 
-const usage = `my-router - manage the parental control router from your laptop
+const usage = `curfew - manage the parental control router from your laptop
 
 Usage:
-  my-router import [flags]           build a device list from the legacy config
-  my-router install <host> [flags]   install or update the daemon on the router
-  my-router push <host> [flags]      send your local device list to the router
-  my-router pull <host> [flags]      fetch the router's device list
-  my-router version
+  curfew import [flags]           build a device list from the legacy config
+  curfew install <host> [flags]   install or update the daemon on the router
+  curfew push <host> [flags]      send your local device list to the router
+  curfew pull <host> [flags]      fetch the router's device list
+  curfew version
 
 The host is an ssh destination, for example root@192.168.1.1.
 Your existing ssh configuration, keys and agent are used as-is.
@@ -67,7 +67,7 @@ func run(args []string) int {
 		return 2
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "my-router: %v\n", err)
+		fmt.Fprintf(os.Stderr, "curfew: %v\n", err)
 		return 1
 	}
 	return 0
@@ -118,7 +118,7 @@ func cmdInstall(args []string) error {
 			"       On this router's PPPoE line it is pppoe-wan, not eth1. Check with: ssh <host> ifstatus wan")
 	}
 	if *password == "" {
-		fmt.Fprintln(os.Stderr, "my-router: warning: no -password given, so the device page will be unauthenticated.")
+		fmt.Fprintln(os.Stderr, "curfew: warning: no -password given, so the device page will be unauthenticated.")
 		fmt.Fprintln(os.Stderr, "           A device kept off the internet can still reach that page and allow itself.")
 	}
 
@@ -141,9 +141,9 @@ func cmdInstall(args []string) error {
 	}
 
 	if _, err := os.Stat(*regPath); err != nil {
-		fmt.Fprintf(os.Stderr, "my-router: warning: no device list at %s.\n", *regPath)
+		fmt.Fprintf(os.Stderr, "curfew: warning: no device list at %s.\n", *regPath)
 		fmt.Fprintln(os.Stderr, "           The router will start with an EMPTY allowlist, which means")
-		fmt.Fprintln(os.Stderr, "           nothing on your LAN reaches the internet. Run 'my-router import' first")
+		fmt.Fprintln(os.Stderr, "           nothing on your LAN reaches the internet. Run 'curfew import' first")
 		fmt.Fprintln(os.Stderr, "           if you are migrating from the shell scripts.")
 	}
 
@@ -165,7 +165,7 @@ func cmdInstall(args []string) error {
 	fmt.Printf("the firewall is enforcing an allowlist of %d device(s)\n", count)
 	if count == 0 {
 		fmt.Fprintln(os.Stderr, "\nWARNING: the allowlist is EMPTY, so nothing on the LAN can reach the internet.")
-		fmt.Fprintln(os.Stderr, "         Run 'my-router import' then 'my-router push <host>', or add devices on the page.")
+		fmt.Fprintln(os.Stderr, "         Run 'curfew import' then 'curfew push <host>', or add devices on the page.")
 		fmt.Fprintf(os.Stderr, "         To undo everything right now: ssh %s 'nft delete table inet parental_control'\n", host)
 	}
 	fmt.Printf("device page: http://<router>%s\n", *listen)
@@ -180,8 +180,8 @@ func buildDaemon(goarch string) (string, error) {
 		return "", fmt.Errorf("no Go toolchain found to build the daemon; " +
 			"install Go, or pass -binary with a prebuilt daemon")
 	}
-	out := filepath.Join(os.TempDir(), fmt.Sprintf("my-router-daemon-%s", goarch))
-	cmd := exec.Command("go", "build", "-o", out, "./cmd/my-router-daemon")
+	out := filepath.Join(os.TempDir(), fmt.Sprintf("curfew-daemon-%s", goarch))
+	cmd := exec.Command("go", "build", "-o", out, "./cmd/curfew-daemon")
 	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+goarch, "CGO_ENABLED=0")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("building the daemon for %s: %w\n%s", goarch, err, output)

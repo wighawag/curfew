@@ -1,7 +1,7 @@
-// Command my-router-daemon runs ON THE ROUTER. It owns the nftables ruleset
+// Command curfew-daemon runs ON THE ROUTER. It owns the nftables ruleset
 // and serves the device page.
 //
-// This is deliberately a SEPARATE binary from the laptop-side `my-router`
+// This is deliberately a SEPARATE binary from the laptop-side `curfew`
 // tool, and the separation is a safety property rather than tidiness: the
 // laptop tool cannot import this package's enforcement code, so running the
 // wrong command on a laptop cannot rewrite that laptop's firewall.
@@ -19,9 +19,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/wighawag/my-router/internal/enforce"
-	"github.com/wighawag/my-router/internal/httpui"
-	"github.com/wighawag/my-router/internal/registry"
+	"github.com/wighawag/curfew/internal/enforce"
+	"github.com/wighawag/curfew/internal/httpui"
+	"github.com/wighawag/curfew/internal/registry"
 )
 
 func main() {
@@ -49,16 +49,16 @@ func envOr(key, fallback string) string {
 
 func run(args []string, stderr *os.File) int {
 	var opt options
-	fs := flag.NewFlagSet("my-router-daemon", flag.ContinueOnError)
+	fs := flag.NewFlagSet("curfew-daemon", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	fs.StringVar(&opt.registryPath, "registry", envOr("MYROUTER_REGISTRY", "/etc/config/my-router/devices.json"),
+	fs.StringVar(&opt.registryPath, "registry", envOr("CURFEW_REGISTRY", "/etc/config/curfew/devices.json"),
 		"path to the device registry")
-	fs.StringVar(&opt.lan, "lan", envOr("MYROUTER_LAN", "br-lan"), "LAN interface")
-	fs.StringVar(&opt.wan, "wan", envOr("MYROUTER_WAN", ""),
+	fs.StringVar(&opt.lan, "lan", envOr("CURFEW_LAN", "br-lan"), "LAN interface")
+	fs.StringVar(&opt.wan, "wan", envOr("CURFEW_WAN", ""),
 		"WAN interface (required: guessing it is how enforcement silently matches nothing)")
-	fs.StringVar(&opt.listen, "listen", envOr("MYROUTER_LISTEN", ":8080"), "HTTP listen address")
-	fs.StringVar(&opt.user, "user", envOr("MYROUTER_USER", "parent"), "HTTP basic auth username")
-	fs.StringVar(&opt.password, "password", envOr("MYROUTER_PASSWORD", ""),
+	fs.StringVar(&opt.listen, "listen", envOr("CURFEW_LISTEN", ":8080"), "HTTP listen address")
+	fs.StringVar(&opt.user, "user", envOr("CURFEW_USER", "parent"), "HTTP basic auth username")
+	fs.StringVar(&opt.password, "password", envOr("CURFEW_PASSWORD", ""),
 		"HTTP basic auth password (empty disables authentication, with a warning)")
 	fs.DurationVar(&opt.reconcile, "reconcile", time.Minute,
 		"how often to re-check that the firewall still matches the registry")
@@ -70,7 +70,7 @@ func run(args []string, stderr *os.File) int {
 
 	if opt.wan == "" {
 		log.Error("no WAN interface configured; refusing to start",
-			"hint", "pass -wan or set MYROUTER_WAN (on a PPPoE line this is pppoe-wan, not eth1)")
+			"hint", "pass -wan or set CURFEW_WAN (on a PPPoE line this is pppoe-wan, not eth1)")
 		return 1
 	}
 

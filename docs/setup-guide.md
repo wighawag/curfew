@@ -5,7 +5,7 @@
 - GL.iNet Flint 2 (GL-MT6000) router
 - Plusnet FTTP with PPPoE credentials (`username@plusdsl.net` + password)
 - Laptop on same network
-- This repo at `~/dev/github/wighawag/my-router`
+- This repo at `~/dev/github/wighawag/curfew`
 
 ---
 
@@ -29,7 +29,7 @@
 ## Step 3: Fill in your configs
 
 ```bash
-cd ~/dev/github/wighawag/my-router/config/local
+cd ~/dev/github/wighawag/curfew/config/local
 ```
 
 Edit the pre-created files with your actual values:
@@ -49,7 +49,7 @@ then run: `ssh root@192.168.1.1 "cat /tmp/dhcp.leases"`
 ## Step 4: Run the installer
 
 ```bash
-cd ~/dev/github/wighawag/my-router
+cd ~/dev/github/wighawag/curfew
 ./install.sh 192.168.1.1
 ```
 
@@ -82,7 +82,7 @@ No login needed. Auto-blocks when the ticket expires.
 
 ```bash
 # Edit your local configs
-vi ~/dev/github/wighawag/my-router/config/local/parental_profiles
+vi ~/dev/github/wighawag/curfew/config/local/parental_profiles
 
 # Re-run installer (idempotent, preserves tickets)
 ./install.sh 192.168.1.1

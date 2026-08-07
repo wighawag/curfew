@@ -2,7 +2,7 @@ package main
 
 import "runtime/debug"
 
-// version is the my-router version string. For a release build it is stamped
+// version is the curfew version string. For a release build it is stamped
 // via -ldflags "-X main.version=<tag>". When it is left at the default "dev"
 // (a plain `go build`, or `go install ...@vX`), resolveVersion falls back to
 // the module version and VCS revision from the build info, so an installed

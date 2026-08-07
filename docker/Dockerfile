@@ -55,8 +55,8 @@ RUN wget -q -O /tmp/agh.tar.gz \
 # procd, which never runs in a container. Without this `ip netns add` fails.
 RUN mkdir -p /var/run
 
-COPY . /opt/my-router/
-WORKDIR /opt/my-router
+COPY . /opt/curfew/
+WORKDIR /opt/curfew
 
 RUN chmod +x legacy/scripts/*.sh legacy/web/cgi-bin/ticket
 

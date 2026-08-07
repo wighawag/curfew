@@ -18,8 +18,8 @@ services:
     sysctls:
       - net.ipv4.ip_forward=1
     volumes:
-      - ../:/opt/my-router
-    working_dir: /opt/my-router
+      - ../:/opt/curfew
+    working_dir: /opt/curfew
     # Go acceptance binaries first (compiled on the host by docker/acceptance.sh,
     # since this image has no Go toolchain), then the legacy bats suite. The
     # `set -e` matters: without it a failing Go binary would be masked by bats
@@ -41,8 +41,8 @@ services:
     sysctls:
       - net.ipv4.ip_forward=1
     volumes:
-      - ../:/opt/my-router
-    working_dir: /opt/my-router
+      - ../:/opt/curfew
+    working_dir: /opt/curfew
     entrypoint: sh
     stdin_open: true
     tty: true
