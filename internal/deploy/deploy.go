@@ -214,6 +214,15 @@ func Install(r Runner, opt InstallOptions) error {
 		return err
 	}
 
+	// Prove the binary actually runs on this router before wiring it to
+	// anything. A wrong-architecture push otherwise "succeeds" all the way
+	// through enable and start, and only shows up as procd respawning a binary
+	// that cannot exec, which is invisible unless you go looking.
+	if _, err := r.Run(RemoteBinary + " -version"); err != nil {
+		return fmt.Errorf("the installed binary does not run on this router "+
+			"(wrong architecture?): %w", err)
+	}
+
 	local, err := os.CreateTemp("", "curfew-init-*")
 	if err != nil {
 		return fmt.Errorf("creating temp init script: %w", err)

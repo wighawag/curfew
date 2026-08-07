@@ -24,6 +24,12 @@ import (
 	"github.com/wighawag/curfew/internal/registry"
 )
 
+// version is stamped at release time via -ldflags "-X main.version=<tag>".
+// Without it the goreleaser ldflag is a silent no-op and there is no way to
+// ask a router which build it is running, which is the first question worth
+// asking when something is wrong on a box you reach over the network.
+var version = "dev"
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stderr))
 }
@@ -62,11 +68,18 @@ func run(args []string, stderr *os.File) int {
 		"HTTP basic auth password (empty disables authentication, with a warning)")
 	fs.DurationVar(&opt.reconcile, "reconcile", time.Minute,
 		"how often to re-check that the firewall still matches the registry")
+	showVersion := fs.Bool("version", false, "print the version and exit")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
+	if *showVersion {
+		fmt.Println(version)
+		return 0
+	}
+
 	log := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	log.Info("starting", "version", version)
 
 	if opt.wan == "" {
 		log.Error("no WAN interface configured; refusing to start",

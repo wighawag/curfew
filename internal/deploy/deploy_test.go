@@ -322,3 +322,21 @@ func TestInstallRegistersItsFilesForFirmwareUpgrade(t *testing.T) {
 		t.Error("the keep.d directory must exist before writing into it")
 	}
 }
+
+// Pushing a binary for the wrong architecture must fail the install, not sail
+// through enable and start. Without this check procd just respawns something
+// that cannot exec, which looks like nothing at all from the laptop.
+func TestInstallFailsWhenThePushedBinaryCannotRun(t *testing.T) {
+	r := &fakeRunner{failOn: "-version"}
+	err := Install(r, InstallOptions{WAN: "pppoe-wan", BinaryPath: tempBinary(t)})
+	if err == nil {
+		t.Fatal("want an error when the installed binary cannot execute")
+	}
+	if !strings.Contains(err.Error(), "architecture") {
+		t.Errorf("the error should point at the likely cause, got: %v", err)
+	}
+	// And it must stop BEFORE wiring the service up.
+	if r.ranMatching("enable") || r.ranMatching("restart") {
+		t.Error("the service must not be enabled or started after a failed exec check")
+	}
+}
