@@ -360,3 +360,67 @@ func TestEnsureAppliedDoesNothingWhenAlreadyCorrect(t *testing.T) {
 		t.Error("a steady state must not rewrite the ruleset every tick")
 	}
 }
+
+// A scheduled block must beat the allowlist: being a registered device does
+// not save you from your bedtime. This is the ordering contract of ADR 0006
+// asserted with real packets rather than by reading the ruleset.
+func TestPacketPathScheduledBlockOutranksTheAllowlist(t *testing.T) {
+	requireTopology(t)
+	e := newTestEnforcer(t)
+	setClientMAC(t, allowedMAC)
+
+	if err := e.ApplyState([]string{allowedMAC}, nil); err != nil {
+		t.Fatalf("ApplyState: %v", err)
+	}
+	if !reaches(t) {
+		t.Fatal("registered and outside any window: should reach the internet")
+	}
+
+	// Same device, now inside a blocked window.
+	if err := e.ApplyState([]string{allowedMAC}, []string{allowedMAC}); err != nil {
+		t.Fatalf("ApplyState: %v", err)
+	}
+	if reaches(t) {
+		t.Error("a registered device inside its window must be blocked")
+	}
+
+	// And the window ending restores it, with no bookkeeping.
+	if err := e.ApplyState([]string{allowedMAC}, nil); err != nil {
+		t.Fatalf("ApplyState: %v", err)
+	}
+	if !reaches(t) {
+		t.Error("leaving the window must restore access")
+	}
+}
+
+func TestPacketPathBlockingOneProfileLeavesAnotherAlone(t *testing.T) {
+	requireTopology(t)
+	e := newTestEnforcer(t)
+	other := "aa:bb:cc:dd:ee:02"
+	if err := e.ApplyState([]string{allowedMAC, other}, []string{other}); err != nil {
+		t.Fatalf("ApplyState: %v", err)
+	}
+	setClientMAC(t, allowedMAC)
+	if !reaches(t) {
+		t.Error("the unblocked device must still reach the internet")
+	}
+	setClientMAC(t, other)
+	if reaches(t) {
+		t.Error("the blocked device must not")
+	}
+}
+
+func TestBlockedIsReadBackFromTheFirewall(t *testing.T) {
+	requireTopology(t)
+	e := newTestEnforcer(t)
+	if err := e.ApplyState([]string{allowedMAC}, []string{allowedMAC}); err != nil {
+		t.Fatalf("ApplyState: %v", err)
+	}
+	got, err := e.Blocked()
+	if err != nil {
+		t.Fatalf("Blocked: %v", err)
+	}
+	if len(got) != 1 || got[0] != allowedMAC {
+		t.Errorf("Blocked() = %v, want [%s]", got, allowedMAC)
+	}
+}

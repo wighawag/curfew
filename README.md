@@ -89,7 +89,7 @@ Resolve by editing your local list and pushing, or take a side wholesale with `-
 
 The **MAC allowlist**, and nothing else yet. Registered devices reach the internet; everything else is dropped. Add, rename and remove devices from the page at `http://<router>:8080`. Names are optional labels: the allowlist works on MAC addresses, so renaming never changes who has internet, while removing a device revokes its access immediately.
 
-The page reports, per device, what the **firewall** currently allows rather than what the saved list claims, and flags any MAC the firewall allows that nothing registered. If the two ever disagree you see it. A green dot derived from reading back our own config file is precisely the reassurance that let the previous system claim to be working.
+Status is read from the **firewall**, never from re-evaluating the schedule or reading back our own config. If the schedule says a profile should be blocked and the firewall disagrees, the page says exactly that instead of showing you what it hoped. A green dot derived from our own config file is precisely the reassurance that let the previous system claim to be working.
 
 The daemon re-asserts the ruleset on a timer, so a table wiped by hand, by a recovery path, or by anything else heals itself on the next tick.
 

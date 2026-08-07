@@ -37,6 +37,7 @@ import (
 const (
 	TableName    = contract.Table
 	AllowedSet   = contract.AllowedSet
+	BlockedSet   = contract.BlockedSet
 	PolicyChain  = contract.PolicyChain
 	BaseChain    = contract.BaseChain
 	HookPriority = contract.HookPriority
@@ -110,16 +111,37 @@ func (e *Enforcer) exists() (bool, error) {
 // allowed: it means nothing is allowed out, which is what an empty registry
 // genuinely implies.
 func (e *Enforcer) Apply(macs []string) error {
-	parsed := make([][]byte, 0, len(macs))
-	for _, m := range macs {
-		hw, err := net.ParseMAC(m)
-		if err != nil {
-			return fmt.Errorf("allowlist entry %q: %w", m, err)
+	return e.ApplyState(macs, nil)
+}
+
+// ApplyState makes the firewall match the given allowlist and the given set of
+// currently-blocked MACs, replacing the whole table in one transaction.
+//
+// blocked is matched ABOVE allowed, so a registered device inside its bedtime
+// window is dropped. A MAC in blocked but not in allowed is harmless: it was
+// going to be dropped anyway.
+func (e *Enforcer) ApplyState(allowed, blocked []string) error {
+	parse := func(list []string, what string) ([][]byte, error) {
+		out := make([][]byte, 0, len(list))
+		for _, m := range list {
+			hw, err := net.ParseMAC(m)
+			if err != nil {
+				return nil, fmt.Errorf("%s entry %q: %w", what, m, err)
+			}
+			if len(hw) != 6 {
+				return nil, fmt.Errorf("%s entry %q: want a 6-octet MAC, got %d octets", what, m, len(hw))
+			}
+			out = append(out, []byte(hw))
 		}
-		if len(hw) != 6 {
-			return fmt.Errorf("allowlist entry %q: want a 6-octet MAC, got %d octets", m, len(hw))
-		}
-		parsed = append(parsed, []byte(hw))
+		return out, nil
+	}
+	parsed, err := parse(allowed, "allowlist")
+	if err != nil {
+		return err
+	}
+	parsedBlocked, err := parse(blocked, "blocklist")
+	if err != nil {
+		return err
 	}
 
 	present, err := e.exists()
@@ -135,29 +157,42 @@ func (e *Enforcer) Apply(macs []string) error {
 	}
 	t = e.conn.AddTable(t)
 
-	allowed := &nftables.Set{
-		Table:   t,
-		Name:    AllowedSet,
-		KeyType: nftables.TypeEtherAddr,
+	newSet := func(name string, keys [][]byte) (*nftables.Set, error) {
+		set := &nftables.Set{Table: t, Name: name, KeyType: nftables.TypeEtherAddr}
+		elements := make([]nftables.SetElement, 0, len(keys))
+		for _, k := range keys {
+			elements = append(elements, nftables.SetElement{Key: k})
+		}
+		if err := e.conn.AddSet(set, elements); err != nil {
+			return nil, fmt.Errorf("building %s: %w", name, err)
+		}
+		return set, nil
 	}
-	elements := make([]nftables.SetElement, 0, len(parsed))
-	for _, p := range parsed {
-		elements = append(elements, nftables.SetElement{Key: p})
+	blockedSet, err := newSet(BlockedSet, parsedBlocked)
+	if err != nil {
+		return err
 	}
-	if err := e.conn.AddSet(allowed, elements); err != nil {
-		return fmt.Errorf("building %s: %w", AllowedSet, err)
+	allowedSet, err := newSet(AllowedSet, parsed)
+	if err != nil {
+		return err
 	}
 
 	policy := e.conn.AddChain(&nftables.Chain{Table: t, Name: PolicyChain})
 
-	// The ordering contract. Registered devices are accepted; everything else
-	// reaching this chain is dropped. The terminal drop must be LAST, because a
-	// rule after a terminal verdict is unreachable, which is one of the defects
-	// this rewrite exists to remove.
+	// The ordering contract. A scheduled block is matched FIRST, so being
+	// registered does not save you from bedtime; then registered devices are
+	// accepted; everything else reaching this chain is dropped. The terminal
+	// drop must be LAST, because a rule after a terminal verdict is
+	// unreachable, which is one of the defects this rewrite exists to remove.
+	e.conn.AddRule(&nftables.Rule{Table: t, Chain: policy, Exprs: []expr.Any{
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseLLHeader, Offset: 6, Len: 6},
+		&expr.Lookup{SourceRegister: 1, SetName: blockedSet.Name, SetID: blockedSet.ID},
+		&expr.Verdict{Kind: expr.VerdictDrop},
+	}})
 	e.conn.AddRule(&nftables.Rule{Table: t, Chain: policy, Exprs: []expr.Any{
 		// ether saddr lives at offset 6, length 6, of the link-layer header.
 		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseLLHeader, Offset: 6, Len: 6},
-		&expr.Lookup{SourceRegister: 1, SetName: allowed.Name, SetID: allowed.ID},
+		&expr.Lookup{SourceRegister: 1, SetName: allowedSet.Name, SetID: allowedSet.ID},
 		&expr.Verdict{Kind: expr.VerdictAccept},
 	}})
 	e.conn.AddRule(&nftables.Rule{Table: t, Chain: policy, Exprs: []expr.Any{
@@ -198,19 +233,30 @@ func (e *Enforcer) Apply(macs []string) error {
 // and the config file is commentary, so status is derived from here and never
 // from the registry.
 func (e *Enforcer) Allowlist() ([]string, error) {
-	set, err := e.conn.GetSetByName(e.tableRef(), AllowedSet)
+	return e.readSet(AllowedSet)
+}
+
+func (e *Enforcer) readSet(name string) ([]string, error) {
+	set, err := e.conn.GetSetByName(e.tableRef(), name)
 	if err != nil {
-		return nil, fmt.Errorf("reading %s: %w", AllowedSet, err)
+		return nil, fmt.Errorf("reading %s: %w", name, err)
 	}
 	elements, err := e.conn.GetSetElements(set)
 	if err != nil {
-		return nil, fmt.Errorf("reading %s elements: %w", AllowedSet, err)
+		return nil, fmt.Errorf("reading %s elements: %w", name, err)
 	}
 	out := make([]string, 0, len(elements))
 	for _, el := range elements {
 		out = append(out, net.HardwareAddr(el.Key).String())
 	}
+	sort.Strings(out)
 	return out, nil
+}
+
+// Blocked reads back the MACs the FIREWALL is currently dropping by schedule.
+// Status comes from here, never from the config, per ADR 0004.
+func (e *Enforcer) Blocked() ([]string, error) {
+	return e.readSet(BlockedSet)
 }
 
 // Teardown removes the whole table, restoring unrestricted forwarding. This is
@@ -241,16 +287,27 @@ func (e *Enforcer) Teardown() error {
 // ruleset had been wiped: found by an end-to-end test that deleted the table
 // and watched enforcement stay gone.
 func (e *Enforcer) EnsureApplied(want []string) (bool, error) {
-	got, err := e.Allowlist()
+	return e.EnsureAppliedState(want, nil)
+}
+
+// EnsureAppliedState is EnsureApplied for both sets at once.
+func (e *Enforcer) EnsureAppliedState(wantAllowed, wantBlocked []string) (bool, error) {
+	gotAllowed, err := e.Allowlist()
 	if err != nil {
-		return true, e.Apply(want)
+		return true, e.ApplyState(wantAllowed, wantBlocked)
 	}
-	sorted := append([]string(nil), got...)
-	sort.Strings(sorted)
-	wanted := append([]string(nil), want...)
-	sort.Strings(wanted)
-	if slices.Equal(sorted, wanted) {
+	gotBlocked, err := e.Blocked()
+	if err != nil {
+		return true, e.ApplyState(wantAllowed, wantBlocked)
+	}
+	a := append([]string(nil), wantAllowed...)
+	b := append([]string(nil), wantBlocked...)
+	sort.Strings(a)
+	sort.Strings(b)
+	sort.Strings(gotAllowed)
+	sort.Strings(gotBlocked)
+	if slices.Equal(gotAllowed, a) && slices.Equal(gotBlocked, b) {
 		return false, nil
 	}
-	return true, e.Apply(wanted)
+	return true, e.ApplyState(a, b)
 }

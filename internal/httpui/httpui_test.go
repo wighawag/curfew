@@ -10,13 +10,30 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/wighawag/curfew/internal/registry"
+	"github.com/wighawag/curfew/internal/schedule"
 )
 
 // fakeFirewall stands in for nftables so the UI is testable without a kernel.
+type fakeSchedule struct{ ps *schedule.Profiles }
+
+func (f *fakeSchedule) Load() (*schedule.Profiles, error) {
+	if f.ps == nil {
+		return &schedule.Profiles{Profiles: []schedule.Profile{}}, nil
+	}
+	cp := &schedule.Profiles{Profiles: append([]schedule.Profile(nil), f.ps.Profiles...)}
+	return cp, nil
+}
+func (f *fakeSchedule) Save(ps *schedule.Profiles) error {
+	f.ps = &schedule.Profiles{Profiles: append([]schedule.Profile(nil), ps.Profiles...)}
+	return nil
+}
+
 type fakeFirewall struct {
 	live      []string
+	blocked   []string
 	applyErr  error
 	readErr   error
 	applyCall int
@@ -36,6 +53,13 @@ func (f *fakeFirewall) Allowlist() ([]string, error) {
 		return nil, f.readErr
 	}
 	return append([]string(nil), f.live...), nil
+}
+
+func (f *fakeFirewall) Blocked() ([]string, error) {
+	if f.readErr != nil {
+		return nil, f.readErr
+	}
+	return append([]string(nil), f.blocked...), nil
 }
 
 type memStore struct {
@@ -61,7 +85,7 @@ func newTestServer(t *testing.T, devices []registry.Device, live []string) (*Ser
 	store := &memStore{reg: &registry.Registry{Devices: devices}}
 	fw := &fakeFirewall{live: live}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(store, fw, log, "", ""), store, fw
+	return New(store, &fakeSchedule{}, fw, log, "", ""), store, fw
 }
 
 func post(t *testing.T, h http.Handler, path string, form url.Values) *httptest.ResponseRecorder {
@@ -197,10 +221,10 @@ func TestAuthGatesEverythingWhenConfigured(t *testing.T) {
 	store := &memStore{reg: &registry.Registry{}}
 	fw := &fakeFirewall{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(store, fw, log, "parent", "hunter2")
+	srv := New(store, &fakeSchedule{}, fw, log, "parent", "hunter2")
 	h := srv.Handler()
 
-	for _, path := range []string{"/", "/api/devices"} {
+	for _, path := range []string{"/", "/devices/", "/api/devices"} {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 		if rec.Code != http.StatusUnauthorized {
@@ -236,8 +260,8 @@ func TestAuthGatesEverythingWhenConfigured(t *testing.T) {
 func TestWrongPasswordIsRejected(t *testing.T) {
 	store := &memStore{reg: &registry.Registry{}}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(store, &fakeFirewall{}, log, "parent", "hunter2")
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	srv := New(store, &fakeSchedule{}, &fakeFirewall{}, log, "parent", "hunter2")
+	req := httptest.NewRequest(http.MethodGet, "/devices/", nil)
 	req.SetBasicAuth("parent", "wrong")
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
@@ -251,7 +275,7 @@ func TestIndexRendersDevices(t *testing.T) {
 		[]registry.Device{{MAC: "aa:bb:cc:dd:ee:01", Name: "eli phone"}},
 		[]string{"aa:bb:cc:dd:ee:01"})
 	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/devices/", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d", rec.Code)
 	}
@@ -318,7 +342,7 @@ func TestRenameRejectsGET(t *testing.T) {
 func TestRenameIsAuthenticated(t *testing.T) {
 	store := &memStore{reg: &registry.Registry{Devices: []registry.Device{{MAC: "aa:bb:cc:dd:ee:01", Name: "old"}}}}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(store, &fakeFirewall{}, log, "parent", "hunter2")
+	srv := New(store, &fakeSchedule{}, &fakeFirewall{}, log, "parent", "hunter2")
 	rec := post(t, srv.Handler(), "/devices/rename", url.Values{
 		"mac": {"aa:bb:cc:dd:ee:01"}, "name": {"intruder"},
 	})
@@ -335,7 +359,7 @@ func TestIndexOffersARenameFormForRegisteredDevicesOnly(t *testing.T) {
 		[]registry.Device{{MAC: "aa:bb:cc:dd:ee:01", Name: "eli"}},
 		[]string{"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:99"}) // ...:99 is unregistered
 	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/devices/", nil))
 	body := rec.Body.String()
 	if !strings.Contains(body, `action="/devices/rename"`) {
 		t.Error("registered devices should get a rename form")
@@ -414,12 +438,220 @@ func TestRemoveRejectsGETAndRequiresAuth(t *testing.T) {
 
 	authStore := &memStore{reg: &registry.Registry{Devices: []registry.Device{{MAC: "aa:bb:cc:dd:ee:01"}}}}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	authed := New(authStore, &fakeFirewall{}, log, "parent", "hunter2")
+	authed := New(authStore, &fakeSchedule{}, &fakeFirewall{}, log, "parent", "hunter2")
 	rec = post(t, authed.Handler(), "/devices/remove", url.Values{"mac": {"aa:bb:cc:dd:ee:01"}})
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("want 401, got %d", rec.Code)
 	}
 	if len(authStore.reg.Devices) != 1 {
 		t.Error("an unauthenticated removal must change nothing")
+	}
+}
+
+func newProfileServer(t *testing.T, devices []registry.Device, ps *schedule.Profiles,
+	allowed, blocked []string) (*Server, *fakeSchedule, *fakeFirewall) {
+	t.Helper()
+	store := &memStore{reg: &registry.Registry{Devices: devices}}
+	sch := &fakeSchedule{ps: ps}
+	fw := &fakeFirewall{live: allowed, blocked: blocked}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return New(store, sch, fw, log, "", ""), sch, fw
+}
+
+func TestHomeListsProfilesWithStatus(t *testing.T) {
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{
+		{Name: "eli", Devices: []string{"aa:bb:cc:dd:ee:01"},
+			Windows: []schedule.Window{{Days: schedule.AllDays, Start: "22:00", End: "08:00"}}},
+		{Name: "adults", Devices: []string{"aa:bb:cc:dd:ee:02"}},
+	}}
+	srv, _, _ := newProfileServer(t,
+		[]registry.Device{{MAC: "aa:bb:cc:dd:ee:01", Name: "eli phone"}, {MAC: "aa:bb:cc:dd:ee:02", Name: "dad"}},
+		ps,
+		[]string{"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"},
+		[]string{"aa:bb:cc:dd:ee:01"}) // firewall says eli is blocked
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"eli", "adults", "22:00 to 08:00, every day (overnight)"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("home should mention %q", want)
+		}
+	}
+}
+
+// Status must come from the firewall, not from re-evaluating the schedule.
+// If the two disagree the page must SAY so, because that gap is the failure
+// this whole project exists to make visible.
+func TestHomeSurfacesDriftBetweenScheduleAndFirewall(t *testing.T) {
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{
+		{Name: "eli", Devices: []string{"aa:bb:cc:dd:ee:01"}},
+	}}
+	// No window says block, yet the firewall is blocking it.
+	srv, _, _ := newProfileServer(t,
+		[]registry.Device{{MAC: "aa:bb:cc:dd:ee:01"}}, ps,
+		[]string{"aa:bb:cc:dd:ee:01"}, []string{"aa:bb:cc:dd:ee:01"})
+	views, err := srv.profileViews(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !views[0].Drifted() {
+		t.Fatal("a firewall block with no window behind it is drift and must be reported")
+	}
+	if !strings.Contains(views[0].Reason, "no window") {
+		t.Errorf("the reason should explain the drift, got %q", views[0].Reason)
+	}
+}
+
+func TestCreateAndDeleteProfile(t *testing.T) {
+	srv, sch, _ := newProfileServer(t, nil, &schedule.Profiles{}, nil, nil)
+	rec := post(t, srv.Handler(), "/profiles/create", url.Values{"name": {"eli"}})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("want 303, got %d", rec.Code)
+	}
+	if _, ok := sch.ps.Find("eli"); !ok {
+		t.Fatal("profile not created")
+	}
+	rec = post(t, srv.Handler(), "/profiles/create", url.Values{"name": {"eli"}})
+	if loc := rec.Header().Get("Location"); !strings.Contains(loc, "error=") {
+		t.Error("creating a duplicate profile should be refused with an error")
+	}
+	rec = post(t, srv.Handler(), "/profiles/delete", url.Values{"name": {"eli"}})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("want 303, got %d", rec.Code)
+	}
+	if len(sch.ps.Profiles) != 0 {
+		t.Error("profile not deleted")
+	}
+}
+
+func TestAddWindowWithDays(t *testing.T) {
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{{Name: "tia"}}}
+	srv, sch, _ := newProfileServer(t, nil, ps, nil, nil)
+	rec := post(t, srv.Handler(), "/profiles/window/add", url.Values{
+		"name": {"tia"}, "start": {"14:00"}, "end": {"16:00"}, "day": {"wed", "fri"},
+	})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("want 303, got %d", rec.Code)
+	}
+	p, _ := sch.ps.Find("tia")
+	if len(p.Windows) != 1 {
+		t.Fatalf("window not added: %+v", p.Windows)
+	}
+	w := p.Windows[0]
+	if w.Start != "14:00" || w.End != "16:00" || len(w.Days) != 2 {
+		t.Errorf("window wrong: %+v", w)
+	}
+	if !w.Contains(time.Date(2026, 8, 5, 15, 0, 0, 0, time.Local)) { // a Wednesday
+		t.Error("the saved window should block on Wednesday afternoon")
+	}
+}
+
+func TestAddSecondWindowSoNightAndLunchCoexist(t *testing.T) {
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{{Name: "eli"}}}
+	srv, sch, _ := newProfileServer(t, nil, ps, nil, nil)
+	post(t, srv.Handler(), "/profiles/window/add", url.Values{
+		"name": {"eli"}, "start": {"22:00"}, "end": {"08:00"},
+		"day": {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}})
+	post(t, srv.Handler(), "/profiles/window/add", url.Values{
+		"name": {"eli"}, "start": {"12:00"}, "end": {"13:00"},
+		"day": {"mon", "tue", "wed", "thu", "fri"}})
+	p, _ := sch.ps.Find("eli")
+	if len(p.Windows) != 2 {
+		t.Fatalf("want both windows, got %+v", p.Windows)
+	}
+	monday := time.Date(2026, 8, 3, 0, 0, 0, 0, time.Local)
+	if !p.BlockedAt(monday.Add(23 * time.Hour)) {
+		t.Error("night window should block")
+	}
+	if !p.BlockedAt(monday.Add(12*time.Hour + 30*time.Minute)) {
+		t.Error("lunch window should block")
+	}
+	if p.BlockedAt(monday.Add(15 * time.Hour)) {
+		t.Error("mid-afternoon should be free")
+	}
+}
+
+// A rejected window must never reach the file, or the daemon would refuse to
+// load its own schedule on the next restart.
+func TestAddWindowRejectsNonsenseWithoutSaving(t *testing.T) {
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{{Name: "eli"}}}
+	srv, sch, _ := newProfileServer(t, nil, ps, nil, nil)
+	rec := post(t, srv.Handler(), "/profiles/window/add", url.Values{
+		"name": {"eli"}, "start": {"22:00"}, "end": {"08:00"}}) // no days
+	if loc := rec.Header().Get("Location"); !strings.Contains(loc, "error=") {
+		t.Error("a window with no days should be refused")
+	}
+	p, _ := sch.ps.Find("eli")
+	if len(p.Windows) != 0 {
+		t.Errorf("nothing should have been saved: %+v", p.Windows)
+	}
+}
+
+func TestRemoveWindow(t *testing.T) {
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{{Name: "eli", Windows: []schedule.Window{
+		{Days: schedule.AllDays, Start: "22:00", End: "08:00"},
+		{Days: []schedule.Day{schedule.Mon}, Start: "12:00", End: "13:00"},
+	}}}}
+	srv, sch, _ := newProfileServer(t, nil, ps, nil, nil)
+	rec := post(t, srv.Handler(), "/profiles/window/remove", url.Values{"name": {"eli"}, "index": {"0"}})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("want 303, got %d", rec.Code)
+	}
+	p, _ := sch.ps.Find("eli")
+	if len(p.Windows) != 1 || p.Windows[0].Start != "12:00" {
+		t.Fatalf("wrong window removed: %+v", p.Windows)
+	}
+	// An out-of-range index must be refused rather than panicking.
+	rec = post(t, srv.Handler(), "/profiles/window/remove", url.Values{"name": {"eli"}, "index": {"9"}})
+	if loc := rec.Header().Get("Location"); !strings.Contains(loc, "error=") {
+		t.Error("an out-of-range window index should be an error")
+	}
+}
+
+func TestSetProfileMembership(t *testing.T) {
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{{Name: "eli", Devices: []string{"aa:bb:cc:dd:ee:01"}}}}
+	srv, sch, _ := newProfileServer(t,
+		[]registry.Device{{MAC: "aa:bb:cc:dd:ee:01"}, {MAC: "aa:bb:cc:dd:ee:02"}}, ps, nil, nil)
+	post(t, srv.Handler(), "/profiles/devices", url.Values{
+		"name": {"eli"}, "mac": {"aa:bb:cc:dd:ee:01", "AA:BB:CC:DD:EE:02"}})
+	p, _ := sch.ps.Find("eli")
+	if len(p.Devices) != 2 || p.Devices[1] != "aa:bb:cc:dd:ee:02" {
+		t.Fatalf("membership not set canonically: %+v", p.Devices)
+	}
+	// Unchecking everything must be possible: a profile with no devices is
+	// legitimate, and an empty form must not be read as "no change".
+	post(t, srv.Handler(), "/profiles/devices", url.Values{"name": {"eli"}})
+	p, _ = sch.ps.Find("eli")
+	if len(p.Devices) != 0 {
+		t.Errorf("membership should be clearable, got %+v", p.Devices)
+	}
+}
+
+func TestScheduleMutationsRequireAuthAndPOST(t *testing.T) {
+	store := &memStore{reg: &registry.Registry{}}
+	sch := &fakeSchedule{ps: &schedule.Profiles{Profiles: []schedule.Profile{{Name: "eli"}}}}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := New(store, sch, &fakeFirewall{}, log, "parent", "hunter2")
+	for _, path := range []string{
+		"/profiles/create", "/profiles/delete", "/profiles/devices",
+		"/profiles/window/add", "/profiles/window/remove",
+	} {
+		rec := post(t, srv.Handler(), path, url.Values{"name": {"eli"}})
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s unauthenticated: want 401, got %d", path, rec.Code)
+		}
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.SetBasicAuth("parent", "hunter2")
+		rec2 := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec2, req)
+		if rec2.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s via GET: want 405, got %d", path, rec2.Code)
+		}
+	}
+	if len(sch.ps.Profiles) != 1 {
+		t.Error("nothing should have changed")
 	}
 }

@@ -95,6 +95,7 @@ const (
 	RemoteBinary   = "/usr/sbin/curfew-daemon"
 	RemoteConfDir  = "/etc/config/curfew"
 	RemoteRegistry = "/etc/config/curfew/devices.json"
+	RemoteProfiles = "/etc/config/curfew/profiles.json"
 	RemoteInit     = "/etc/init.d/curfew"
 	ServiceName    = "curfew"
 	// RemoteKeepList registers our files for preservation across a firmware
@@ -168,6 +169,7 @@ start_service() {
     procd_open_instance
     procd_set_param command %s \
         -registry %s \
+        -profiles %s \
         -lan "$CURFEW_LAN" \
         -wan "$CURFEW_WAN" \
         -listen "$CURFEW_LISTEN"
@@ -177,7 +179,7 @@ start_service() {
     procd_set_param stderr 1
     procd_close_instance
 }
-`, RemoteDaemonConf, RemoteBinary, RemoteRegistry)
+`, RemoteDaemonConf, RemoteBinary, RemoteRegistry, RemoteProfiles)
 }
 
 // shellQuote renders a value safe to `.` into a POSIX shell. Passwords can

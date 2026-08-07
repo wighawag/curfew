@@ -25,6 +25,8 @@ import (
 type Firewall interface {
 	Apply(macs []string) error
 	Allowlist() ([]string, error)
+	// Blocked is what the firewall is currently dropping by schedule.
+	Blocked() ([]string, error)
 }
 
 // Store loads and saves the device registry.
@@ -36,6 +38,7 @@ type Store interface {
 // Server is the HTTP surface.
 type Server struct {
 	store    Store
+	schedule ScheduleStore
 	firewall Firewall
 	log      *slog.Logger
 	user     string
@@ -46,8 +49,8 @@ type Server struct {
 // which the daemon warns about loudly at startup: this page grants network
 // access, and it is reachable by the very devices it is keeping off the
 // internet, since blocking applies to forwarded traffic and not to the router.
-func New(store Store, firewall Firewall, log *slog.Logger, user, password string) *Server {
-	return &Server{store: store, firewall: firewall, log: log, user: user, password: password}
+func New(store Store, sched ScheduleStore, firewall Firewall, log *slog.Logger, user, password string) *Server {
+	return &Server{store: store, schedule: sched, firewall: firewall, log: log, user: user, password: password}
 }
 
 // DeviceView is one row of the page and of the API.
@@ -81,7 +84,13 @@ func (s *Server) authOK(r *http.Request) bool {
 // Handler returns the routed HTTP handler.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/", s.handleHome)
+	mux.HandleFunc("/devices/", s.handleDevicesPage)
+	mux.HandleFunc("/profiles/create", s.handleProfileCreate)
+	mux.HandleFunc("/profiles/delete", s.handleProfileDelete)
+	mux.HandleFunc("/profiles/devices", s.handleProfileDevices)
+	mux.HandleFunc("/profiles/window/add", s.handleWindowAdd)
+	mux.HandleFunc("/profiles/window/remove", s.handleWindowRemove)
 	mux.HandleFunc("/devices", s.handleAddDevice)
 	mux.HandleFunc("/devices/rename", s.handleRenameDevice)
 	mux.HandleFunc("/devices/remove", s.handleRemoveDevice)
@@ -157,8 +166,9 @@ func (s *Server) handleAPIDevices(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
+// handleDevicesPage serves the device list at /devices/.
+func (s *Server) handleDevicesPage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/devices/" {
 		http.NotFound(w, r)
 		return
 	}
@@ -201,7 +211,7 @@ func (s *Server) handleAddDevice(w http.ResponseWriter, r *http.Request) {
 	name := r.FormValue("name")
 
 	if _, err := registry.NormaliseMAC(mac); err != nil {
-		http.Redirect(w, r, "/?error="+template.URLQueryEscaper(err.Error()), http.StatusSeeOther)
+		http.Redirect(w, r, "/devices/?error="+template.URLQueryEscaper(err.Error()), http.StatusSeeOther)
 		return
 	}
 
@@ -212,7 +222,7 @@ func (s *Server) handleAddDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := reg.Add(mac, name); err != nil {
-		http.Redirect(w, r, "/?error="+template.URLQueryEscaper(err.Error()), http.StatusSeeOther)
+		http.Redirect(w, r, "/devices/?error="+template.URLQueryEscaper(err.Error()), http.StatusSeeOther)
 		return
 	}
 	if err := s.store.Save(reg); err != nil {
@@ -229,7 +239,7 @@ func (s *Server) handleAddDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("device registered", "mac", mac, "name", name)
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	http.Redirect(w, r, "/devices/", http.StatusSeeOther)
 }
 
 // handleRenameDevice changes a device's name.
@@ -259,7 +269,7 @@ func (s *Server) handleRenameDevice(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := reg.Rename(mac, name); err != nil {
 		// Includes the not-registered case, which must not silently insert.
-		http.Redirect(w, r, "/?error="+template.URLQueryEscaper(err.Error()), http.StatusSeeOther)
+		http.Redirect(w, r, "/devices/?error="+template.URLQueryEscaper(err.Error()), http.StatusSeeOther)
 		return
 	}
 	if err := s.store.Save(reg); err != nil {
@@ -268,7 +278,7 @@ func (s *Server) handleRenameDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("device renamed", "mac", mac, "name", name)
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	http.Redirect(w, r, "/devices/", http.StatusSeeOther)
 }
 
 // handleRemoveDevice deregisters a device and revokes its access.
@@ -296,7 +306,7 @@ func (s *Server) handleRemoveDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := reg.Remove(mac); err != nil {
-		http.Redirect(w, r, "/?error="+template.URLQueryEscaper(err.Error()), http.StatusSeeOther)
+		http.Redirect(w, r, "/devices/?error="+template.URLQueryEscaper(err.Error()), http.StatusSeeOther)
 		return
 	}
 	if err := s.store.Save(reg); err != nil {
@@ -311,7 +321,7 @@ func (s *Server) handleRemoveDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("device removed", "mac", mac)
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	http.Redirect(w, r, "/devices/", http.StatusSeeOther)
 }
 
 type pageData struct {
@@ -347,6 +357,7 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
 </style>
 </head>
 <body>
+<p><a href="/">&larr; profiles</a></p>
 <h1>Devices allowed on the internet</h1>
 {{if .Error}}<div class="err">{{.Error}}</div>{{end}}
 <table>

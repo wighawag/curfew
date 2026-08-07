@@ -22,6 +22,7 @@ import (
 	"github.com/wighawag/curfew/internal/enforce"
 	"github.com/wighawag/curfew/internal/httpui"
 	"github.com/wighawag/curfew/internal/registry"
+	"github.com/wighawag/curfew/internal/schedule"
 )
 
 // version is stamped at release time via -ldflags "-X main.version=<tag>".
@@ -36,6 +37,7 @@ func main() {
 
 type options struct {
 	registryPath string
+	profilesPath string
 	lan          string
 	wan          string
 	listen       string
@@ -59,6 +61,8 @@ func run(args []string, stderr *os.File) int {
 	fs.SetOutput(stderr)
 	fs.StringVar(&opt.registryPath, "registry", envOr("CURFEW_REGISTRY", "/etc/config/curfew/devices.json"),
 		"path to the device registry")
+	fs.StringVar(&opt.profilesPath, "profiles", envOr("CURFEW_PROFILES", "/etc/config/curfew/profiles.json"),
+		"path to the profiles and schedules")
 	fs.StringVar(&opt.lan, "lan", envOr("CURFEW_LAN", "br-lan"), "LAN interface")
 	fs.StringVar(&opt.wan, "wan", envOr("CURFEW_WAN", ""),
 		"WAN interface (required: guessing it is how enforcement silently matches nothing)")
@@ -94,20 +98,25 @@ func run(args []string, stderr *os.File) int {
 	}
 
 	store := registry.FileStore{Path: opt.registryPath}
-	reg, err := store.Load()
-	if err != nil {
+	sched := schedule.FileStore{Path: opt.profilesPath}
+	if _, err := store.Load(); err != nil {
 		log.Error("cannot read the registry", "path", opt.registryPath, "error", err)
+		return 1
+	}
+	if _, err := sched.Load(); err != nil {
+		// A schedule nobody can predict is worse than none, so refuse.
+		log.Error("cannot read the schedule", "path", opt.profilesPath, "error", err)
 		return 1
 	}
 
 	// Enforce BEFORE serving. Coming up with the page available but the
 	// ruleset unapplied is precisely the state that lies about being in
 	// control, so a failure here is fatal rather than logged and ignored.
-	if err := fw.Apply(reg.MACs()); err != nil {
+	if err := reconcileOnce(store, sched, fw); err != nil {
 		log.Error("cannot apply the ruleset; refusing to start", "error", err)
 		return 1
 	}
-	log.Info("ruleset applied", "devices", len(reg.MACs()), "lan", opt.lan, "wan", opt.wan)
+	log.Info("ruleset applied", "lan", opt.lan, "wan", opt.wan)
 
 	if opt.password == "" {
 		log.Warn("NO PASSWORD SET: the device page is unauthenticated",
@@ -116,14 +125,14 @@ func run(args []string, stderr *os.File) int {
 
 	srv := &http.Server{
 		Addr:              opt.listen,
-		Handler:           httpui.New(store, fw, log, opt.user, opt.password).Handler(),
+		Handler:           httpui.New(store, sched, fw, log, opt.user, opt.password).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	go reconcileLoop(ctx, log, store, fw, opt.reconcile)
+	go reconcileLoop(ctx, log, store, sched, fw, opt.reconcile)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -158,7 +167,7 @@ func run(args []string, stderr *os.File) int {
 // have drifted. This is the level-triggered discipline the design rests on: a
 // missed moment, a crash mid-write, or something else clobbering the table all
 // self-heal on the next pass, instead of leaving a state nothing corrects.
-func reconcileLoop(ctx context.Context, log *slog.Logger, store registry.FileStore, fw *enforce.Enforcer, every time.Duration) {
+func reconcileLoop(ctx context.Context, log *slog.Logger, store registry.FileStore, sched schedule.FileStore, fw *enforce.Enforcer, every time.Duration) {
 	if every <= 0 {
 		return
 	}
@@ -169,7 +178,7 @@ func reconcileLoop(ctx context.Context, log *slog.Logger, store registry.FileSto
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := reconcileOnce(store, fw); err != nil {
+			if err := reconcileOnce(store, sched, fw); err != nil {
 				log.Error("reconcile failed", "error", err)
 			}
 		}
@@ -178,12 +187,19 @@ func reconcileLoop(ctx context.Context, log *slog.Logger, store registry.FileSto
 
 // reconcileOnce applies the registry only when the firewall disagrees with it,
 // so a steady state costs one read rather than a ruleset rewrite every tick.
-func reconcileOnce(store registry.FileStore, fw *enforce.Enforcer) error {
+func reconcileOnce(store registry.FileStore, sched schedule.FileStore, fw *enforce.Enforcer) error {
 	reg, err := store.Load()
 	if err != nil {
 		return fmt.Errorf("reading registry: %w", err)
 	}
-	if _, err := fw.EnsureApplied(reg.MACs()); err != nil {
+	ps, err := sched.Load()
+	if err != nil {
+		return fmt.Errorf("reading schedule: %w", err)
+	}
+	// Desired state, computed from the clock. Nothing here depends on having
+	// observed a boundary, which is what makes a missed moment impossible.
+	blocked := ps.BlockedMACs(time.Now())
+	if _, err := fw.EnsureAppliedState(reg.MACs(), blocked); err != nil {
 		return fmt.Errorf("applying ruleset: %w", err)
 	}
 	return nil

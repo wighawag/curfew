@@ -476,3 +476,10 @@ func TestInstallShipsTheListWhenTheRouterHasNone(t *testing.T) {
 		t.Error("a first install must ship the list, or the allowlist starts empty")
 	}
 }
+
+func TestInitScriptPassesTheProfilesPath(t *testing.T) {
+	s := initScript()
+	if !strings.Contains(s, "-profiles "+RemoteProfiles) {
+		t.Errorf("the daemon needs its schedule path or profiles silently do nothing:\n%s", s)
+	}
+}
