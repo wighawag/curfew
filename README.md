@@ -132,6 +132,8 @@ ssh root@192.168.1.1 "grep -A2 '^users:' /opt/AdGuardHome/adguardhome.yaml"
 
 `users: []` means open. A test asserts this as an attack that stops working: it confirms the attack succeeds first, adopts, then requires the same request to fail while a correct password still works.
 
+Setup also makes AdGuard actually own DNS: it checks which process holds port 53, moves dnsmasq to 54 (keeping DHCP) when it is in the way, waits for AdGuard to take the port, and **puts dnsmasq back if it does not**. An unfiltered household is bad; one with no resolver at all is worse.
+
 Passwords: `-password` sets both the device page and AdGuard, and `-curfew-password` or `-adguard-password` override it individually. When adopting an AdGuard that already has a login, pass that existing one with `-adguard-password` so curfew can talk to its API.
 
 curfew deliberately does **not** own `AdGuardHome.yaml`. AdGuard rewrites that file itself and drops anything it does not recognise, so everything else curfew does goes through the REST API. The reasoning and the measurements are in `docs/adr/0010-curfew-drives-adguard-through-its-api-and-owns-only-its-own-objects.md`.

@@ -66,7 +66,7 @@ const openConfig = `http:
 users: []
 dns:
   bind_hosts: [127.0.0.1]
-  port: 5353
+  port: 53
   upstream_dns: ["127.0.0.1:5454"]
   bootstrap_dns: ["127.0.0.1:5454"]
   filtering_enabled: true
@@ -178,6 +178,7 @@ func TestAdoptingAnOpenAdGuardStopsAChildTurningFilteringOff(t *testing.T) {
 
 	report, err := SetupAdGuard(localRunner{t}, AdGuardOptions{
 		Enabled: true, User: "parent", Password: "hunter2", RouterIP: "127.0.0.1",
+		DNSTimeout: 30 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("SetupAdGuard: %v", err)
@@ -215,6 +216,7 @@ func TestAdoptionKeepsExistingRulesAndConfig(t *testing.T) {
 
 	if _, err := SetupAdGuard(localRunner{t}, AdGuardOptions{
 		Enabled: true, User: "parent", Password: "hunter2", RouterIP: "127.0.0.1",
+		DNSTimeout: 30 * time.Second,
 	}); err != nil {
 		t.Fatalf("SetupAdGuard: %v", err)
 	}
@@ -249,6 +251,7 @@ func TestAdoptionLeavesAnExistingLoginAlone(t *testing.T) {
 	// -adguard-user and -adguard-password are for.
 	report, err := SetupAdGuard(localRunner{t}, AdGuardOptions{
 		Enabled: true, User: "someone", Password: "theirs", RouterIP: "127.0.0.1",
+		DNSTimeout: 30 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("SetupAdGuard: %v", err)

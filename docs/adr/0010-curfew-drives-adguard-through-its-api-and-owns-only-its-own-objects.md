@@ -44,6 +44,16 @@ The safety argument for tolerating that bridge at all: **the load-bearing contro
 
 Rule changes were measured to take effect in **10ms in both directions**, with a 4 MiB DNS cache configured, so the cache does not defeat a schedule. AdGuard's own `blocked_services_schedule` does work (it stores milliseconds since midnight with a timezone) and is **not used**: it applies only to AdGuard's built-in service catalogue rather than to arbitrary domains, and a second scheduler with different semantics is precisely the split ownership this decision exists to avoid. curfew already evaluates windows as desired state from the clock, with day selectors, overnight handling and an embedded tzdata, and that model is reused.
 
+## A running AdGuard is not a filtering AdGuard
+
+Found on the live router, and it changed this ADR after the fact. AdGuard was running, authenticated and serving its admin page, while **dnsmasq held port 53** and the household resolved through it unfiltered. AdGuard was fatally exiting on every start with `listen tcp 0.0.0.0:53: bind: address already in use`, and procd eventually gave up.
+
+The verification that missed it is the interesting part. AdGuard serves its web API about **two seconds** after starting and only attempts the DNS bind about **forty-three seconds** later, once its blocklists are loaded. So a check of the admin API immediately after a restart passes against a process that is already doomed. That is the same shape as every other defect this project exists to remove: a healthy-looking report over a system that is doing nothing.
+
+So setup now (a) asks WHO holds port 53 rather than whether the port answers, since dnsmasq and AdGuard are indistinguishable from outside; (b) waits for AdGuard to actually take the port, with a timeout generous enough to cover that 43-second gap, and quotes AdGuard's own fatal line when it does not; (c) moves dnsmasq to 54 when it is in the way, per ADR 0002; and (d) **rolls dnsmasq back to 53 on any failure**, because the one thing worse than an unfiltered household is one with no resolver at all. A rollback that itself fails says so unmistakably and prints the manual fix.
+
+It also enables the service. The live router had the init script but no `rc.d` symlink, so a power cut would have left no AdGuard and nothing to notice.
+
 ## Consequences
 
 - Reconciliation of AdGuard is **on action, not on a tick**. The firewall is re-asserted every minute because the kernel can be wiped underneath it; AdGuard's config persists and a human edits it, so a continuous reconciler would revert a change made in AdGuard's own UI. Disagreement is REPORTED instead, which is the same principle as everywhere else here: make drift visible rather than silently correcting or hiding it.

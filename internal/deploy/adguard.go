@@ -34,7 +34,18 @@ type AdGuardOptions struct {
 	// RouterIP is the address the admin page will be reached on, used for the
 	// API and for what gets printed at the end.
 	RouterIP string
+	// DNSTimeout bounds how long to wait for AdGuard to take over port 53.
+	// Zero means DefaultDNSTimeout. It is a field rather than a constant
+	// because AdGuard loads its blocklists before binding (43 seconds on the
+	// real router), so the honest wait is long enough to make a test that
+	// exercises the failure path unbearable at full length.
+	DNSTimeout time.Duration
 }
+
+// DefaultDNSTimeout is how long AdGuard gets to take over port 53. Generous on
+// purpose: measured on the live router, it served its admin API two seconds
+// after starting and only attempted the DNS bind 43 seconds later.
+const DefaultDNSTimeout = 2 * time.Minute
 
 // AdGuardReport says what happened, in terms a person can check.
 type AdGuardReport struct {
@@ -56,25 +67,44 @@ type AdGuardReport struct {
 	// Verified records that an unauthenticated request was REFUSED and an
 	// authenticated one accepted, both measured after the change.
 	Verified bool
+	// ServingDNS records that AdGuard actually holds port 53 and resolves.
+	// Kept separate from Verified because the two were measured to disagree:
+	// AdGuard serves its admin API about two seconds after starting and only
+	// attempts the DNS bind about forty-three seconds later, so a run can pass
+	// every authentication check and still be filtering nothing.
+	ServingDNS bool
+	// MovedDnsmasq records that dnsmasq was moved to port 54 to free 53.
+	MovedDnsmasq bool
+	// RolledBack records that the attempt failed and dnsmasq was put back, so
+	// the household still has a resolver and nothing is filtered.
+	RolledBack bool
+	// EnabledService records that AdGuard had no boot-time symlink and now
+	// does.
+	EnabledService bool
 }
 
 // Summary renders the report for a terminal.
 func (r AdGuardReport) Summary() string {
-	switch {
-	case r.Skipped:
+	if r.Skipped {
 		return "AdGuard: skipped (" + r.Reason + ")"
+	}
+	var head string
+	switch {
 	case r.Installed:
-		return fmt.Sprintf("AdGuard: installed %s, admin page on port %d, API authenticated",
-			r.Version, adguard.DefaultPort)
+		head = fmt.Sprintf("AdGuard: installed %s, API authenticated", r.Version)
 	case r.SecuredNow:
-		return fmt.Sprintf("AdGuard: adopted %s and CLOSED ITS OPEN API "+
+		head = fmt.Sprintf("AdGuard: adopted %s and CLOSED ITS OPEN API "+
 			"(it was answering every request on the LAN without a password)", r.Version)
 	case r.AlreadySecured:
-		return fmt.Sprintf("AdGuard: adopted %s, which already had an admin account; nothing changed",
-			r.Version)
+		head = fmt.Sprintf("AdGuard: adopted %s, which already had an admin account", r.Version)
 	default:
-		return "AdGuard: nothing to do"
+		head = "AdGuard: nothing to do"
 	}
+	extra := []string{r.dnsSummary()}
+	if r.EnabledService {
+		extra = append(extra, "enabled it to start at boot")
+	}
+	return head + "\n         " + strings.Join(extra, "\n         ")
 }
 
 // adGuardPresent reports whether the binary is on the router at all.
@@ -163,10 +193,27 @@ func adoptAdGuard(r Runner, opt AdGuardOptions) (AdGuardReport, error) {
 		report.SecuredNow = true
 	}
 
+	// Make it survive a reboot. Found missing on the live router: the init
+	// script was there but had no rc.d symlink, so a power cut would have left
+	// the household with no AdGuard at all.
+	enabled, err := ensureServiceEnabled(r)
+	if err != nil {
+		return report, err
+	}
+	report.EnabledService = enabled
+
 	// Verify against the RUNNING server, not the file. A config with a user in
 	// it that AdGuard has not reloaded is still an open API, and what a child
 	// on the LAN meets is the server.
 	if err := verifyAdGuard(r, opt, &report); err != nil {
+		return report, err
+	}
+
+	// And make it actually FILTER. Everything above is about the admin API;
+	// an AdGuard that is authenticated, running and not on port 53 is
+	// filtering precisely nothing while looking healthy, which is the state
+	// this router was found in.
+	if err := takeOverDNS(r, opt, &report); err != nil {
 		return report, err
 	}
 	return report, nil
@@ -293,30 +340,22 @@ func installAdGuard(r Runner, opt AdGuardOptions) (AdGuardReport, error) {
 		return report, err
 	}
 
-	// dnsmasq moves to port 54 and keeps DHCP, per ADR 0002. Best effort and
-	// REPORTED rather than fatal: on a router without procd running (which is
-	// how the test image behaves) these are no-ops, and failing the whole
-	// install because of them would be wrong.
-	for _, cmd := range []string{
-		"uci set dhcp.@dnsmasq[0].port=54",
-		"uci -q delete dhcp.lan.dhcp_option",
-		fmt.Sprintf("uci add_list dhcp.lan.dhcp_option='6,%s'", opt.RouterIP),
-		"uci commit dhcp",
-		"/etc/init.d/dnsmasq restart",
-	} {
-		if _, err := r.Run(cmd + " 2>/dev/null || true"); err != nil {
-			return report, err
-		}
-	}
-
-	if _, err := r.Run("/etc/init.d/adguardhome enable 2>/dev/null || true"); err != nil {
-		return report, err
-	}
+	// dnsmasq moving to port 54 is NOT done here. takeOverDNS below owns it,
+	// because it is the step that can leave the household with no resolver at
+	// all and it therefore needs the rollback.
 	if _, err := r.Run(restartAdGuard()); err != nil {
 		return report, err
 	}
 
+	enabled, err := ensureServiceEnabled(r)
+	if err != nil {
+		return report, err
+	}
+	report.EnabledService = enabled
 	if err := verifyAdGuard(r, opt, &report); err != nil {
+		return report, err
+	}
+	if err := takeOverDNS(r, opt, &report); err != nil {
 		return report, err
 	}
 	return report, nil
