@@ -1,173 +1,144 @@
 # curfew
 
-Profile-based parental control system for OpenWrt on the GL.iNet Flint 2 (GL-MT6000).
+Parental control for a home OpenWrt router, driven from your laptop. Decides which devices may reach the internet, and (in time) when.
 
-> **Being rewritten in Go.** The section immediately below describes the new tool, which is where new work goes. Everything after it documents the shell implementation being replaced; treat that as the current state of the router, not as the direction. See `docs/adr/0007-the-tool-owns-every-operation-including-recovery-and-deployment.md`.
+Enforcement is done in the **kernel**, with nftables, and every claim it makes is checked against the firewall rather than against its own saved state. That is the whole design brief: the system it replaces reported success while enforcing nothing, and stayed green through 104 tests because none of them ever sent a packet.
 
-## The Go tool
+Built for a GL.iNet Flint 2 (GL-MT6000) running OpenWrt, but nothing in it is specific to that board beyond the interface names you pass it.
 
-Two binaries, and the split is a safety property rather than tidiness.
+## Two binaries, on purpose
 
-**`curfew`** runs on your laptop and does three things: `install`, `push`, `pull`. It cannot enforce anything, because it does not import the enforcement code at all. Running the wrong command on a laptop therefore cannot rewrite that laptop's own firewall. A test asserts this against the real import graph, so it cannot rot.
+**`curfew`** runs on your **laptop**. It installs the daemon, and pushes and pulls the device list. It cannot enforce anything: it does not import the enforcement code at all, so running the wrong command on your laptop cannot rewrite your laptop's own firewall. A test asserts that against the real import graph, so it cannot quietly stop being true.
 
-**`curfew-daemon`** runs on the router. It owns the nftables ruleset and serves the device page on port 8080.
+**`curfew-daemon`** runs on the **router**. It owns the nftables ruleset and serves the device page. It is placed there by `curfew install`, which detects the router's architecture rather than assuming it.
 
-```sh
-# install (or update) the router, from your laptop
-curfew install root@192.168.1.1 --wan pppoe-wan --password <choose-one>
-
-# move the device list around
-curfew pull root@192.168.1.1     # router  -> config/local/devices.json
-curfew push root@192.168.1.1     # config/local/devices.json -> router
-```
-
-`--wan` is required and deliberately not guessed: on this router's PPPoE line the live device is `pppoe-wan`, not the configured `eth1`, and guessing it is exactly how enforcement silently matches nothing. Check with `ssh <host> ifstatus wan`.
-
-The daemon detects the router's architecture over SSH and the correct binary is cross-compiled for it, because pushing the wrong architecture produces something that cannot exec, on a device reached over the very network being configured.
-
-### What it does today
-
-The MAC allowlist, and nothing else yet. Registered devices reach the internet; unregistered ones do not. Add devices from the page at `http://<router>:8080`, giving each an optional name.
-
-The page reports, per device, what the **firewall** currently allows rather than what the saved list claims. If the two ever disagree you see it, because a green dot derived from reading back our own config file is precisely the reassurance that let the previous system report success while enforcing nothing.
-
-The daemon re-asserts the ruleset on a timer, so a table wiped by hand or by a recovery path heals itself on the next tick rather than leaving a state nothing corrects.
-
-### Running the tests
+## Install
 
 ```sh
-go test ./...          # unit tests, no privileges needed
-./docker/acceptance.sh # packet-path tests in a real OpenWrt image, plus the legacy suite
+curl -fsSL https://github.com/wighawag/curfew/releases/latest/download/install.sh | sh
 ```
 
-The acceptance run sends real packets through a real LAN-to-WAN topology and asserts whether they arrive, which is the only trustworthy evidence about a firewall (`docs/adr/0004-tests-assert-on-the-packet-path.md`). Go has no toolchain in that image, so the test binaries are compiled on the host and executed inside it.
+This detects your OS and architecture, downloads the latest release, **verifies its sha256 checksum before unpacking**, and installs `curfew` to `~/.local/bin`. Override with environment variables:
 
-## Features (shell implementation, being replaced)
-
-- **Profiles**: group multiple devices (phone, laptop) per child
-- **Internet schedules**: block internet at certain times per profile
-- **Time budgets**: daily limits shared across all devices in a profile
-- **Tickets**: grant temporary access from a phone (no login needed)
-- **Website blocking**: per-profile, with time groups (e.g. streaming blocked 20:00-08:00, gaming blocked 08:00-10:00)
-- **Global filtering**: block gambling/porn/malware for all devices (auto-updated lists)
-- **Unknown device blocking**: MAC allowlist prevents MAC randomization bypass
-- **nftables**: uses OpenWrt's native firewall (auto-detected, iptables fallback)
-
-## Setup (one time)
-
-### 1. Flash OpenWrt
-
-1. Download the sysupgrade image from the [Firmware Selector](https://firmware-selector.openwrt.org/?version=25.12.5&target=mediatek%2Ffilogic&id=glinet_gl-mt6000)
-2. Go to `http://192.168.8.1` (GL.iNet UI) → System → Upgrade
-3. Upload the `.bin` file, select **"Do not keep configuration"**
-4. Wait 2-3 min. Router reboots to `http://192.168.1.1`
-
-### 2. Set up internet + Wi-Fi
-
-1. Open `http://192.168.1.1`, log in (root, no password initially)
-2. Set a root password when prompted
-3. **Network → Interfaces → WAN:** Protocol = PPPoE, enter your ISP credentials
-4. **Network → Wireless:** Enable both radios, set SSID + password, Country = GB
-5. **System → System:** Set Timezone = Europe/London
-6. **Network → Firewall:** Enable Hardware Flow Offloading
-
-### 3. Fill in your configs
-
-```bash
-cd ~/dev/github/wighawag/curfew/config/local
+```sh
+curl -fsSL https://github.com/wighawag/curfew/releases/latest/download/install.sh \
+  | CURFEW_VERSION=v0.1.0 PREFIX=$HOME/bin sh
 ```
 
-Edit the pre-created files with your actual values:
+Only the laptop binary is installed. The daemon belongs on the router and is put there by `curfew install`, which fetches the right architecture for your device. Keeping the enforcement binary off your laptop is the point of the split.
 
-| File | What to set |
-|---|---|
-| `parental_profiles` | ALL profiles (adults + kids + IoT): name, budget, MAC addresses |
-| `parental_websites` | Websites to block per profile, organized by time groups |
-| `parental_blocklists` | Global blocklist URLs (gambling/porn/malware) |
-| `crontab` | Your schedule times (bedtime, streaming, gaming blocks) |
-| `tickets.html` | Profile names shown in the phone UI |
+Or build from source: `go build -o curfew .`
 
-The `parental_profiles` file is the single source of truth: all MACs across all
-profiles form the MAC allowlist. Adults and IoT devices get budget `0` (unlimited).
+## Quick start
 
-To find your devices' MAC addresses, connect them to the router first, then:
-```bash
-ssh root@192.168.1.1 "cat /tmp/dhcp.leases"
+```sh
+# 1. If you are migrating from the shell scripts, import your existing devices.
+#    The allowlist starts EMPTY, and an empty allowlist means nothing in the
+#    house reaches the internet.
+curfew import
+
+# 2. Install onto the router. --wan is required and deliberately not guessed.
+curfew install root@192.168.1.1 --wan pppoe-wan --password 'choose-one'
+
+# 3. Open the page
+open http://192.168.1.1:8080
 ```
 
-### 4. Run the installer
+`curfew install` prints how many devices **the firewall is actually enforcing**, read back off the router, not how many commands exited zero.
 
-```bash
-cd ~/dev/github/wighawag/curfew
-./install.sh 192.168.1.1
+### Finding your WAN interface
+
+`--wan` is required because guessing it is how enforcement silently matches nothing: on a PPPoE line the live device is `pppoe-wan`, not the configured `eth1`.
+
+```sh
+ssh root@192.168.1.1 "ifstatus wan | grep l3_device"
 ```
 
-This does everything: copies scripts, uploads your configs, sets up cron schedules, applies the firewall, downloads blocklists, and enables the boot script. Active tickets are preserved on re-runs.
+## Commands
 
-### 5. Wife's phone
+| Command | Runs on | What it does |
+|---|---|---|
+| `curfew import` | laptop | Build a device list from the legacy pipe-delimited config |
+| `curfew install <host>` | laptop | Install or update the daemon, ship the device list, start it |
+| `curfew push <host>` | laptop | Send your local device list to the router |
+| `curfew pull <host>` | laptop | Fetch the router's device list |
+| `curfew version` | laptop | Print the version |
+| `curfew-daemon -version` | router | Print the version running on the router |
 
-Bookmark: `http://192.168.1.1/tickets.html`
-She taps a child → taps a duration → all their devices get internet. Auto-blocks when it expires.
+Your existing ssh configuration, keys and agent are used as-is.
 
-### 6. Disable MAC randomization on kids' devices
+## What it does today
 
-- **iPhone:** Settings → Wi-Fi → tap "i" → Private Wi-Fi Address → OFF
-- **Android:** Settings → Wi-Fi → tap network → Privacy → Use device MAC
+The **MAC allowlist**, and nothing else yet. Registered devices reach the internet; everything else is dropped. Add devices from the page at `http://<router>:8080`, each with an optional name.
 
-## Updating later
+The page reports, per device, what the **firewall** currently allows rather than what the saved list claims, and flags any MAC the firewall allows that nothing registered. If the two ever disagree you see it. A green dot derived from reading back our own config file is precisely the reassurance that let the previous system claim to be working.
 
-Edit your files in `config/local/`, then re-run the installer:
-```bash
-./install.sh 192.168.1.1
+The daemon re-asserts the ruleset on a timer, so a table wiped by hand, by a recovery path, or by anything else heals itself on the next tick.
+
+Schedules, time budgets, tickets and website blocking are designed but not built. The decisions behind them are recorded in `docs/adr/` so they land as decisions rather than guesses.
+
+## If something goes wrong
+
+A wrong ruleset costs WAN, never LAN, so **SSH always works**. To remove all policy and restore connectivity immediately:
+
+```sh
+ssh root@192.168.1.1 'nft delete table inet curfew'
+ssh root@192.168.1.1 '/etc/init.d/curfew stop'     # or it reconciles straight back
 ```
-Idempotent: scripts update, configs upload, cron regenerates, firewall set updates without clearing active blocks or tickets.
 
-Force a full re-apply (clears active state):
-```bash
-./install.sh 192.168.1.1 --force
-```
+The daemon deliberately leaves the ruleset in place when it exits. Stopping it must not silently open the household's internet; removing policy is an explicit act.
 
-## Reverting to GL.iNet firmware
+## Where things live on the router
 
-1. Download from `https://dl.gl-inet.com/router/mt6000/stable`
-2. OpenWrt: System → Backup/Flash → upload GL.iNet firmware → uncheck "Keep settings"
-3. Router reboots to GL.iNet at `http://192.168.8.1`
+| Path | Survives a reboot | Survives a firmware upgrade |
+|---|---|---|
+| `/etc/config/curfew/devices.json` | yes | yes |
+| `/usr/sbin/curfew-daemon` | yes | yes, via `/lib/upgrade/keep.d/curfew` |
+| `/etc/init.d/curfew` | yes | yes, same |
 
-## Useful commands
+`/etc/config/` is the only location OpenWrt's sysupgrade keep list preserves by default, which is measured, not assumed. `curfew install` registers the binary and the init script for preservation too, so a firmware upgrade cannot leave you with a config that says who is allowed and a firewall that allows everyone.
 
-```bash
-ssh root@192.168.1.1
-parental-profiles.sh status            # All profiles + blocked MACs
-parental-profiles.sh block alice       # Block all Alice's devices
-parental-profiles.sh ticket alice 30   # 30-min ticket for Alice
-website-blocking.sh status             # Website blocking state
-blocklists.sh status                   # Global blocklist counts
-blocklists.sh update                   # Re-download blocklists now
-```
+## First-time router setup
+
+Only needed on a fresh board.
+
+1. Flash OpenWrt from the [Firmware Selector](https://firmware-selector.openwrt.org/?version=25.12.5&target=mediatek%2Ffilogic&id=glinet_gl-mt6000). GL.iNet UI at `http://192.168.8.1` → System → Upgrade, **"Do not keep configuration"**. It reboots to `http://192.168.1.1`.
+2. Set a root password, then configure **WAN** (PPPoE credentials), **Wireless** (both radios, SSID, country) and **Timezone**.
+3. Turn on Hardware Flow Offloading under Network → Firewall.
+
+Then install curfew as above. Reverting to stock: download from `https://dl.gl-inet.com/router/mt6000/stable`, then System → Backup/Flash, unchecking "Keep settings".
 
 ## Testing
 
-```bash
-docker compose -f docker/docker-compose.yml run --rm test
+```sh
+go test ./...          # unit tests, no privileges required
+./docker/acceptance.sh # packet-path tests in a real OpenWrt image
 ```
 
-113 tests on a real OpenWrt userland (`openwrt/rootfs`), with no mocked system tools. Most assert on nftables state; a network-namespace harness additionally builds a real LAN-to-WAN topology and asserts on the **packet path**, which is the only evidence that distinguishes "the ruleset looks right" from "the packet is dropped".
+The acceptance run builds a real LAN-to-WAN topology out of network namespaces and asserts whether a packet from a given source MAC **actually arrives**. Ruleset text is precisely the thing that looks correct while packets flow, so it cannot be the evidence (`docs/adr/0004-tests-assert-on-the-packet-path.md`).
+
+Every packet-path test asserts a **baseline** first. A topology fault makes every probe read unreachable, which is indistinguishable from a perfect firewall, so without that guard a broken harness reports a flawless pass while testing nothing.
+
+The OpenWrt image has no Go toolchain, so the test binaries are compiled on the host and executed inside it. The same run also exercises the legacy shell suite still under `legacy/`.
 
 ## Project structure
 
 ```
 curfew/
-├── config/local/              # Your actual configs (gitignored)
-├── install.sh                 # One-command installer (idempotent)
-├── scripts/
-│   ├── parental-profiles.sh   # Internet schedules, budgets, tickets
-│   ├── website-blocking.sh    # Per-profile website blocking with groups
-│   ├── setup-firewall.sh      # MAC allowlist (block unknown devices)
-│   └── blocklists.sh          # Global gambling/porn/malware filtering
-├── web/tickets.html           # Phone UI for tickets
-├── test/                      # 113 bats tests (incl. packet-path harness)
-├── docker/                    # Test environment
-└── docs/                      # Examples and guides
+├── main.go, version.go        # the laptop CLI
+├── cmd/curfew-daemon/         # the router daemon
+├── internal/
+│   ├── contract/              # nftables object names, shared, dependency-free
+│   ├── enforce/               # the ruleset, via netlink (router side only)
+│   ├── httpui/                # device page and JSON API
+│   ├── registry/              # the device list
+│   ├── legacyconfig/          # importer for the old pipe-delimited config
+│   └── deploy/                # install, push, pull over ssh
+├── config/local/              # your actual config (gitignored)
+├── docs/adr/                  # decisions and why
+├── work/                      # specs, tasks and findings
+├── legacy/                    # the shell implementation being replaced
+└── docker/                    # OpenWrt test image and acceptance runner
 ```
 
 ## License

@@ -70,3 +70,9 @@ changelog:
 release:
   draft: false
   prerelease: auto
+  # Upload the installer as a standalone release asset, so it is served from
+  # stable release object storage rather than a branch (no raw.githubusercontent
+  # cache lag, and it always matches the release it ships with):
+  #   curl -fsSL https://github.com/wighawag/curfew/releases/latest/download/install.sh | sh
+  extra_files:
+    - glob: ./install.sh
