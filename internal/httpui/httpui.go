@@ -84,6 +84,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/devices", s.handleAddDevice)
 	mux.HandleFunc("/devices/rename", s.handleRenameDevice)
+	mux.HandleFunc("/devices/remove", s.handleRemoveDevice)
 	mux.HandleFunc("/api/devices", s.handleAPIDevices)
 	return s.withAuth(s.withNoStore(mux))
 }
@@ -270,6 +271,49 @@ func (s *Server) handleRenameDevice(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
+// handleRemoveDevice deregisters a device and revokes its access.
+//
+// Unlike rename, this DOES reconcile the firewall: removing a device from the
+// allowlist is the whole point, and leaving the ruleset untouched would mean
+// the page said "removed" while the device kept its internet, which is the
+// exact lie this project exists to remove.
+func (s *Server) handleRemoveDevice(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	mac := r.FormValue("mac")
+
+	reg, err := s.store.Load()
+	if err != nil {
+		s.log.Error("loading registry", "error", err)
+		http.Error(w, "failed to read the registry", http.StatusInternalServerError)
+		return
+	}
+	if err := reg.Remove(mac); err != nil {
+		http.Redirect(w, r, "/?error="+template.URLQueryEscaper(err.Error()), http.StatusSeeOther)
+		return
+	}
+	if err := s.store.Save(reg); err != nil {
+		s.log.Error("saving registry", "error", err)
+		http.Error(w, "failed to save the registry", http.StatusInternalServerError)
+		return
+	}
+	if err := s.firewall.Apply(reg.MACs()); err != nil {
+		s.log.Error("applying ruleset", "error", err)
+		http.Error(w, fmt.Sprintf("device removed from the list but the firewall was NOT updated, "+
+			"so it may still have access: %v", err), http.StatusInternalServerError)
+		return
+	}
+	s.log.Info("device removed", "mac", mac)
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 type pageData struct {
 	Devices []DeviceView
 	Error   string
@@ -294,6 +338,8 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
  form.rename { display: flex; gap: .3rem; margin: 0; }
  form.rename input { padding: .4rem; font-size: .9rem; }
  form.rename button { padding: .4rem .6rem; font-size: .85rem; }
+ form.remove { margin: 0; }
+ button.danger { padding: .4rem .6rem; font-size: .85rem; color: #b00020; }
  input { padding: .6rem; font-size: 1rem; width: 100%; box-sizing: border-box; }
  button { padding: .7rem; font-size: 1rem; }
  .err { background: #fdecea; color: #b00020; padding: .6rem; margin-bottom: 1rem; }
@@ -304,7 +350,7 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
 <h1>Devices allowed on the internet</h1>
 {{if .Error}}<div class="err">{{.Error}}</div>{{end}}
 <table>
-<tr><th>Name</th><th>MAC</th><th>Allowed</th></tr>
+<tr><th>Name</th><th>MAC</th><th>Allowed</th><th></th></tr>
 {{range .Devices}}
 <tr{{if .Unregistered}} class="warn"{{end}}>
   <td>
@@ -321,9 +367,16 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
   </td>
   <td><code>{{.MAC}}</code></td>
   <td>{{if .Allowed}}<span class="yes">yes</span>{{else}}<span class="no">no</span>{{end}}</td>
+  <td>{{if not .Unregistered}}
+    <form method="POST" action="/devices/remove" class="remove"
+          onsubmit="return confirm('Remove {{if .Name}}{{.Name}}{{else}}{{.MAC}}{{end}} and cut off its internet?')">
+      <input type="hidden" name="mac" value="{{.MAC}}">
+      <button type="submit" class="danger">Remove</button>
+    </form>
+  {{end}}</td>
 </tr>
 {{else}}
-<tr><td colspan="3" class="muted">No devices registered. Nothing can reach the internet.</td></tr>
+<tr><td colspan="4" class="muted">No devices registered. Nothing can reach the internet.</td></tr>
 {{end}}
 </table>
 <h2 style="font-size:1.05rem">Add a device</h2>

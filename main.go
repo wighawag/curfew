@@ -29,7 +29,8 @@ const usage = `curfew - manage the parental control router from your laptop
 
 Usage:
   curfew import [flags]           build a device list from the legacy config
-  curfew install <host> [flags]   install or update the daemon on the router
+  curfew install <host> [flags]   first-time setup: daemon, settings, service
+  curfew update <host> [flags]    update the daemon binary, keeping its settings
   curfew push <host> [flags]      send your local device list to the router
   curfew pull <host> [flags]      fetch the router's device list
   curfew version
@@ -55,6 +56,8 @@ func run(args []string) int {
 		err = cmdImport(rest)
 	case "install":
 		err = cmdInstall(rest)
+	case "update":
+		err = cmdUpdate(rest)
 	case "push":
 		err = cmdPush(rest)
 	case "pull":
@@ -225,6 +228,43 @@ func cmdImport(args []string) error {
 		fmt.Printf("  %s  %s\n", d.MAC, d.Name)
 	}
 	fmt.Println("\nCheck this list: it becomes the allowlist, and anything missing loses internet.")
+	return nil
+}
+
+// cmdUpdate replaces the daemon binary without re-specifying how the router is
+// configured. The settings live on the router as data, so asking for them
+// again would only create a chance to change them by accident.
+func cmdUpdate(args []string) error {
+	fs := flag.NewFlagSet("update", flag.ContinueOnError)
+	binary := fs.String("binary", "", "prebuilt daemon binary to install (default: build one)")
+	host, err := hostAndFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	runner := deploy.SSHRunner{Host: host}
+
+	arch, err := deploy.DetectArch(runner)
+	if err != nil {
+		return err
+	}
+	binPath := *binary
+	if binPath == "" {
+		binPath, err = buildDaemon(arch)
+		if err != nil {
+			return err
+		}
+		defer os.Remove(binPath)
+	}
+
+	if err := deploy.Update(runner, binPath); err != nil {
+		return err
+	}
+	count, err := deploy.Verify(runner)
+	if err != nil {
+		return fmt.Errorf("updated, but verification FAILED: %w", err)
+	}
+	fmt.Printf("updated %s (%s)\n", host, arch)
+	fmt.Printf("the firewall is enforcing an allowlist of %d device(s)\n", count)
 	return nil
 }
 

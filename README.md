@@ -59,7 +59,8 @@ ssh root@192.168.1.1 "ifstatus wan | grep l3_device"
 | Command | Runs on | What it does |
 |---|---|---|
 | `curfew import` | laptop | Build a device list from the legacy pipe-delimited config |
-| `curfew install <host>` | laptop | Install or update the daemon, ship the device list, start it |
+| `curfew install <host>` | laptop | First-time setup: daemon, settings, service, device list |
+| `curfew update <host>` | laptop | Update the daemon binary, keeping the router's settings and devices |
 | `curfew push <host>` | laptop | Send your local device list to the router |
 | `curfew pull <host>` | laptop | Fetch the router's device list |
 | `curfew version` | laptop | Print the version |
@@ -69,7 +70,7 @@ Your existing ssh configuration, keys and agent are used as-is.
 
 ## What it does today
 
-The **MAC allowlist**, and nothing else yet. Registered devices reach the internet; everything else is dropped. Add devices from the page at `http://<router>:8080`, each with an optional name.
+The **MAC allowlist**, and nothing else yet. Registered devices reach the internet; everything else is dropped. Add, rename and remove devices from the page at `http://<router>:8080`. Names are optional labels: the allowlist works on MAC addresses, so renaming never changes who has internet, while removing a device revokes its access immediately.
 
 The page reports, per device, what the **firewall** currently allows rather than what the saved list claims, and flags any MAC the firewall allows that nothing registered. If the two ever disagree you see it. A green dot derived from reading back our own config file is precisely the reassurance that let the previous system claim to be working.
 
@@ -95,6 +96,9 @@ The daemon deliberately leaves the ruleset in place when it exits. Stopping it m
 | `/etc/config/curfew/devices.json` | yes | yes |
 | `/usr/sbin/curfew-daemon` | yes | yes, via `/lib/upgrade/keep.d/curfew` |
 | `/etc/init.d/curfew` | yes | yes, same |
+| `/etc/config/curfew/daemon.conf` | yes | yes |
+
+The daemon's settings (WAN interface, listen address, credentials) live in `daemon.conf` as data rather than baked into the service definition. That is what lets `curfew update` replace the binary without being told them again, and it means updating can never change them by accident. `install` writes that file; `update` deliberately never touches it, nor the device list.
 
 `/etc/config/` is the only location OpenWrt's sysupgrade keep list preserves by default, which is measured, not assumed. `curfew install` registers the binary and the init script for preservation too, so a firmware upgrade cannot leave you with a config that says who is allowed and a firewall that allows everyone.
 

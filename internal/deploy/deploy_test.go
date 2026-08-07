@@ -27,6 +27,12 @@ func (f *fakeRunner) Run(cmd string) (string, error) {
 	if strings.Contains(cmd, "uname -m") {
 		return "aarch64\n", nil
 	}
+	if strings.Contains(cmd, RemoteDaemonConf) && strings.Contains(cmd, "echo yes") {
+		if f.existing[RemoteDaemonConf] {
+			return "yes\n", nil
+		}
+		return "no\n", nil
+	}
 	if strings.Contains(cmd, RemoteRegistry) && strings.Contains(cmd, "echo yes") {
 		if f.existing[RemoteRegistry] {
 			return "yes\n", nil
@@ -223,19 +229,107 @@ func TestPullCreatesParentDirectory(t *testing.T) {
 	}
 }
 
-func TestInitScriptShape(t *testing.T) {
-	s := initScript("pppoe-wan", "br-lan", ":8080", "parent", "hunter2")
+func TestInitScriptIsAStaticTemplateCarryingNoSettings(t *testing.T) {
+	s := initScript()
 	for _, want := range []string{
 		"USE_PROCD=1",
 		"procd_set_param respawn", // the resilience that replaces cron
 		RemoteBinary,
-		`-wan "pppoe-wan"`,
-		`-lan "br-lan"`,
-		"CURFEW_PASSWORD=",
+		RemoteDaemonConf, // it SOURCES its settings rather than embedding them
+		`-wan "$CURFEW_WAN"`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("init script missing %q:\n%s", want, s)
 		}
+	}
+	// The whole point: no setting is baked in, so `update` can replace this
+	// file without being told the WAN interface or the password again.
+	for _, mustNot := range []string{"pppoe-wan", "hunter2", "br-lan"} {
+		if strings.Contains(s, mustNot) {
+			t.Errorf("init script must not embed the setting %q", mustNot)
+		}
+	}
+}
+
+func TestDaemonConfQuotesAwkwardValues(t *testing.T) {
+	// A password can contain anything. A naive quote would either break the
+	// file the init script sources, or let the value execute.
+	c := daemonConf("br-lan", "pppoe-wan", ":8080", "parent", `it's $PWD; rm -rf /`)
+	if !strings.Contains(c, `CURFEW_PASSWORD='it'\''s $PWD; rm -rf /'`) {
+		t.Errorf("password not safely quoted:\n%s", c)
+	}
+	if !strings.Contains(c, "CURFEW_WAN='pppoe-wan'") {
+		t.Errorf("settings missing:\n%s", c)
+	}
+}
+
+func TestInstallWritesSettingsAsDataAndProtectsThem(t *testing.T) {
+	r := &fakeRunner{}
+	if err := Install(r, InstallOptions{
+		LAN: "br-lan", WAN: "pppoe-wan", Listen: ":8080",
+		User: "parent", Password: "hunter2", BinaryPath: tempBinary(t),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	conf, ok := r.uploaded[RemoteDaemonConf]
+	if !ok {
+		t.Fatalf("install must write the settings file; uploads were %v", r.uploads)
+	}
+	if !strings.Contains(conf, "CURFEW_WAN='pppoe-wan'") || !strings.Contains(conf, "CURFEW_PASSWORD='hunter2'") {
+		t.Errorf("settings not written:\n%s", conf)
+	}
+	if !r.ranMatching("chmod 600 " + RemoteDaemonConf) {
+		t.Error("the settings file holds the password and must not be world-readable")
+	}
+}
+
+// The point of update: no WAN, no password, and it must not disturb either
+// the settings or the device list.
+func TestUpdateReplacesTheBinaryWithoutTouchingSettingsOrDevices(t *testing.T) {
+	r := &fakeRunner{existing: map[string]bool{RemoteDaemonConf: true}}
+	if err := Update(r, tempBinary(t)); err != nil {
+		t.Fatal(err)
+	}
+	if !r.uploadedTo(RemoteBinary + ".new") {
+		t.Error("update should push a new binary")
+	}
+	if !r.uploadedTo(RemoteInit) {
+		t.Error("update should refresh the service template")
+	}
+	if r.uploadedTo(RemoteDaemonConf) {
+		t.Error("update must NOT rewrite the settings; that would change them silently")
+	}
+	if r.uploadedTo(RemoteRegistry) {
+		t.Error("update must NOT touch the device list")
+	}
+	if !r.ranMatching(RemoteInit + " restart") {
+		t.Error("update should restart the service")
+	}
+}
+
+func TestUpdateRefusesARouterThatWasNeverInstalled(t *testing.T) {
+	// The init script requires the settings file. Replacing it on a router
+	// that has none would leave a service that cannot start.
+	r := &fakeRunner{existing: map[string]bool{}}
+	err := Update(r, tempBinary(t))
+	if err == nil {
+		t.Fatal("want an error when the router has no settings file")
+	}
+	if !strings.Contains(err.Error(), "install") {
+		t.Errorf("the error should say to run install, got: %v", err)
+	}
+	if r.uploadedTo(RemoteBinary+".new") || r.uploadedTo(RemoteInit) {
+		t.Error("update must change nothing when it refuses")
+	}
+}
+
+func TestUpdateFailsWhenThePushedBinaryCannotRun(t *testing.T) {
+	r := &fakeRunner{existing: map[string]bool{RemoteDaemonConf: true}, failOn: "-version"}
+	if err := Update(r, tempBinary(t)); err == nil {
+		t.Fatal("want an error when the new binary cannot execute")
+	}
+	if r.ranMatching("restart") {
+		t.Error("a service must not be restarted onto a binary that cannot exec")
 	}
 }
 

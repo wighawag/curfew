@@ -111,6 +111,11 @@ const (
 	// present in the rootfs test image. Confirm on the real router before
 	// relying on it, and see the fallback in the comment on RemoteConfDir.
 	RemoteKeepList = "/lib/upgrade/keep.d/curfew"
+	// RemoteDaemonConf holds the daemon's settings as DATA rather than baked
+	// into the generated init script. That is what lets `update` replace the
+	// binary and the service template without being told the WAN interface and
+	// the password all over again, and without silently changing them.
+	RemoteDaemonConf = "/etc/config/curfew/daemon.conf"
 )
 
 // GoArch maps what `uname -m` reports on the router to a GOARCH. Detecting
@@ -146,26 +151,98 @@ func DetectArch(r Runner) (string, error) {
 // initScript is the procd service. respawn is what replaces the resilience
 // cron used to provide; it is available on OpenWrt (verified in the real
 // image at /lib/functions/procd.sh).
-func initScript(wan, lan, listen, user, password string) string {
+func initScript() string {
 	return fmt.Sprintf(`#!/bin/sh /etc/rc.common
 # curfew: parental control daemon. Managed by the curfew tool.
 START=99
 USE_PROCD=1
 
+CONF=%s
+
 start_service() {
+    if [ ! -f "$CONF" ]; then
+        echo "curfew: missing $CONF; run 'curfew install' from your laptop" >&2
+        return 1
+    fi
+    . "$CONF"
     procd_open_instance
     procd_set_param command %s \
         -registry %s \
-        -lan %q \
-        -wan %q \
-        -listen %q
-    procd_set_param env CURFEW_USER=%q CURFEW_PASSWORD=%q
+        -lan "$CURFEW_LAN" \
+        -wan "$CURFEW_WAN" \
+        -listen "$CURFEW_LISTEN"
+    procd_set_param env CURFEW_USER="$CURFEW_USER" CURFEW_PASSWORD="$CURFEW_PASSWORD"
     procd_set_param respawn
     procd_set_param stdout 1
     procd_set_param stderr 1
     procd_close_instance
 }
-`, RemoteBinary, RemoteRegistry, lan, wan, listen, user, password)
+`, RemoteDaemonConf, RemoteBinary, RemoteRegistry)
+}
+
+// shellQuote renders a value safe to `.` into a POSIX shell. Passwords can
+// contain anything, and a naive quote would either break the file or let a
+// value execute.
+func shellQuote(v string) string {
+	return "'" + strings.ReplaceAll(v, "'", `'\''`) + "'"
+}
+
+// daemonConf renders the settings file the init script sources.
+func daemonConf(lan, wan, listen, user, password string) string {
+	return fmt.Sprintf(`# curfew daemon settings. Written by 'curfew install'.
+# 'curfew update' deliberately leaves this file alone.
+CURFEW_LAN=%s
+CURFEW_WAN=%s
+CURFEW_LISTEN=%s
+CURFEW_USER=%s
+CURFEW_PASSWORD=%s
+`, shellQuote(lan), shellQuote(wan), shellQuote(listen), shellQuote(user), shellQuote(password))
+}
+
+// uploadString writes content to a remote path, via a temp local file.
+func uploadString(r Runner, content, remotePath, what string) error {
+	local, err := os.CreateTemp("", "curfew-*")
+	if err != nil {
+		return fmt.Errorf("creating temp %s: %w", what, err)
+	}
+	defer os.Remove(local.Name())
+	if _, err := local.WriteString(content); err != nil {
+		local.Close()
+		return fmt.Errorf("writing temp %s: %w", what, err)
+	}
+	if err := local.Close(); err != nil {
+		return fmt.Errorf("closing temp %s: %w", what, err)
+	}
+	return r.Upload(local.Name(), remotePath)
+}
+
+// pushBinary uploads the daemon and proves it actually executes on this
+// router. Shared by install and update, because the wrong-architecture trap
+// is identical for both.
+func pushBinary(r Runner, binaryPath string) error {
+	if binaryPath == "" {
+		return fmt.Errorf("no daemon binary to install")
+	}
+	if _, err := os.Stat(binaryPath); err != nil {
+		return fmt.Errorf("daemon binary: %w", err)
+	}
+	// Upload to a temp path then move, so a half-copied binary is never the
+	// thing procd tries to exec.
+	tmpRemote := RemoteBinary + ".new"
+	if err := r.Upload(binaryPath, tmpRemote); err != nil {
+		return err
+	}
+	if _, err := r.Run(fmt.Sprintf("chmod +x %s && mv %s %s", tmpRemote, tmpRemote, RemoteBinary)); err != nil {
+		return err
+	}
+	// A wrong-architecture push otherwise "succeeds" all the way through
+	// enable and start, and shows up only as procd respawning a binary that
+	// cannot exec, which is invisible from the laptop.
+	if _, err := r.Run(RemoteBinary + " -version"); err != nil {
+		return fmt.Errorf("the installed binary does not run on this router "+
+			"(wrong architecture?): %w", err)
+	}
+	return nil
 }
 
 // InstallOptions configures a deployment.
@@ -177,65 +254,37 @@ type InstallOptions struct {
 	Password string
 	// BinaryPath is the locally built daemon to push.
 	BinaryPath string
-	// RegistryPath, when set and present on disk, is uploaded BEFORE the
-	// service starts. This matters more than it looks: the daemon applies the
-	// registry at startup, so starting with an empty one takes every device in
-	// the house off the internet until something pushes a real list. Shipping
-	// it as part of the install removes that window entirely.
+	// RegistryPath is the local device list, shipped only when the router has
+	// none, so a first install never starts with an empty allowlist.
 	RegistryPath string
 }
 
-// Install puts the daemon on the router, installs the service and starts it.
-//
-// Ordering matters: the binary and the service definition land BEFORE anything
-// is started, and the registry is only created if absent, so re-running an
-// install never discards the device list.
+// Install puts the daemon on the router, writes its settings and service
+// definition, and starts it.
 func Install(r Runner, opt InstallOptions) error {
 	if opt.WAN == "" {
 		return fmt.Errorf("WAN interface is required")
 	}
-	if opt.BinaryPath == "" {
-		return fmt.Errorf("no daemon binary to install")
-	}
-	if _, err := os.Stat(opt.BinaryPath); err != nil {
-		return fmt.Errorf("daemon binary: %w", err)
-	}
-
 	if _, err := r.Run("mkdir -p " + RemoteConfDir); err != nil {
 		return err
 	}
-	// Upload to a temp path then move, so a half-copied binary is never the
-	// thing procd tries to exec.
-	tmpRemote := RemoteBinary + ".new"
-	if err := r.Upload(opt.BinaryPath, tmpRemote); err != nil {
-		return err
-	}
-	if _, err := r.Run(fmt.Sprintf("chmod +x %s && mv %s %s", tmpRemote, tmpRemote, RemoteBinary)); err != nil {
+	if err := pushBinary(r, opt.BinaryPath); err != nil {
 		return err
 	}
 
-	// Prove the binary actually runs on this router before wiring it to
-	// anything. A wrong-architecture push otherwise "succeeds" all the way
-	// through enable and start, and only shows up as procd respawning a binary
-	// that cannot exec, which is invisible unless you go looking.
-	if _, err := r.Run(RemoteBinary + " -version"); err != nil {
-		return fmt.Errorf("the installed binary does not run on this router "+
-			"(wrong architecture?): %w", err)
+	// Settings as DATA, separate from the service definition that reads them.
+	// This is what lets `update` replace the binary and the service template
+	// later without being told the WAN interface and the password again.
+	conf := daemonConf(opt.LAN, opt.WAN, opt.Listen, opt.User, opt.Password)
+	if err := uploadString(r, conf, RemoteDaemonConf, "settings"); err != nil {
+		return err
+	}
+	// The password is in there, so it must not be world-readable.
+	if _, err := r.Run("chmod 600 " + RemoteDaemonConf); err != nil {
+		return err
 	}
 
-	local, err := os.CreateTemp("", "curfew-init-*")
-	if err != nil {
-		return fmt.Errorf("creating temp init script: %w", err)
-	}
-	defer os.Remove(local.Name())
-	if _, err := local.WriteString(initScript(opt.WAN, opt.LAN, opt.Listen, opt.User, opt.Password)); err != nil {
-		local.Close()
-		return fmt.Errorf("writing temp init script: %w", err)
-	}
-	if err := local.Close(); err != nil {
-		return fmt.Errorf("closing temp init script: %w", err)
-	}
-	if err := r.Upload(local.Name(), RemoteInit); err != nil {
+	if err := uploadString(r, initScript(), RemoteInit, "init script"); err != nil {
 		return err
 	}
 	if _, err := r.Run("chmod +x " + RemoteInit); err != nil {
@@ -247,9 +296,8 @@ func Install(r Runner, opt InstallOptions) error {
 	// The point is to avoid ever starting with an empty allowlist, which would
 	// take the whole household off the internet. It is NOT to make the router
 	// match the laptop: devices can be added and renamed on the router's own
-	// page, and an install run later to update the binary must not silently
-	// discard those edits. Making the router match the laptop is what `push`
-	// is for, and it is an explicit act.
+	// page, and an install run later must not silently discard those edits.
+	// Making the router match the laptop is what `push` is for.
 	remoteHas, err := r.Run(fmt.Sprintf("[ -s %s ] && echo yes || echo no", RemoteRegistry))
 	if err != nil {
 		return err
@@ -261,34 +309,57 @@ func Install(r Runner, opt InstallOptions) error {
 			}
 		}
 	}
-	// Otherwise ensure one exists, without ever clobbering a list already on
-	// the router.
 	if _, err := r.Run(fmt.Sprintf("[ -f %s ] || printf '%%s\\n' '{\"devices\":[]}' > %s",
 		RemoteRegistry, RemoteRegistry)); err != nil {
 		return err
 	}
 
-	// Register for preservation across a firmware upgrade, before starting.
-	keep, err := os.CreateTemp("", "curfew-keep-*")
-	if err != nil {
-		return fmt.Errorf("creating temp keep list: %w", err)
-	}
-	defer os.Remove(keep.Name())
-	if _, err := fmt.Fprintf(keep, "%s\n%s\n", RemoteBinary, RemoteInit); err != nil {
-		keep.Close()
-		return fmt.Errorf("writing temp keep list: %w", err)
-	}
-	if err := keep.Close(); err != nil {
-		return fmt.Errorf("closing temp keep list: %w", err)
-	}
+	// Register for preservation across a firmware upgrade. /usr/sbin and
+	// /etc/init.d are NOT in OpenWrt's keep list, so without this a sysupgrade
+	// leaves a device list saying who is allowed and no daemon enforcing it.
 	if _, err := r.Run("mkdir -p /lib/upgrade/keep.d"); err != nil {
 		return err
 	}
-	if err := r.Upload(keep.Name(), RemoteKeepList); err != nil {
+	if err := uploadString(r, RemoteBinary+"\n"+RemoteInit+"\n", RemoteKeepList, "keep list"); err != nil {
 		return err
 	}
 
 	if _, err := r.Run(RemoteInit + " enable"); err != nil {
+		return err
+	}
+	if _, err := r.Run(RemoteInit + " restart"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Update replaces the daemon binary and the service definition, and nothing
+// else.
+//
+// It does not ask for the WAN interface or the password again, because those
+// live in RemoteDaemonConf as data rather than baked into the generated init
+// script. It deliberately leaves that file AND the device list alone, so
+// updating the binary can never change who is allowed on the network or
+// silently discard edits made on the router's own page.
+func Update(r Runner, binaryPath string) error {
+	has, err := r.Run(fmt.Sprintf("[ -f %s ] && echo yes || echo no", RemoteDaemonConf))
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(has) != "yes" {
+		return fmt.Errorf("no settings found at %s on the router.\n"+
+			"       This router was set up by an older version, or never installed. "+
+			"Run 'curfew install' once to write them", RemoteDaemonConf)
+	}
+	if err := pushBinary(r, binaryPath); err != nil {
+		return err
+	}
+	// The init script is a static template now, so replacing it is safe: it
+	// carries no settings of its own.
+	if err := uploadString(r, initScript(), RemoteInit, "init script"); err != nil {
+		return err
+	}
+	if _, err := r.Run("chmod +x " + RemoteInit); err != nil {
 		return err
 	}
 	if _, err := r.Run(RemoteInit + " restart"); err != nil {

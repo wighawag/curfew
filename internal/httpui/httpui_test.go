@@ -348,3 +348,78 @@ func TestIndexOffersARenameFormForRegisteredDevicesOnly(t *testing.T) {
 		t.Error("the unregistered MAC should still be flagged rather than made nameable")
 	}
 }
+
+func TestRemoveDeviceRevokesAccess(t *testing.T) {
+	srv, store, fw := newTestServer(t,
+		[]registry.Device{
+			{MAC: "aa:bb:cc:dd:ee:01", Name: "keep"},
+			{MAC: "aa:bb:cc:dd:ee:02", Name: "drop"},
+		},
+		[]string{"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"})
+	rec := post(t, srv.Handler(), "/devices/remove", url.Values{"mac": {"aa:bb:cc:dd:ee:02"}})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("want 303, got %d: %s", rec.Code, rec.Body)
+	}
+	if len(store.reg.Devices) != 1 || store.reg.Devices[0].MAC != "aa:bb:cc:dd:ee:01" {
+		t.Fatalf("wrong device removed: %+v", store.reg.Devices)
+	}
+	// The firewall MUST be reconciled: saying "removed" while the device keeps
+	// its internet is the exact failure this project exists to remove.
+	if len(fw.live) != 1 || fw.live[0] != "aa:bb:cc:dd:ee:01" {
+		t.Errorf("allowlist not reconciled after removal: %v", fw.live)
+	}
+}
+
+func TestRemoveFailsLoudlyWhenTheFirewallFails(t *testing.T) {
+	srv, _, fw := newTestServer(t,
+		[]registry.Device{{MAC: "aa:bb:cc:dd:ee:01"}}, []string{"aa:bb:cc:dd:ee:01"})
+	fw.applyErr = errors.New("netlink is unhappy")
+	rec := post(t, srv.Handler(), "/devices/remove", url.Values{"mac": {"aa:bb:cc:dd:ee:01"}})
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("want 500, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "may still have access") {
+		t.Errorf("the response must warn the device may still be online, got %q", rec.Body.String())
+	}
+}
+
+func TestRemoveUnknownDeviceIsAnError(t *testing.T) {
+	srv, store, fw := newTestServer(t,
+		[]registry.Device{{MAC: "aa:bb:cc:dd:ee:01"}}, []string{"aa:bb:cc:dd:ee:01"})
+	before := fw.applyCall
+	rec := post(t, srv.Handler(), "/devices/remove", url.Values{"mac": {"aa:bb:cc:dd:ee:09"}})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("want a redirect carrying the error, got %d", rec.Code)
+	}
+	if len(store.reg.Devices) != 1 {
+		t.Error("nothing should have been removed")
+	}
+	if fw.applyCall != before {
+		t.Error("the firewall must not be touched when nothing was removed")
+	}
+}
+
+func TestRemoveRejectsGETAndRequiresAuth(t *testing.T) {
+	srv, store, _ := newTestServer(t,
+		[]registry.Device{{MAC: "aa:bb:cc:dd:ee:01"}}, nil)
+	req := httptest.NewRequest(http.MethodGet, "/devices/remove?mac=aa:bb:cc:dd:ee:01", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("want 405 for a GET removal, got %d", rec.Code)
+	}
+	if len(store.reg.Devices) != 1 {
+		t.Fatal("a GET must never remove a device")
+	}
+
+	authStore := &memStore{reg: &registry.Registry{Devices: []registry.Device{{MAC: "aa:bb:cc:dd:ee:01"}}}}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	authed := New(authStore, &fakeFirewall{}, log, "parent", "hunter2")
+	rec = post(t, authed.Handler(), "/devices/remove", url.Values{"mac": {"aa:bb:cc:dd:ee:01"}})
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("want 401, got %d", rec.Code)
+	}
+	if len(authStore.reg.Devices) != 1 {
+		t.Error("an unauthenticated removal must change nothing")
+	}
+}
