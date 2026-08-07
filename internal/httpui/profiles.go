@@ -24,8 +24,13 @@ type ProfileView struct {
 	Windows []string
 	// Blocked is read from the FIREWALL, not computed from the clock, per
 	// docs/adr/0004-tests-assert-on-the-packet-path.md. It is the truth about
-	// what is happening to packets right now.
+	// what is happening to packets right now. True only when EVERY device is
+	// blocked; see Partial.
 	Blocked bool
+	// Partial means some of the profile's devices are blocked and some are
+	// not. That is always drift: a half-enforced bedtime is a child online on
+	// their other device.
+	Partial bool
 	// ShouldBeBlocked is what the schedule says SHOULD be true. When the two
 	// disagree the page says so, because that gap is the entire failure this
 	// project exists to make visible rather than hide.
@@ -34,7 +39,17 @@ type ProfileView struct {
 }
 
 // Drifted reports a disagreement between the firewall and the schedule.
-func (p ProfileView) Drifted() bool { return p.Blocked != p.ShouldBeBlocked }
+//
+// A profile with NO devices can never drift: there is no MAC to block, so
+// "should be blocked" is satisfied vacuously. Reporting drift there was a real
+// bug, and an alarming one, since a freshly created profile always tripped it
+// before any device had been assigned.
+func (p ProfileView) Drifted() bool {
+	if len(p.Devices) == 0 {
+		return false
+	}
+	return p.Partial || p.Blocked != p.ShouldBeBlocked
+}
 
 // profileViews joins the schedule (intent) with the firewall (truth).
 func (s *Server) profileViews(now time.Time) ([]ProfileView, error) {
@@ -73,18 +88,29 @@ func (s *Server) profileViews(now time.Time) ([]ProfileView, error) {
 		for _, w := range p.Windows {
 			v.Windows = append(v.Windows, w.Describe())
 		}
-		anyBlocked := false
+		blockedCount := 0
 		for _, m := range p.Devices {
 			v.Devices = append(v.Devices, DeviceView{
 				MAC: m, Name: name[m], Allowed: isAllowed[m] && !isBlocked[m],
 			})
 			if isBlocked[m] {
-				anyBlocked = true
+				blockedCount++
 			}
 		}
 		sort.Slice(v.Devices, func(i, j int) bool { return v.Devices[i].MAC < v.Devices[j].MAC })
-		v.Blocked = anyBlocked
+		// Blocked means EVERY device is blocked. Counting "any" would let a
+		// half-enforced bedtime read as enforced, which is a child online on
+		// their second device.
+		v.Blocked = len(p.Devices) > 0 && blockedCount == len(p.Devices)
+		v.Partial = blockedCount > 0 && blockedCount < len(p.Devices)
+
 		switch {
+		case len(p.Devices) == 0 && len(p.Windows) == 0:
+			v.Reason = "no devices and no schedule"
+		case len(p.Devices) == 0:
+			v.Reason = "no devices yet, so this schedule affects nothing"
+		case v.Partial:
+			v.Reason = fmt.Sprintf("only %d of %d devices are blocked", blockedCount, len(p.Devices))
 		case v.Blocked && v.ShouldBeBlocked:
 			v.Reason = "inside a blocked window"
 		case v.Blocked && !v.ShouldBeBlocked:
@@ -382,6 +408,7 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
  .off { background: #fdecea; color: #b00020; }
  .on  { background: #e7f6ec; color: #0a7d28; }
  .drift { background: #fff4e5; color: #8a5300; border: 1px solid #f0c48a; }
+ .idle { background: #eee; color: #555; }
  .muted { color: #666; font-size: .85rem; }
  ul { margin: .5rem 0; padding-left: 1.1rem; }
  li { font-size: .9rem; margin-bottom: .2rem; }
@@ -408,6 +435,8 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
     <h2>{{.Name}}</h2>
     {{if .Drifted}}
       <span class="state drift">{{.Reason}}</span>
+    {{else if not .Devices}}
+      <span class="state idle">no devices</span>
     {{else if .Blocked}}
       <span class="state off">blocked</span>
     {{else}}

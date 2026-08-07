@@ -813,3 +813,78 @@ func TestSchedulesUseTheConfiguredTimezone(t *testing.T) {
 		t.Error("13:20 London is outside the window")
 	}
 }
+
+// A freshly created profile has no devices, so there is no MAC to block and
+// "should be blocked" is satisfied vacuously. Reporting drift there was a real
+// bug: every new profile tripped it the moment a window was added, before any
+// device had been assigned, which reads as a broken system.
+func TestProfileWithNoDevicesNeverReportsDrift(t *testing.T) {
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{{
+		Name:    "brand-new",
+		Windows: []schedule.Window{{Days: schedule.AllDays, Start: "00:00", End: "23:59"}},
+	}}}
+	srv, _, _ := newProfileServer(t, nil, ps, nil, nil)
+	views, err := srv.profileViews(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := views[0]
+	if !v.ShouldBeBlocked {
+		t.Fatal("the window covers now, so the schedule should say blocked")
+	}
+	if v.Drifted() {
+		t.Errorf("a profile with no devices cannot drift, got reason %q", v.Reason)
+	}
+	if !strings.Contains(v.Reason, "no devices") {
+		t.Errorf("the reason should explain there is nothing to enforce, got %q", v.Reason)
+	}
+}
+
+// The opposite failure: counting "any device blocked" as blocked would let a
+// half-enforced bedtime read as fine, which is a child online on their laptop
+// while their phone is cut off.
+func TestPartiallyBlockedProfileIsDrift(t *testing.T) {
+	m1, m2 := "aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{{
+		Name: "eli", Devices: []string{m1, m2},
+		Windows: []schedule.Window{{Days: schedule.AllDays, Start: "00:00", End: "23:59"}},
+	}}}
+	srv, _, _ := newProfileServer(t,
+		[]registry.Device{{MAC: m1}, {MAC: m2}}, ps,
+		[]string{m1, m2}, []string{m1}) // only one of the two is blocked
+	views, err := srv.profileViews(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := views[0]
+	if !v.Partial {
+		t.Error("one of two devices blocked is partial enforcement")
+	}
+	if !v.Drifted() {
+		t.Error("partial enforcement must be reported as drift")
+	}
+	if v.Blocked {
+		t.Error("a profile is only blocked when EVERY device is")
+	}
+	if !strings.Contains(v.Reason, "1 of 2") {
+		t.Errorf("the reason should say how many, got %q", v.Reason)
+	}
+}
+
+func TestFullyBlockedProfileIsNotDrift(t *testing.T) {
+	m1, m2 := "aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{{
+		Name: "eli", Devices: []string{m1, m2},
+		Windows: []schedule.Window{{Days: schedule.AllDays, Start: "00:00", End: "23:59"}},
+	}}}
+	srv, _, _ := newProfileServer(t,
+		[]registry.Device{{MAC: m1}, {MAC: m2}}, ps, []string{m1, m2}, []string{m1, m2})
+	views, err := srv.profileViews(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if views[0].Drifted() || !views[0].Blocked {
+		t.Errorf("every device blocked inside a window is correct, got drift=%v reason=%q",
+			views[0].Drifted(), views[0].Reason)
+	}
+}
