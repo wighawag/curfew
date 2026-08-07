@@ -58,7 +58,7 @@ RUN mkdir -p /var/run
 COPY . /opt/my-router/
 WORKDIR /opt/my-router
 
-RUN chmod +x scripts/*.sh web/cgi-bin/ticket
+RUN chmod +x legacy/scripts/*.sh legacy/web/cgi-bin/ticket
 
 # State directory used by the test helpers.
 RUN mkdir -p /tmp/mock-state

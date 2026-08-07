@@ -20,7 +20,14 @@ services:
     volumes:
       - ../:/opt/my-router
     working_dir: /opt/my-router
-    command: sh -c 'chmod +x scripts/*.sh web/cgi-bin/ticket && bats test/'
+    # Go acceptance binaries first (compiled on the host by docker/acceptance.sh,
+    # since this image has no Go toolchain), then the legacy bats suite. The
+    # `set -e` matters: without it a failing Go binary would be masked by bats
+    # exiting 0 afterwards, which is precisely the kind of green-while-broken
+    # gate this project keeps having to unlearn.
+    command: sh -c 'set -e; chmod +x legacy/scripts/*.sh legacy/web/cgi-bin/ticket;
+      for t in .acceptance/*.test; do [ -e "$$t" ] || continue; echo "== $$t"; "$$t"; done;
+      bats legacy/test/'
 
   # Interactive shell for manual testing
   shell:
