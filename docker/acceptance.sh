@@ -24,6 +24,12 @@ CGO_ENABLED=0 go test -c -o .acceptance/policy.test ./internal/policy
 # against a real kernel and a real packet.
 CGO_ENABLED=0 go test -c -o .acceptance/accounting.test ./internal/accounting
 
+# internal/deploy adopts a REAL AdGuard and closes its open API. That claim is
+# an attack that must stop working, so it is asserted against a running server
+# rather than against a config file, and it needs the AdGuard binary the image
+# ships.
+CGO_ENABLED=0 go test -c -o .acceptance/deploy.test ./internal/deploy
+
 # The kernel probe both measures a kernel and claims to be safe on a live
 # router. The second half is a packet-path assertion, so it belongs here.
 CGO_ENABLED=0 go test -c -o .acceptance/kernelprobe.test ./internal/kernelprobe

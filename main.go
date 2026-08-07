@@ -14,8 +14,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
+	"github.com/wighawag/curfew/internal/adguard"
 	"github.com/wighawag/curfew/internal/deploy"
 	"github.com/wighawag/curfew/internal/legacyconfig"
 	"github.com/wighawag/curfew/internal/registry"
@@ -226,7 +228,16 @@ func cmdInstall(args []string) error {
 	wan := fs.String("wan", "", "WAN interface on the router (required; on PPPoE this is pppoe-wan)")
 	listen := fs.String("listen", ":8080", "address the device page listens on")
 	user := fs.String("user", "parent", "username for the device page")
-	password := fs.String("password", "", "password for the device page (strongly recommended)")
+	password := fs.String("password", "",
+		"password for BOTH the device page and AdGuard's admin page (strongly recommended)")
+	curfewPassword := fs.String("curfew-password", "",
+		"password for the device page only, overriding -password")
+	adguardPassword := fs.String("adguard-password", "",
+		"password for AdGuard's admin page and API only, overriding -password. "+
+			"On a router that already has AdGuard with a login, pass the EXISTING one")
+	adguardUser := fs.String("adguard-user", adguard.DefaultUser, "username for AdGuard's admin page")
+	noAdGuard := fs.Bool("no-adguard", false,
+		"do not install or touch AdGuard Home at all")
 	binary := fs.String("binary", "", "prebuilt daemon binary to install (default: build one)")
 	tz := fs.String("timezone", "", "IANA timezone for schedules (default: the router's own zonename)")
 	regPath := fs.String("registry", defaultRegistryPath(),
@@ -240,9 +251,20 @@ func cmdInstall(args []string) error {
 		return fmt.Errorf("-wan is required: guessing it is how enforcement silently matches nothing.\n" +
 			"       On this router's PPPoE line it is pppoe-wan, not eth1. Check with: ssh <host> ifstatus wan")
 	}
-	if *password == "" {
+	// One -password sets both, and either can be overridden. Two systems on
+	// this router grant internet access, and shipping either of them without
+	// a password means the device being filtered can free itself.
+	curfewPass := firstNonEmpty(*curfewPassword, *password)
+	adguardPass := firstNonEmpty(*adguardPassword, *password)
+	if curfewPass == "" {
 		fmt.Fprintln(os.Stderr, "curfew: warning: no -password given, so the device page will be unauthenticated.")
 		fmt.Fprintln(os.Stderr, "           A device kept off the internet can still reach that page and allow itself.")
+	}
+	if !*noAdGuard && adguardPass == "" {
+		return fmt.Errorf("no password for AdGuard.\n" +
+			"       An AdGuard with no admin account serves its whole API to every device on the LAN:\n" +
+			"       one request turns off filtering for the house, and it can come from the child's own phone.\n" +
+			"       Pass -password to set both, -adguard-password for AdGuard alone, or -no-adguard to skip it")
 	}
 
 	runner := deploy.SSHRunner{Host: host}
@@ -286,11 +308,27 @@ func cmdInstall(args []string) error {
 
 	if err := deploy.Install(runner, deploy.InstallOptions{
 		LAN: *lan, WAN: *wan, Listen: *listen,
-		User: *user, Password: *password, Timezone: zone, BinaryPath: binPath,
+		User: *user, Password: curfewPass, Timezone: zone, BinaryPath: binPath,
 		RegistryPath: *regPath, ProfilesPath: profilesPath(*regPath),
 	}); err != nil {
 		return err
 	}
+	// AdGuard AFTER the daemon, deliberately. The daemon is what enforces the
+	// allowlist and the schedules; if AdGuard setup fails, the household still
+	// ends up with working parental control and a clear message about the DNS
+	// half, rather than neither.
+	routerIP := hostAddress(host)
+	agh, aghErr := deploy.SetupAdGuard(runner, deploy.AdGuardOptions{
+		Enabled: !*noAdGuard, User: *adguardUser, Password: adguardPass, RouterIP: routerIP,
+	})
+	if aghErr != nil {
+		fmt.Fprintf(os.Stderr, "\ncurfew: AdGuard setup FAILED: %v\n", aghErr)
+		fmt.Fprintln(os.Stderr, "        Everything else is installed and enforcing. Re-run once that is fixed,")
+		fmt.Fprintln(os.Stderr, "        or pass -no-adguard to leave AdGuard alone.")
+	} else {
+		fmt.Println(agh.Summary())
+	}
+
 	// Verify against the kernel rather than trusting that the commands
 	// succeeded. An install that says "done" without checking is the failure
 	// this whole project is about.
@@ -592,4 +630,29 @@ func cmdPull(args []string) error {
 	}
 	fmt.Println(msg)
 	return nil
+}
+
+// firstNonEmpty returns the first value that is set, which is how a specific
+// flag overrides the shared one.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// hostAddress strips any user@ prefix and port from an ssh host, leaving the
+// address AdGuard should bind to and be reached on.
+func hostAddress(host string) string {
+	if i := strings.LastIndex(host, "@"); i >= 0 {
+		host = host[i+1:]
+	}
+	if i := strings.LastIndex(host, ":"); i >= 0 && !strings.Contains(host[i+1:], "]") {
+		if _, err := strconv.Atoi(host[i+1:]); err == nil {
+			host = host[:i]
+		}
+	}
+	return strings.Trim(host, "[]")
 }

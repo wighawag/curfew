@@ -59,7 +59,7 @@ ssh root@192.168.1.1 "ifstatus wan | grep l3_device"
 | Command | Runs on | What it does |
 |---|---|---|
 | `curfew import` | laptop | Build a device list from the legacy pipe-delimited config |
-| `curfew install <host>` | laptop | First-time setup: daemon, settings, service, device list |
+| `curfew install <host>` | laptop | First-time setup: daemon, settings, service, device list, AdGuard |
 | `curfew update <host>` | laptop | Update the daemon binary, keeping the router's settings and devices |
 | `curfew push <host>` | laptop | Send your local device list to the router |
 | `curfew pull <host>` | laptop | Merge the router's device list into yours |
@@ -120,7 +120,23 @@ A minute only counts if the devices actually sent something. An idle phone in a 
 
 **The activity threshold's default is a guess, and both the daemon and the settings page say so.** How many bytes a minute mean "in use" cannot be worked out from first principles; it has to be measured against the devices in your house. So the settings page shows what each profile actually sent in the last interval, for every profile including the ones with no budget, right next to the field you set. Leave the budgets off for an evening, watch the figures, and set the threshold above what your idle devices send. Until you do, expect it to be somewhat wrong in one direction or the other.
 
-Guest passes and website blocking are designed but not built. The decisions behind them are recorded in `docs/adr/` so they land as decisions rather than guesses.
+### AdGuard Home
+
+`curfew install` sets AdGuard up, or **adopts** one you installed yourself, and `-no-adguard` skips it entirely. Adoption changes exactly one thing and only when it is missing: an admin account. Your lists, your exceptions and your own login are left alone, and a backup of the config is kept.
+
+That one change is not cosmetic. **An AdGuard with no admin account serves its entire REST API to every device on your LAN.** Measured: an unauthenticated `POST /control/protection {"enabled":false}` returns `200 OK` and turns off filtering for the whole house, and the request can come from the phone being filtered. The shell script this replaces shipped exactly that. If you set AdGuard up with it, check:
+
+```sh
+ssh root@192.168.1.1 "grep -A2 '^users:' /opt/AdGuardHome/adguardhome.yaml"
+```
+
+`users: []` means open. A test asserts this as an attack that stops working: it confirms the attack succeeds first, adopts, then requires the same request to fail while a correct password still works.
+
+Passwords: `-password` sets both the device page and AdGuard, and `-curfew-password` or `-adguard-password` override it individually. When adopting an AdGuard that already has a login, pass that existing one with `-adguard-password` so curfew can talk to its API.
+
+curfew deliberately does **not** own `AdGuardHome.yaml`. AdGuard rewrites that file itself and drops anything it does not recognise, so everything else curfew does goes through the REST API. The reasoning and the measurements are in `docs/adr/0010-curfew-drives-adguard-through-its-api-and-owns-only-its-own-objects.md`.
+
+Guest passes and per-profile website blocking are designed but not built. The decisions behind them are recorded in `docs/adr/` so they land as decisions rather than guesses.
 
 ## If something goes wrong
 
