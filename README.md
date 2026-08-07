@@ -2,7 +2,47 @@
 
 Profile-based parental control system for OpenWrt on the GL.iNet Flint 2 (GL-MT6000).
 
-## Features
+> **Being rewritten in Go.** The section immediately below describes the new tool, which is where new work goes. Everything after it documents the shell implementation being replaced; treat that as the current state of the router, not as the direction. See `docs/adr/0007-the-tool-owns-every-operation-including-recovery-and-deployment.md`.
+
+## The Go tool
+
+Two binaries, and the split is a safety property rather than tidiness.
+
+**`my-router`** runs on your laptop and does three things: `install`, `push`, `pull`. It cannot enforce anything, because it does not import the enforcement code at all. Running the wrong command on a laptop therefore cannot rewrite that laptop's own firewall. A test asserts this against the real import graph, so it cannot rot.
+
+**`my-router-daemon`** runs on the router. It owns the nftables ruleset and serves the device page on port 8080.
+
+```sh
+# install (or update) the router, from your laptop
+my-router install root@192.168.1.1 --wan pppoe-wan --password <choose-one>
+
+# move the device list around
+my-router pull root@192.168.1.1     # router  -> config/local/devices.json
+my-router push root@192.168.1.1     # config/local/devices.json -> router
+```
+
+`--wan` is required and deliberately not guessed: on this router's PPPoE line the live device is `pppoe-wan`, not the configured `eth1`, and guessing it is exactly how enforcement silently matches nothing. Check with `ssh <host> ifstatus wan`.
+
+The daemon detects the router's architecture over SSH and the correct binary is cross-compiled for it, because pushing the wrong architecture produces something that cannot exec, on a device reached over the very network being configured.
+
+### What it does today
+
+The MAC allowlist, and nothing else yet. Registered devices reach the internet; unregistered ones do not. Add devices from the page at `http://<router>:8080`, giving each an optional name.
+
+The page reports, per device, what the **firewall** currently allows rather than what the saved list claims. If the two ever disagree you see it, because a green dot derived from reading back our own config file is precisely the reassurance that let the previous system report success while enforcing nothing.
+
+The daemon re-asserts the ruleset on a timer, so a table wiped by hand or by a recovery path heals itself on the next tick rather than leaving a state nothing corrects.
+
+### Running the tests
+
+```sh
+go test ./...          # unit tests, no privileges needed
+./docker/acceptance.sh # packet-path tests in a real OpenWrt image, plus the legacy suite
+```
+
+The acceptance run sends real packets through a real LAN-to-WAN topology and asserts whether they arrive, which is the only trustworthy evidence about a firewall (`docs/adr/0004-tests-assert-on-the-packet-path.md`). Go has no toolchain in that image, so the test binaries are compiled on the host and executed inside it.
+
+## Features (shell implementation, being replaced)
 
 - **Profiles**: group multiple devices (phone, laptop) per child
 - **Internet schedules**: block internet at certain times per profile
