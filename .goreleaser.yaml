@@ -1,0 +1,72 @@
+version: 2
+
+# Two binaries with deliberately different target sets.
+#
+#   my-router         runs on your LAPTOP. It only drives ssh/scp, so it builds
+#                     for whatever you run there, macOS included.
+#   my-router-daemon  runs on the ROUTER. It talks netlink to a Linux kernel,
+#                     so it is Linux-only, and it covers the architectures
+#                     OpenWrt devices actually ship (the GL-MT6000 is arm64).
+#
+# Both are CGO-free and static, so the daemon depends on nothing in the
+# router's userland.
+
+project_name: my-router
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: my-router
+    binary: my-router
+    main: .
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+
+  - id: my-router-daemon
+    binary: my-router-daemon
+    main: ./cmd/my-router-daemon
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos: [linux]
+    goarch: [amd64, arm64, mips, mipsle]
+    gomips: [softfloat] # OpenWrt MIPS targets are almost always softfloat
+
+archives:
+  # The two binaries ship in SEPARATE archives on purpose. Bundling them would
+  # invite installing the daemon on a laptop, and keeping the enforcement code
+  # off the laptop is the reason there are two binaries at all.
+  - id: my-router
+    ids: [my-router]
+    name_template: "my-router_{{ .Os }}_{{ .Arch }}"
+    files: [LICENSE, README.md]
+
+  - id: my-router-daemon
+    ids: [my-router-daemon]
+    name_template: "my-router-daemon_{{ .Os }}_{{ .Arch }}"
+    files: [LICENSE]
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  draft: false
+  prerelease: auto
