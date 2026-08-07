@@ -66,6 +66,11 @@ type Core interface {
 	// AccountingInterval is what the observed byte figure is measured over.
 	// Zero means accounting is off.
 	AccountingInterval() time.Duration
+	// MaxTicket is the longest grant that will be accepted, so the form can
+	// cap its own input instead of letting a fat-fingered number become an
+	// error message. Asked of the core rather than imported, because this
+	// package must not depend on the enforcement code.
+	MaxTicket() time.Duration
 }
 
 // Store loads and saves the device registry.
@@ -138,7 +143,10 @@ func (s *Server) authOK(r *http.Request) bool {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleHome)
+	mux.HandleFunc("/settings", s.handleSettings)
+	mux.HandleFunc("/settings/budget", s.handleBudgetSettings)
 	mux.HandleFunc("/devices/", s.handleDevicesPage)
+	mux.HandleFunc("/profiles/budget", s.handleProfileBudget)
 	mux.HandleFunc("/profiles/create", s.handleProfileCreate)
 	mux.HandleFunc("/profiles/delete", s.handleProfileDelete)
 	mux.HandleFunc("/profiles/devices", s.handleProfileDevices)

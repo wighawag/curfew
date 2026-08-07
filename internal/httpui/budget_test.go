@@ -50,7 +50,7 @@ func budgetPage(t *testing.T, st budget.State, blocked bool) string {
 
 func TestThePageShowsWhatIsLeftOfABudget(t *testing.T) {
 	body := budgetPage(t, budget.State{Usage: budget.D(90 * time.Minute)}, false)
-	for _, want := range []string{"used 1h 30m today", "2h 30m of 4h0m0s left"} {
+	for _, want := range []string{"used 1h 30m today", "2h 30m of 4h left"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("the page does not say %q\n%s", want, body)
 		}
@@ -163,7 +163,7 @@ func TestAnUnlimitedAllowanceIsNotRenderedAsZeroLeft(t *testing.T) {
 	if strings.Contains(line, "stretch") {
 		t.Errorf("an unlimited stretch must not be rendered at all, got %q", line)
 	}
-	if !strings.Contains(line, "3h of 4h0m0s left") {
+	if !strings.Contains(line, "3h of 4h left") {
 		t.Errorf("want the daily allowance, got %q", line)
 	}
 }

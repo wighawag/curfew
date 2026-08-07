@@ -100,6 +100,12 @@ A block you impose **outranks** a ticket, so a child cannot ticket their way out
 
 The page is password-gated, and that matters more than it looks: blocking applies to forwarded traffic, so the router still answers the device it is blocking. The password and the precedence above are two independent halves of stopping a child freeing themselves, and neither is sufficient alone.
 
+### Two pages, split by when you need them
+
+The **home page** answers the two questions you have with a child standing in front of you: is this child online, and can I give them twenty minutes? It is one row per profile, showing the state read off the firewall and what is left of the budget, with a block button, the preset ticket durations, and a box for any other number of minutes.
+
+Everything that configures the household lives on **`/settings`**: schedules, which devices belong to which profile, the budgets themselves, and the two household budget knobs. That split is deliberate. Configuration is a sit-down job done rarely, and every control it added to the home page was something to scroll past at the moment it was least welcome.
+
 A ticket is **gone after a reboot**, deliberately. A manual block is not.
 
 Status is read from the **firewall**, never from re-evaluating the schedule or reading back our own config. If the schedule says a profile should be blocked and the firewall disagrees, the page says exactly that instead of showing you what it hoped. A green dot derived from our own config file is precisely the reassurance that let the previous system claim to be working.
@@ -112,7 +118,7 @@ A profile can have four limits, all optional, and a profile with none of them is
 
 A minute only counts if the devices actually sent something. An idle phone in a pocket burns nothing, a blocked child burns nothing while they are blocked, and a ticket overrides a spent budget exactly as it overrides a bedtime. The decisions behind the continuity model, and the measurements behind where the counters live, are in `docs/adr/0009-the-budget-continuity-model.md`.
 
-**The activity threshold's default is a guess, and the daemon says so at every startup.** How many bytes a minute mean "in use" cannot be worked out from first principles; it has to be measured against the devices in your house. So the home page shows what each profile actually sent in the last interval, for every profile including the ones with no budget, and you set `activity_threshold_bytes_per_minute` once you have watched an idle device for an evening. Until you do, expect it to be somewhat wrong in one direction or the other.
+**The activity threshold's default is a guess, and both the daemon and the settings page say so.** How many bytes a minute mean "in use" cannot be worked out from first principles; it has to be measured against the devices in your house. So the settings page shows what each profile actually sent in the last interval, for every profile including the ones with no budget, right next to the field you set. Leave the budgets off for an evening, watch the figures, and set the threshold above what your idle devices send. Until you do, expect it to be somewhat wrong in one direction or the other.
 
 Guest passes and website blocking are designed but not built. The decisions behind them are recorded in `docs/adr/` so they land as decisions rather than guesses.
 

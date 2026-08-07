@@ -616,12 +616,24 @@ func TestHomeListsProfilesWithStatus(t *testing.T) {
 		t.Fatalf("want 200, got %d", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"eli", "adults", "22:00 to 08:00, every day (overnight)"} {
+	for _, want := range []string{"eli", "adults"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("home should mention %q", want)
 		}
 	}
+	// The schedule itself belongs to settings now: the home page answers "is
+	// this child online", and a list of windows is not that.
+	if strings.Contains(body, "22:00 to 08:00, every day (overnight)") {
+		t.Error("the home page should not carry the window list; it lives in settings")
+	}
 	assertWholePage(t, rec)
+
+	set := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(set, httptest.NewRequest(http.MethodGet, "/settings", nil))
+	assertWholePage(t, set)
+	if !strings.Contains(set.Body.String(), "22:00 to 08:00, every day (overnight)") {
+		t.Error("settings must describe the window in words a person can check")
+	}
 }
 
 // assertWholePage is the control this file was missing.
@@ -651,8 +663,10 @@ func tail(s string, n int) string {
 }
 
 // The exact shape of the shipped bug: a profile WITH a window must render its
-// remove form and everything after it.
-func TestHomeRendersCompletelyWithWindowsAndOffersBothForms(t *testing.T) {
+// remove form and everything after it. The forms moved to settings, so the
+// guard follows them; the failure it catches is a property of the template
+// engine, not of which page the template belongs to.
+func TestSettingsRendersCompletelyWithWindowsAndOffersBothForms(t *testing.T) {
 	ps := &schedule.Profiles{Profiles: []schedule.Profile{
 		{Name: "eli", Devices: []string{"aa:bb:cc:dd:ee:01"}, Windows: []schedule.Window{
 			{Days: schedule.AllDays, Start: "22:00", End: "08:00"},
@@ -663,7 +677,7 @@ func TestHomeRendersCompletelyWithWindowsAndOffersBothForms(t *testing.T) {
 	}}
 	srv, _, _ := newProfileServer(t, []registry.Device{{MAC: "aa:bb:cc:dd:ee:01"}}, ps, nil, nil)
 	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/settings", nil))
 	assertWholePage(t, rec)
 
 	body := rec.Body.String()
@@ -1142,7 +1156,7 @@ func TestAddWindowFormDefaultsToEveryDayTicked(t *testing.T) {
 	ps := &schedule.Profiles{Profiles: []schedule.Profile{{Name: "eli"}}}
 	srv, _, _ := newProfileServer(t, nil, ps, nil, nil)
 	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/settings", nil))
 	assertWholePage(t, rec)
 	body := rec.Body.String()
 	for _, d := range schedule.AllDays {
@@ -1216,13 +1230,20 @@ func TestHomeOffersABlockButtonAndTicketDurations(t *testing.T) {
 	if strings.Contains(body, `action="/profiles/unblock"`) {
 		t.Error("nothing is blocked, so no unblock button should be offered")
 	}
-	// Four durations per profile, and each must carry its OWN profile name:
-	// a shared name here would block or ticket the wrong child.
-	if got := strings.Count(body, `action="/profiles/ticket"`); got != 2*len(ticketDurations) {
-		t.Errorf("want %d ticket buttons, got %d", 2*len(ticketDurations), got)
+	// The preset durations PLUS one custom-duration form per profile, and each
+	// must carry its OWN profile name: a shared name here would block or
+	// ticket the wrong child.
+	wantForms := 2 * (len(ticketDurations) + 1)
+	if got := strings.Count(body, `action="/profiles/ticket"`); got != wantForms {
+		t.Errorf("want %d ticket forms, got %d", wantForms, got)
 	}
 	if !strings.Contains(body, `name="minutes" value="30"`) {
 		t.Error("the 30 minute tap should be there")
+	}
+	// The custom box is capped at what the core will actually accept, so the
+	// commonest way to get an error is prevented by the form.
+	if got := strings.Count(body, ` max="720"`); got != 2 {
+		t.Errorf("want a capped custom-duration box per profile, got %d", got)
 	}
 	for _, name := range []string{"eli", "dad"} {
 		if !strings.Contains(body, `<input type="hidden" name="name" value="`+name+`">`) {
@@ -1250,15 +1271,16 @@ func TestBlockingFromThePageEnforcesItAndSwapsTheControls(t *testing.T) {
 	}
 
 	body := getHome(t, srv).Body.String()
-	if !strings.Contains(body, "unblock eli") {
+	if !strings.Contains(body, `action="/profiles/unblock"`) {
 		t.Error("a blocked profile must offer the way back")
 	}
-	// Ticket buttons for eli must be gone: a ticket cannot lift this block, so
-	// offering one would be a button that does nothing.
-	if got := strings.Count(body, `action="/profiles/ticket"`); got != len(ticketDurations) {
-		t.Errorf("only dad should still offer tickets, got %d buttons", got)
+	// Ticket controls for eli must be gone: a ticket cannot lift this block,
+	// so offering one would be a button that does nothing. dad keeps the
+	// presets and the custom box.
+	if got := strings.Count(body, `action="/profiles/ticket"`); got != len(ticketDurations)+1 {
+		t.Errorf("only dad should still offer tickets, got %d forms", got)
 	}
-	if !strings.Contains(body, "Unblock first") {
+	if !strings.Contains(body, "a ticket cannot lift it") {
 		t.Error("the page should say why the ticket buttons are gone")
 	}
 }

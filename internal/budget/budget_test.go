@@ -378,3 +378,35 @@ func TestRemainingNeverGoesNegative(t *testing.T) {
 		t.Error("an unlimited profile has no remaining allowance to report")
 	}
 }
+
+// Durations are shown in input boxes and typed back, so how they RENDER is
+// part of the config surface rather than cosmetics: "4h0m0s" in a text box
+// reads like three numbers and invites someone to "fix" it.
+func TestDurationsRenderTheWayAPersonWritesThem(t *testing.T) {
+	for in, want := range map[time.Duration]string{
+		4 * time.Hour:                "4h",
+		2*time.Hour + 30*time.Minute: "2h30m",
+		10 * time.Minute:             "10m",
+		30 * time.Second:             "30s",
+		time.Minute + 30*time.Second: "1m30s",
+		time.Hour + 30*time.Second:   "1h0m30s",
+	} {
+		if got := D(in).String(); got != want {
+			t.Errorf("D(%s).String() = %q, want %q", in, got, want)
+		}
+		// The load-bearing half: whatever it renders as must parse back to
+		// the same value, or showing a budget in a form and saving it would
+		// change it.
+		back, err := ParseDuration(D(in).String())
+		if err != nil {
+			t.Errorf("%q does not parse back: %v", D(in).String(), err)
+			continue
+		}
+		if back != D(in) {
+			t.Errorf("%s rendered as %q and parsed back as %s", in, D(in).String(), back)
+		}
+	}
+	if got := D(0).Form(); got != "" {
+		t.Errorf("an unset limit must render as an empty box, got %q", got)
+	}
+}

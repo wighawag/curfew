@@ -482,6 +482,14 @@ func (c *Core) BudgetStatus() (map[string]budget.Status, error) {
 	return out, nil
 }
 
+// MaxTicket is the longest single ticket that can be granted.
+//
+// It is re-exported from internal/enforce rather than restated, so the page's
+// input cap and the rule that actually refuses a grant cannot drift apart. The
+// HTTP layer deliberately does not import the enforcement package at all, and
+// this is how it learns the number without doing so.
+func (c *Core) MaxTicket() time.Duration { return enforce.MaxTicket }
+
 // AccountingInterval reports how long an accounting interval is, so a page can
 // say what the observed byte figure is per. Zero means accounting is off.
 func (c *Core) AccountingInterval() time.Duration {

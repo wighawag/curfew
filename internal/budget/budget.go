@@ -52,8 +52,21 @@ func D(d time.Duration) Duration { return Duration(d) }
 // Std returns the underlying time.Duration.
 func (d Duration) Std() time.Duration { return time.Duration(d) }
 
-// String renders the duration compactly.
-func (d Duration) String() string { return time.Duration(d).String() }
+// String renders the duration the way a person writes it: "4h" rather than
+// Go's "4h0m0s", which reads like three separate numbers on a form.
+//
+// It still round-trips through ParseDuration, which is what lets the same
+// value be shown in an input box, typed back, and saved unchanged.
+func (d Duration) String() string {
+	s := time.Duration(d).String()
+	switch {
+	case strings.HasSuffix(s, "h0m0s"):
+		return strings.TrimSuffix(s, "0m0s")
+	case strings.HasSuffix(s, "m0s"):
+		return strings.TrimSuffix(s, "0s")
+	}
+	return s
+}
 
 // MarshalJSON writes the duration as a string.
 func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(time.Duration(d).String()) }
@@ -70,17 +83,46 @@ func (d *Duration) UnmarshalJSON(data []byte) error {
 		}
 		return fmt.Errorf("a budget must be a duration string such as \"4h\" or \"30m\", got %s", string(data))
 	}
+	v, err := ParseDuration(s)
+	if err != nil {
+		return err
+	}
+	*d = v
+	return nil
+}
+
+// ParseDuration reads a duration a person typed. An empty string is zero,
+// which is how a form clears a limit and how "unlimited" is expressed.
+//
+// A bare number is REFUSED here too, and for the same reason as in JSON: on a
+// form labelled "daily", typing 4 could mean four hours and typing 240 could
+// mean 240 minutes, and a budget silently wrong by a factor of sixty still
+// looks like a working budget. The error says what to type instead.
+func ParseDuration(s string) (Duration, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
-		*d = 0
-		return nil
+		return 0, nil
+	}
+	if _, err := strconv.ParseFloat(s, 64); err == nil {
+		return 0, fmt.Errorf("%q needs a unit: write %qh for hours or %qm for minutes", s, s, s)
 	}
 	v, err := time.ParseDuration(s)
 	if err != nil {
-		return fmt.Errorf("%q is not a duration (write it like \"4h\", \"90m\" or \"2h30m\")", s)
+		return 0, fmt.Errorf("%q is not a duration (write it like \"4h\", \"90m\" or \"2h30m\")", s)
 	}
-	*d = Duration(v)
-	return nil
+	if v < 0 {
+		return 0, fmt.Errorf("%q is negative", s)
+	}
+	return Duration(v), nil
+}
+
+// Form renders a duration for a text input: empty when unset, so a form shows
+// a blank box for "no limit" rather than "0s", which reads as "no time at all".
+func (d Duration) Form() string {
+	if d == 0 {
+		return ""
+	}
+	return d.String()
 }
 
 // Limits is one profile's budget, and every field is optional. A profile whose

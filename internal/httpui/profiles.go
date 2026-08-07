@@ -2,7 +2,6 @@ package httpui
 
 import (
 	"fmt"
-	"html/template"
 	"net/http"
 	"sort"
 	"strconv"
@@ -288,13 +287,13 @@ func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	data := homeData{
-		Profiles:   views,
-		Unassigned: unassigned,
-		Now:        time.Now().In(s.loc).Format("Mon 15:04 MST"),
-		Zone:       s.loc.String(),
-		Error:      r.URL.Query().Get("error"),
-		AllDays:    schedule.AllDays,
-		Tickets:    ticketChoices(),
+		Profiles:         views,
+		UnassignedCount:  len(unassigned),
+		Now:              time.Now().In(s.loc).Format("Mon 15:04 MST"),
+		Zone:             s.loc.String(),
+		Error:            r.URL.Query().Get("error"),
+		Tickets:          ticketChoices(),
+		MaxTicketMinutes: int(s.core.MaxTicket().Minutes()),
 	}
 	s.render(w, homeTemplate, data, "home")
 }
@@ -324,14 +323,6 @@ func (s *Server) unassignedDevices() ([]DeviceView, error) {
 		}
 	}
 	return out, nil
-}
-
-func redirectHome(w http.ResponseWriter, r *http.Request, err error) {
-	if err != nil {
-		http.Redirect(w, r, "/?error="+template.URLQueryEscaper(err.Error()), http.StatusSeeOther)
-		return
-	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 // mutateSchedule loads, applies fn, validates and saves. Every schedule change
@@ -437,7 +428,7 @@ func (s *Server) handleProfileCreate(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		s.log.Info("profile created", "name", name)
 	}
-	redirectHome(w, r, err)
+	redirectSettings(w, r, err)
 }
 
 func (s *Server) handleProfileDelete(w http.ResponseWriter, r *http.Request) {
@@ -456,7 +447,7 @@ func (s *Server) handleProfileDelete(w http.ResponseWriter, r *http.Request) {
 	// later recreated under the same name would come back mysteriously
 	// blocked by a parent who does not remember doing it.
 	if err := s.core.Unblock(name); err != nil {
-		redirectHome(w, r, err)
+		redirectSettings(w, r, err)
 		return
 	}
 	err := s.mutateSchedule(func(ps *schedule.Profiles) error {
@@ -474,7 +465,7 @@ func (s *Server) handleProfileDelete(w http.ResponseWriter, r *http.Request) {
 		// has a schedule", and it happens within a tick rather than silently.
 		s.log.Info("profile deleted", "name", name)
 	}
-	redirectHome(w, r, err)
+	redirectSettings(w, r, err)
 }
 
 // handleProfileDevices sets a profile's device membership from the checkboxes.
@@ -506,7 +497,7 @@ func (s *Server) handleProfileDevices(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		s.log.Info("profile membership changed", "name", name, "devices", len(macs))
 	}
-	redirectHome(w, r, err)
+	redirectSettings(w, r, err)
 }
 
 func (s *Server) handleWindowAdd(w http.ResponseWriter, r *http.Request) {
@@ -526,7 +517,7 @@ func (s *Server) handleWindowAdd(w http.ResponseWriter, r *http.Request) {
 	for _, d := range r.Form["day"] {
 		parsed, err := schedule.ParseDay(d)
 		if err != nil {
-			redirectHome(w, r, err)
+			redirectSettings(w, r, err)
 			return
 		}
 		days = append(days, parsed)
@@ -548,7 +539,7 @@ func (s *Server) handleWindowAdd(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		s.log.Info("window added", "profile", name, "start", start, "end", end, "days", len(days))
 	}
-	redirectHome(w, r, err)
+	redirectSettings(w, r, err)
 }
 
 func (s *Server) handleWindowRemove(w http.ResponseWriter, r *http.Request) {
@@ -578,17 +569,25 @@ func (s *Server) handleWindowRemove(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		s.log.Info("window removed", "profile", name)
 	}
-	redirectHome(w, r, err)
+	redirectSettings(w, r, err)
 }
 
 type homeData struct {
-	Profiles   []ProfileView
-	Unassigned []DeviceView
-	Now        string
-	Zone       string
-	Error      string
-	AllDays    []schedule.Day
-	Tickets    []ticketChoice
+	Profiles []ProfileView
+	Now      string
+	Zone     string
+	Error    string
+	Tickets  []ticketChoice
+	// MaxTicketMinutes bounds the custom-duration box, so the commonest way to
+	// get the error is prevented by the form rather than explained after the
+	// fact. The core enforces the same cap regardless; this is a courtesy, not
+	// the control.
+	MaxTicketMinutes int
+	// Unassigned devices belong to no profile and are therefore always
+	// allowed. Only the COUNT is shown here, as a one-line warning, because
+	// "why is this child not blocked?" is a home-page question even though
+	// fixing it is a settings-page job.
+	UnassignedCount int
 }
 
 // ticketChoice is one duration button.
@@ -604,179 +603,3 @@ func ticketChoices() []ticketChoice {
 	}
 	return out
 }
-
-var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>curfew</title>
-<style>
- body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem; max-width: 44rem; }
- h1 { font-size: 1.3rem; margin-bottom: .2rem; }
- h2 { font-size: 1.05rem; margin: 0; }
- .now { color: #666; font-size: .85rem; margin-bottom: 1.2rem; }
- .profile { border: 1px solid #ddd; border-radius: .5rem; padding: .8rem; margin-bottom: 1rem; }
- .head { display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap; }
- .state { font-weight: 600; padding: .1rem .5rem; border-radius: .3rem; font-size: .85rem; }
- .off { background: #fdecea; color: #b00020; }
- .on  { background: #e7f6ec; color: #0a7d28; }
- .drift { background: #fff4e5; color: #8a5300; border: 1px solid #f0c48a; }
- .idle { background: #eef2f7; color: #33506e; border: 1px solid #c9d6e4; }
- .warnline { background: #fff4e5; color: #8a5300; border: 1px solid #f0c48a;
-             border-radius: .3rem; padding: .35rem .5rem; margin-top: .5rem; font-size: .85rem; }
- .muted { color: #666; font-size: .85rem; }
- ul { margin: .5rem 0; padding-left: 1.1rem; }
- li { font-size: .9rem; margin-bottom: .2rem; }
- code { font-family: ui-monospace, monospace; font-size: .85rem; }
- form { margin: 0; }
- .row { display: flex; gap: .3rem; flex-wrap: wrap; align-items: center; margin-top: .4rem; }
- input[type=time], input[type=text] { padding: .35rem; font-size: .9rem; }
- button { padding: .35rem .6rem; font-size: .85rem; }
- .danger { color: #b00020; }
- .actions { display: flex; gap: .4rem; flex-wrap: wrap; align-items: center;
-            margin-top: .6rem; padding-top: .6rem; border-top: 1px dashed #e2e2e2; }
- .actions form { display: inline; }
- .block { padding: .45rem .8rem; font-weight: 600; color: #b00020; border: 1px solid #f0b6bd;
-          background: #fdecea; border-radius: .3rem; }
- .unblock { padding: .45rem .8rem; font-weight: 600; color: #0a7d28; border: 1px solid #a9dcb9;
-            background: #e7f6ec; border-radius: .3rem; }
- .tickets { display: flex; gap: .3rem; flex-wrap: wrap; align-items: center; margin-top: .5rem; }
- .tickets button { padding: .45rem .7rem; }
- .days label { font-size: .8rem; margin-right: .4rem; white-space: nowrap; }
- .err { background: #fdecea; color: #b00020; padding: .6rem; margin-bottom: 1rem; }
- details { margin-top: .6rem; }
- summary { font-size: .85rem; cursor: pointer; color: #333; }
-</style>
-</head>
-<body>
-<h1>curfew</h1>
-<div class="now">{{.Now}} ({{.Zone}}) &middot; <a href="/devices/">all devices</a></div>
-{{if .Error}}<div class="err">{{.Error}}</div>{{end}}
-
-{{range $p := .Profiles}}
-<div class="profile">
-  <div class="head">
-    <h2>{{.Name}}</h2>
-    <span class="state {{.StateClass}}">{{.StateLabel}}</span>
-    <span class="muted">{{if not .Drifted}}{{.Reason}}{{end}}</span>
-  </div>
-  {{if .NeedsDevices}}<div class="warnline">{{.Warning}}</div>{{end}}
-  {{if .Budget}}<div class="muted">budget: {{.Budget}}</div>{{end}}
-  {{if .Observed}}<div class="muted">{{.Observed}}</div>{{end}}
-
-  <div class="actions">
-    {{if .ManuallyBlocked}}
-      <form method="POST" action="/profiles/unblock">
-        <input type="hidden" name="name" value="{{.Name}}">
-        <button type="submit" class="unblock">unblock {{.Name}}</button>
-      </form>
-      <span class="muted">off until you lift it. Lifting it leaves any bedtime window in force.</span>
-    {{else}}
-      <form method="POST" action="/profiles/block">
-        <input type="hidden" name="name" value="{{.Name}}">
-        <button type="submit" class="block">block {{.Name}}</button>
-      </form>
-      <span class="muted">off until you say otherwise. Cancels any ticket.</span>
-    {{end}}
-  </div>
-
-  {{if .ManuallyBlocked}}
-  <div class="muted" style="margin-top:.5rem">Unblock first to give {{.Name}} time:
-    a ticket cannot lift a block you imposed.</div>
-  {{else}}
-  <div class="tickets">
-    <span class="muted">give time:</span>
-    {{range $.Tickets}}
-    <form method="POST" action="/profiles/ticket">
-      <input type="hidden" name="name" value="{{$p.Name}}">
-      <input type="hidden" name="minutes" value="{{.Minutes}}">
-      <button type="submit">{{.Label}}</button>
-    </form>
-    {{end}}
-    {{if $p.TicketLeft}}<span class="muted">{{$p.TicketLeft}} left; tapping again adds a fresh ticket</span>{{end}}
-  </div>
-  {{end}}
-
-  <ul>
-  {{range $i, $w := .Windows}}
-    <li>{{$w}}
-      <form method="POST" action="/profiles/window/remove" style="display:inline">
-        <input type="hidden" name="name" value="{{$p.Name}}">
-        <input type="hidden" name="index" value="{{$i}}">
-        <button type="submit" class="danger">remove</button>
-      </form>
-    </li>
-  {{else}}
-    <li class="muted">no blocked windows: always allowed</li>
-  {{end}}
-  </ul>
-
-  <details>
-    <summary>add a blocked window</summary>
-    <form method="POST" action="/profiles/window/add">
-      <input type="hidden" name="name" value="{{.Name}}">
-      <div class="row days">
-        {{range $.AllDays}}<label><input type="checkbox" name="day" value="{{.}}" checked>{{.}}</label>{{end}}
-      </div>
-      <div class="row">
-        from <input type="time" name="start" value="22:00" required>
-        to <input type="time" name="end" value="08:00" required>
-        <button type="submit">add</button>
-      </div>
-      <div class="muted">An end earlier than the start runs overnight, and belongs to the day it starts on.</div>
-    </form>
-  </details>
-
-  <details>
-    <summary>devices in this profile ({{len .Devices}})</summary>
-    <form method="POST" action="/profiles/devices">
-      <input type="hidden" name="name" value="{{.Name}}">
-      {{range .Devices}}
-      <div><label><input type="checkbox" name="mac" value="{{.MAC}}" checked>
-        {{if .Name}}{{.Name}}{{else}}<span class="muted">unnamed</span>{{end}}
-        <code>{{.MAC}}</code></label></div>
-      {{end}}
-      {{range $.Unassigned}}
-      <div><label><input type="checkbox" name="mac" value="{{.MAC}}">
-        {{if .Name}}{{.Name}}{{else}}<span class="muted">unnamed</span>{{end}}
-        <code>{{.MAC}}</code> <span class="muted">(in no profile)</span></label></div>
-      {{end}}
-      <div class="row"><button type="submit">save membership</button></div>
-    </form>
-  </details>
-
-  <details>
-    <summary class="danger">delete this profile</summary>
-    <form method="POST" action="/profiles/delete"
-          onsubmit="return confirm('Delete {{.Name}}? Its devices go back to being always allowed.')">
-      <input type="hidden" name="name" value="{{.Name}}">
-      <div class="row"><button type="submit" class="danger">delete {{.Name}}</button></div>
-    </form>
-  </details>
-</div>
-{{else}}
-<p class="muted">No profiles yet. A device in no profile is always allowed.</p>
-{{end}}
-
-<div class="profile">
-  <h2 style="font-size:.95rem">New profile</h2>
-  <form method="POST" action="/profiles/create">
-    <div class="row">
-      <input type="text" name="name" placeholder="eli" required autocapitalize="none" autocomplete="off">
-      <button type="submit">create</button>
-    </div>
-  </form>
-</div>
-
-{{if .Unassigned}}
-<p class="muted">{{len .Unassigned}} registered device(s) are in no profile, so they are always allowed.</p>
-{{end}}
-<p class="muted">Blocked/allowed is read from the firewall itself. If it ever disagrees with
-the schedule, this page says so rather than showing you what it hoped.</p>
-<p class="muted">A block you impose outranks a ticket, so a ticket cannot undo it, and
-blocking cancels any ticket already running. To end a ticket early, block and then unblock.
-Tickets are held by the kernel and are gone after a reboot; a block you impose is not.</p>
-</body>
-</html>
-`))
