@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/wighawag/curfew/internal/budget"
 )
 
 // at builds a local time on a known weekday. 2026-08-03 is a Monday, so the
@@ -257,5 +259,59 @@ func TestDescribe(t *testing.T) {
 		if got := w.Describe(); got != want {
 			t.Errorf("Describe() = %q, want %q", got, want)
 		}
+	}
+}
+
+// Budgets are configured by editing profiles.json, and `curfew pull`
+// re-serialises that file through this struct rather than copying it. So a
+// field this package forgets to carry is not merely unsaved: pulling would
+// silently STRIP every budget in the household from the local copy, and the
+// next push would send the stripped version back.
+//
+// That makes the round trip the load-bearing property of the config path, and
+// worth pinning separately from the fields being read correctly once.
+func TestBudgetsSurviveTheRoundTripThatPullPerforms(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "profiles.json")
+	in := &Profiles{
+		Profiles: []Profile{{
+			Name:    "eli",
+			Devices: []string{"aa:bb:cc:dd:ee:01"},
+			Windows: []Window{{Days: AllDays, Start: "22:00", End: "08:00"}},
+			Budget: budget.Limits{
+				Daily: budget.D(4 * time.Hour), Continuous: budget.D(2 * time.Hour),
+				Gap: budget.D(10 * time.Minute), ResetGap: budget.D(30 * time.Minute),
+			},
+		}},
+		Budget: budget.Settings{ResetTime: "04:00", ActivityThresholdBytesPerMinute: 12345},
+	}
+	if err := Save(path, in); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	back, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if back.Profiles[0].Budget != in.Profiles[0].Budget {
+		t.Errorf("a pull would strip the per-profile budget: %+v", back.Profiles[0].Budget)
+	}
+	if back.Budget != in.Budget {
+		t.Errorf("a pull would strip the household budget settings: %+v", back.Budget)
+	}
+	// Equal decides whether push and pull think the two sides agree. If it
+	// ignored budgets, a budget changed on the router would read as "already
+	// in step" and be overwritten by the next push without a word.
+	if !Equal(in, back) {
+		t.Error("Equal says a faithful round trip differs")
+	}
+	changed := *in
+	changed.Profiles = []Profile{in.Profiles[0]}
+	changed.Profiles[0].Budget.Daily = budget.D(3 * time.Hour)
+	if Equal(in, &changed) {
+		t.Error("Equal ignores a changed budget, so push and pull would silently discard one")
+	}
+	settings := *in
+	settings.Budget.ResetTime = "05:00"
+	if Equal(in, &settings) {
+		t.Error("Equal ignores a changed reset time, so one side would keep the other's day boundary")
 	}
 }
