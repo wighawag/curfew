@@ -481,7 +481,7 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
     <form method="POST" action="/profiles/window/add">
       <input type="hidden" name="name" value="{{.Name}}">
       <div class="row days">
-        {{range $.AllDays}}<label><input type="checkbox" name="day" value="{{.}}">{{.}}</label>{{end}}
+        {{range $.AllDays}}<label><input type="checkbox" name="day" value="{{.}}" checked>{{.}}</label>{{end}}
       </div>
       <div class="row">
         from <input type="time" name="start" value="22:00" required>

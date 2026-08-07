@@ -91,7 +91,13 @@ func minutes(hhmm string) (int, error) {
 // than reinterpreted.
 func (w Window) Validate() error {
 	if len(w.Days) == 0 {
-		return errors.New("a window needs at least one day")
+		// Deliberately an error rather than "no days means every day". An
+		// unspecified field silently meaning "everything" is precisely the
+		// busybox crond behaviour that made the previous system's schedules
+		// untrustworthy (see the finding on it), and `"days": []` in the file
+		// would read as "never" to anyone looking. The form ticks every day by
+		// default instead, so the data stays explicit.
+		return errors.New("a window needs at least one day: tick the days it should apply on")
 	}
 	seen := map[Day]bool{}
 	for _, d := range w.Days {

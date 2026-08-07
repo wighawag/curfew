@@ -953,3 +953,46 @@ func TestFullyBlockedProfileIsNotDrift(t *testing.T) {
 			views[0].Drifted(), views[0].Reason)
 	}
 }
+
+// The add-window form must arrive with every day ticked.
+//
+// The alternative, treating "no days" as "every day", is rejected on purpose:
+// an unspecified field silently meaning everything is the exact busybox crond
+// behaviour that made the old schedules untrustworthy, and `"days": []` would
+// read as "never" to anyone opening the config.
+func TestAddWindowFormDefaultsToEveryDayTicked(t *testing.T) {
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{{Name: "eli"}}}
+	srv, _, _ := newProfileServer(t, nil, ps, nil, nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	assertWholePage(t, rec)
+	body := rec.Body.String()
+	for _, d := range schedule.AllDays {
+		want := `name="day" value="` + string(d) + `" checked`
+		if !strings.Contains(body, want) {
+			t.Errorf("%s should be ticked by default", d)
+		}
+	}
+	if got := strings.Count(body, `name="day"`); got != len(schedule.AllDays) {
+		t.Errorf("want %d day checkboxes, got %d", len(schedule.AllDays), got)
+	}
+}
+
+// And unticking them all is still refused, with a message that says what to do.
+func TestSubmittingNoDaysIsStillAnError(t *testing.T) {
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{{Name: "eli"}}}
+	srv, sch, _ := newProfileServer(t, nil, ps, nil, nil)
+	rec := post(t, srv.Handler(), "/profiles/window/add", url.Values{
+		"name": {"eli"}, "start": {"22:00"}, "end": {"08:00"}})
+	loc := rec.Header().Get("Location")
+	if !strings.Contains(loc, "error=") {
+		t.Fatal("a window with no days must be refused, not silently made every-day")
+	}
+	if !strings.Contains(loc, "tick+the+days") && !strings.Contains(loc, "tick%20the%20days") {
+		t.Errorf("the error should say what to do, got %q", loc)
+	}
+	p, _ := sch.ps.Find("eli")
+	if len(p.Windows) != 0 {
+		t.Error("nothing should have been saved")
+	}
+}
