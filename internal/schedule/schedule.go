@@ -352,3 +352,45 @@ func sameSet(a, b []Day) bool {
 	}
 	return true
 }
+
+// Equal reports whether two schedules are the same, order-insensitively for
+// profiles but order-sensitively for a profile's windows, since a window list
+// is authored and its order is what a person sees on the page.
+func Equal(a, b *Profiles) bool {
+	ai, bi := map[string]Profile{}, map[string]Profile{}
+	if a != nil {
+		for _, p := range a.Profiles {
+			ai[p.Name] = p
+		}
+	}
+	if b != nil {
+		for _, p := range b.Profiles {
+			bi[p.Name] = p
+		}
+	}
+	if len(ai) != len(bi) {
+		return false
+	}
+	for name, pa := range ai {
+		pb, ok := bi[name]
+		if !ok || len(pa.Windows) != len(pb.Windows) || len(pa.Devices) != len(pb.Devices) {
+			return false
+		}
+		for i := range pa.Windows {
+			if pa.Windows[i].Start != pb.Windows[i].Start || pa.Windows[i].End != pb.Windows[i].End ||
+				!sameSet(pa.Windows[i].Days, pb.Windows[i].Days) {
+				return false
+			}
+		}
+		da := append([]string(nil), pa.Devices...)
+		db := append([]string(nil), pb.Devices...)
+		sort.Strings(da)
+		sort.Strings(db)
+		for i := range da {
+			if da[i] != db[i] {
+				return false
+			}
+		}
+	}
+	return true
+}

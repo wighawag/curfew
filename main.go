@@ -19,6 +19,7 @@ import (
 	"github.com/wighawag/curfew/internal/deploy"
 	"github.com/wighawag/curfew/internal/legacyconfig"
 	"github.com/wighawag/curfew/internal/registry"
+	"github.com/wighawag/curfew/internal/schedule"
 )
 
 func main() {
@@ -109,6 +110,89 @@ func basePath(registryPath string) string {
 	return filepath.Join(filepath.Dir(registryPath), ".devices.base.json")
 }
 
+// profilesPath sits next to the device list, mirroring the router's layout.
+func profilesPath(registryPath string) string {
+	return filepath.Join(filepath.Dir(registryPath), "profiles.json")
+}
+
+func profilesBasePath(registryPath string) string {
+	return filepath.Join(filepath.Dir(registryPath), ".profiles.base.json")
+}
+
+// syncProfiles moves the schedule in one direction, with the same
+// last-agreed guard the device list uses.
+//
+// Schedules are compared and taken WHOLE rather than merged entry by entry.
+// A structured merge of windows is a real piece of work and would mostly
+// invent decisions nobody asked for; refusing and naming the two sides is
+// honest, and the file is small enough to reconcile by hand.
+func syncProfiles(runner deploy.Runner, regPath string, pull, force bool) (string, error) {
+	local, err := schedule.Load(profilesPath(regPath))
+	if err != nil {
+		return "", err
+	}
+	base, err := schedule.Load(profilesBasePath(regPath))
+	if err != nil {
+		return "", err
+	}
+	tmp, err := os.CreateTemp("", "curfew-profiles-*.json")
+	if err != nil {
+		return "", err
+	}
+	tmp.Close()
+	defer os.Remove(tmp.Name())
+	present, err := deploy.FetchFile(runner, deploy.RemoteProfiles, tmp.Name())
+	if err != nil {
+		return "", err
+	}
+	remote := &schedule.Profiles{Profiles: []schedule.Profile{}}
+	if present {
+		if remote, err = schedule.Load(tmp.Name()); err != nil {
+			return "", fmt.Errorf("the router's schedule is unusable: %w", err)
+		}
+	}
+
+	localChanged := !schedule.Equal(local, base)
+	remoteChanged := !schedule.Equal(remote, base)
+
+	switch {
+	case schedule.Equal(local, remote):
+		if err := schedule.Save(profilesBasePath(regPath), remote); err != nil {
+			return "", err
+		}
+		return "schedule already in step", nil
+	case pull:
+		if localChanged && remoteChanged && !force {
+			return "", fmt.Errorf("the schedule changed on BOTH sides since the last sync.\n" +
+				"       Schedules are taken whole, not merged, so pick one:\n" +
+				"         curfew pull <host> --force   # the router's schedule wins\n" +
+				"         curfew push <host> --force   # your local schedule wins")
+		}
+		if !remoteChanged && !force {
+			return "schedule unchanged on the router", nil
+		}
+		if err := schedule.Save(profilesPath(regPath), remote); err != nil {
+			return "", err
+		}
+		if err := schedule.Save(profilesBasePath(regPath), remote); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("pulled %d profile(s)", len(remote.Profiles)), nil
+	default: // push
+		if remoteChanged && !force {
+			return "", fmt.Errorf("the router's schedule changed since your last sync, so pushing " +
+				"would discard it.\n       Run 'curfew pull' first, or push --force to overwrite it")
+		}
+		if err := deploy.PushFile(runner, profilesPath(regPath), deploy.RemoteProfiles); err != nil {
+			return "", err
+		}
+		if err := schedule.Save(profilesBasePath(regPath), local); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("pushed %d profile(s)", len(local.Profiles)), nil
+	}
+}
+
 func conflictPath(registryPath string) string {
 	return filepath.Join(filepath.Dir(registryPath), "devices.conflict.txt")
 }
@@ -185,7 +269,7 @@ func cmdInstall(args []string) error {
 	if err := deploy.Install(runner, deploy.InstallOptions{
 		LAN: *lan, WAN: *wan, Listen: *listen,
 		User: *user, Password: *password, BinaryPath: binPath,
-		RegistryPath: *regPath,
+		RegistryPath: *regPath, ProfilesPath: profilesPath(*regPath),
 	}); err != nil {
 		return err
 	}
@@ -371,7 +455,13 @@ func cmdPush(args []string) error {
 	}
 	_ = os.Remove(conflictPath(*path))
 	fmt.Printf("pushed %d device(s) to %s\n", len(local.Devices), host)
-	return nil
+
+	msg, err := syncProfiles(runner, *path, false, *force)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s\n", msg)
+	return deploy.Restart(runner)
 }
 
 func cmdPull(args []string) error {
@@ -397,6 +487,11 @@ func cmdPull(args []string) error {
 		}
 		_ = os.Remove(conflictPath(*path))
 		fmt.Printf("pulled %d device(s) from %s, discarding local changes\n", len(remote.Devices), host)
+		msg, err := syncProfiles(runner, *path, true, true)
+		if err != nil {
+			return err
+		}
+		fmt.Println(msg)
 		return nil
 	}
 
@@ -439,5 +534,14 @@ func cmdPull(args []string) error {
 	if !registry.Equal(merged, remote) {
 		fmt.Printf("your list now differs from the router; run 'curfew push %s' to send it\n", host)
 	}
+
+	// The schedule lives in its own file and must be synced too, or a profile
+	// created on the router is invisible on the laptop and a later push wipes
+	// it. That gap shipped once.
+	msg, err := syncProfiles(runner, *path, true, false)
+	if err != nil {
+		return err
+	}
+	fmt.Println(msg)
 	return nil
 }

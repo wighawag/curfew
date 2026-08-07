@@ -3,6 +3,7 @@ package httpui
 import (
 	"encoding/json"
 	"errors"
+	"html/template"
 	"io"
 	"log/slog"
 	"net/http"
@@ -479,6 +480,81 @@ func TestHomeListsProfilesWithStatus(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("home should mention %q", want)
 		}
+	}
+	assertWholePage(t, rec)
+}
+
+// assertWholePage is the control this file was missing.
+//
+// html/template writes as it goes, so a template error halfway through used to
+// leave a 200 with a truncated body. A real bug shipped that way: everything
+// after the first profile's first window silently vanished, including the
+// add-window and create-profile forms, while status checks and any assertion
+// on a string near the top of the page still passed. Checking the page is
+// COMPLETE is what makes that visible.
+func assertWholePage(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "</html>") {
+		t.Fatalf("the page is truncated, so the template failed mid-render:\n...%s",
+			tail(rec.Body.String(), 200))
+	}
+}
+
+func tail(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
+}
+
+// The exact shape of the shipped bug: a profile WITH a window must render its
+// remove form and everything after it.
+func TestHomeRendersCompletelyWithWindowsAndOffersBothForms(t *testing.T) {
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{
+		{Name: "eli", Devices: []string{"aa:bb:cc:dd:ee:01"}, Windows: []schedule.Window{
+			{Days: schedule.AllDays, Start: "22:00", End: "08:00"},
+			{Days: []schedule.Day{schedule.Mon}, Start: "12:00", End: "13:00"},
+		}},
+		{Name: "tia", Windows: []schedule.Window{
+			{Days: []schedule.Day{schedule.Wed, schedule.Fri}, Start: "14:00", End: "16:00"}}},
+	}}
+	srv, _, _ := newProfileServer(t, []registry.Device{{MAC: "aa:bb:cc:dd:ee:01"}}, ps, nil, nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	assertWholePage(t, rec)
+
+	body := rec.Body.String()
+	// One add-window form per profile, and the create form, must all survive.
+	if got := strings.Count(body, `action="/profiles/window/add"`); got != 2 {
+		t.Errorf("want an add-window form for each of the 2 profiles, got %d", got)
+	}
+	if got := strings.Count(body, `action="/profiles/create"`); got != 1 {
+		t.Errorf("want the create-profile form, got %d", got)
+	}
+	// Each window needs a remove form carrying its OWN profile name.
+	if got := strings.Count(body, `action="/profiles/window/remove"`); got != 3 {
+		t.Errorf("want a remove form per window (3), got %d", got)
+	}
+	if !strings.Contains(body, `name="name" value="eli"`) || !strings.Contains(body, `name="name" value="tia"`) {
+		t.Error("remove forms must carry the profile they belong to, not the page data")
+	}
+}
+
+// A template that cannot render must be a 500, never a plausible-looking
+// partial page.
+func TestBrokenTemplateFailsLoudlyInsteadOfTruncating(t *testing.T) {
+	srv, _, _ := newProfileServer(t, nil, &schedule.Profiles{}, nil, nil)
+	broken := template.Must(template.New("x").Parse(`<p>{{.NoSuchField}}</p>`))
+	rec := httptest.NewRecorder()
+	srv.render(rec, broken, homeData{}, "test")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("want 500, got %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "<p>") {
+		t.Error("no partial output should reach the client")
 	}
 }
 

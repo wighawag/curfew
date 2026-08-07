@@ -132,9 +132,7 @@ func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
 		Error:      r.URL.Query().Get("error"),
 		AllDays:    schedule.AllDays,
 	}
-	if err := homeTemplate.Execute(w, data); err != nil {
-		s.log.Error("writing home", "error", err)
-	}
+	s.render(w, homeTemplate, data, "home")
 }
 
 // unassignedDevices are registered devices in no profile. They are always
@@ -393,7 +391,7 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
 <div class="now">{{.Now}} &middot; <a href="/devices/">all devices</a></div>
 {{if .Error}}<div class="err">{{.Error}}</div>{{end}}
 
-{{range .Profiles}}
+{{range $p := .Profiles}}
 <div class="profile">
   <div class="head">
     <h2>{{.Name}}</h2>
@@ -411,7 +409,7 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
   {{range $i, $w := .Windows}}
     <li>{{$w}}
       <form method="POST" action="/profiles/window/remove" style="display:inline">
-        <input type="hidden" name="name" value="{{$.Name}}">
+        <input type="hidden" name="name" value="{{$p.Name}}">
         <input type="hidden" name="index" value="{{$i}}">
         <button type="submit" class="danger">remove</button>
       </form>

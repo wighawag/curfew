@@ -9,6 +9,7 @@
 package httpui
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -118,6 +119,26 @@ func (s *Server) withNoStore(next http.Handler) http.Handler {
 	})
 }
 
+// render executes a template into a BUFFER before writing a byte of response.
+//
+// This is not tidiness. html/template writes as it goes, so a template error
+// halfway through leaves a 200 with a truncated page: the browser shows
+// something plausible with the rest of the form silently missing, and any test
+// asserting on status or on a string near the top passes. That is exactly how
+// a real bug shipped here. Buffering turns the same failure into a 500 and a
+// log line, which is the difference between a lie and an error.
+func (s *Server) render(w http.ResponseWriter, t *template.Template, data any, what string) {
+	var buf bytes.Buffer
+	if err := t.Execute(&buf, data); err != nil {
+		s.log.Error("rendering "+what, "error", err)
+		http.Error(w, "failed to render the page", http.StatusInternalServerError)
+		return
+	}
+	if _, err := buf.WriteTo(w); err != nil {
+		s.log.Error("writing "+what, "error", err)
+	}
+}
+
 // view joins the registry (names) with the firewall (truth).
 func (s *Server) view() ([]DeviceView, error) {
 	reg, err := s.store.Load()
@@ -185,9 +206,7 @@ func (s *Server) handleDevicesPage(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	data := pageData{Devices: devices, Error: r.URL.Query().Get("error")}
-	if err := indexTemplate.Execute(w, data); err != nil {
-		s.log.Error("writing index", "error", err)
-	}
+	s.render(w, indexTemplate, data, "devices")
 }
 
 // handleAddDevice registers a device and reconciles the firewall.

@@ -259,6 +259,8 @@ type InstallOptions struct {
 	// RegistryPath is the local device list, shipped only when the router has
 	// none, so a first install never starts with an empty allowlist.
 	RegistryPath string
+	// ProfilesPath is the local schedule, shipped on the same terms.
+	ProfilesPath string
 }
 
 // Install puts the daemon on the router, writes its settings and service
@@ -313,6 +315,24 @@ func Install(r Runner, opt InstallOptions) error {
 	}
 	if _, err := r.Run(fmt.Sprintf("[ -f %s ] || printf '%%s\\n' '{\"devices\":[]}' > %s",
 		RemoteRegistry, RemoteRegistry)); err != nil {
+		return err
+	}
+
+	// Same rule for the schedule: seed it only if the router has none, so an
+	// install never discards profiles created on the router's own page.
+	remoteSched, err := r.Run(fmt.Sprintf("[ -s %s ] && echo yes || echo no", RemoteProfiles))
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(remoteSched) != "yes" && opt.ProfilesPath != "" {
+		if _, statErr := os.Stat(opt.ProfilesPath); statErr == nil {
+			if err := r.Upload(opt.ProfilesPath, RemoteProfiles); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := r.Run(fmt.Sprintf("[ -f %s ] || printf '%%s\\n' '{\"profiles\":[]}' > %s",
+		RemoteProfiles, RemoteProfiles)); err != nil {
 		return err
 	}
 
@@ -402,6 +422,41 @@ func Verify(r Runner) (int, error) {
 		}
 	}
 	return count, nil
+}
+
+// FetchFile reads a remote file into localPath, reporting whether it existed
+// at all so "the router has none yet" is distinguishable from "the download
+// failed", which would otherwise be treated as empty and quietly wipe data.
+func FetchFile(r Runner, remotePath, localPath string) (bool, error) {
+	out, err := r.Run(fmt.Sprintf("[ -s %s ] && echo yes || echo no", remotePath))
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(out) != "yes" {
+		return false, nil
+	}
+	if err := r.Download(remotePath, localPath); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// PushFile copies a local file to a remote path.
+func PushFile(r Runner, localPath, remotePath string) error {
+	if _, err := os.Stat(localPath); err != nil {
+		return fmt.Errorf("local file: %w", err)
+	}
+	if _, err := r.Run("mkdir -p " + RemoteConfDir); err != nil {
+		return err
+	}
+	return r.Upload(localPath, remotePath)
+}
+
+// Restart reloads the daemon so a pushed change takes effect now rather than
+// at the next reconcile tick.
+func Restart(r Runner) error {
+	_, err := r.Run(RemoteInit + " restart")
+	return err
 }
 
 // FetchRegistry reads the router's device list into localPath. It reports
