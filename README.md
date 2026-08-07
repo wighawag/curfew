@@ -63,6 +63,7 @@ ssh root@192.168.1.1 "ifstatus wan | grep l3_device"
 | `curfew update <host>` | laptop | Update the daemon binary, keeping the router's settings and devices |
 | `curfew push <host>` | laptop | Send your local device list to the router |
 | `curfew pull <host>` | laptop | Merge the router's device list into yours |
+| `curfew probe <host>` | laptop | Check the router's kernel still supports tickets |
 | `curfew version` | laptop | Print the version |
 | `curfew-daemon -version` | router | Print the version running on the router |
 
@@ -117,6 +118,16 @@ ssh root@192.168.1.1 '/etc/init.d/curfew stop'     # or it reconciles straight b
 ```
 
 The daemon deliberately leaves the ruleset in place when it exits. Stopping it must not silently open the household's internet; removing policy is an explicit act.
+
+### If a ticket behaves oddly
+
+```sh
+curfew probe root@192.168.1.1
+```
+
+Tickets are nftables elements with **kernel** timeouts, carried across a whole-table rebuild with the time they have left, and all of that is the kernel's behaviour rather than this program's. The test suite measures it on the kernel of whatever machine built the tests, which says nothing about your router after a firmware upgrade or on a new board. This asks the router itself, and prints what it found.
+
+It is safe to run at any time, including with the family online. It works in its own table, creates no chain and no hook, so no packet is ever matched against it, and it removes that table when it finishes. A packet-path test asserts exactly that: a blocked device stays blocked and the enforcement ruleset comes out byte for byte identical.
 
 ## Where things live on the router
 

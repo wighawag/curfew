@@ -18,6 +18,10 @@ rm -f .acceptance/*.test .acceptance/curfew-daemon
 CGO_ENABLED=0 go test -c -o .acceptance/enforce.test ./internal/enforce
 CGO_ENABLED=0 go test -c -o .acceptance/policy.test ./internal/policy
 
+# The kernel probe both measures a kernel and claims to be safe on a live
+# router. The second half is a packet-path assertion, so it belongs here.
+CGO_ENABLED=0 go test -c -o .acceptance/kernelprobe.test ./internal/kernelprobe
+
 # The daemon's own boot path is tested by RUNNING the daemon, so the binary
 # ships alongside its test. Nothing else covers that startup order, and it is
 # where the system this replaces failed: it came up and enforced nothing.

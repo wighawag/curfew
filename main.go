@@ -34,6 +34,7 @@ Usage:
   curfew update <host> [flags]    update the daemon binary, keeping its settings
   curfew push <host> [flags]      send your local device list to the router
   curfew pull <host> [flags]      merge the router's device list into yours
+  curfew probe <host>             check the router's KERNEL still supports tickets
   curfew version
 
 The host is an ssh destination, for example root@192.168.1.1.
@@ -63,6 +64,8 @@ func run(args []string) int {
 		err = cmdPush(rest)
 	case "pull":
 		err = cmdPull(rest)
+	case "probe":
+		err = cmdProbe(rest)
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 		return 0
@@ -426,6 +429,36 @@ func cmdUpdate(args []string) error {
 	}
 	fmt.Printf("updated %s (%s)\n", host, arch)
 	fmt.Printf("the firewall is enforcing an allowlist of %d device(s)\n", count)
+	return nil
+}
+
+// cmdProbe asks the ROUTER's own daemon binary to measure its kernel.
+//
+// The measurement has to happen on the router, because the thing in question
+// is that kernel's behaviour, and this laptop's kernel says nothing about it.
+// So this is a thin driver: it runs the already-installed daemon with -probe
+// and relays what it says. Nothing about enforcement is touched, by design of
+// the probe rather than by care taken here.
+//
+// Worth running after a firmware upgrade, on a new board, or whenever a ticket
+// behaves oddly, because the test suite measures the kernel of whatever
+// machine built it and cannot speak for this one.
+func cmdProbe(args []string) error {
+	fs := flag.NewFlagSet("probe", flag.ContinueOnError)
+	host, err := hostAndFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	runner := deploy.SSHRunner{Host: host}
+	out, runErr := runner.Run(deploy.RemoteBinary + " -probe")
+	fmt.Print(out)
+	if runErr != nil {
+		if strings.Contains(runErr.Error(), "flag provided but not defined") {
+			return fmt.Errorf("the daemon on %s is too old to know -probe. Run 'curfew update %s' first",
+				host, host)
+		}
+		return fmt.Errorf("the probe reported a problem on %s: %w", host, runErr)
+	}
 	return nil
 }
 

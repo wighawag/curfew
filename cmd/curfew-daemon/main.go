@@ -28,6 +28,7 @@ import (
 	"github.com/wighawag/curfew/internal/blockstate"
 	"github.com/wighawag/curfew/internal/enforce"
 	"github.com/wighawag/curfew/internal/httpui"
+	"github.com/wighawag/curfew/internal/kernelprobe"
 	"github.com/wighawag/curfew/internal/policy"
 	"github.com/wighawag/curfew/internal/registry"
 	"github.com/wighawag/curfew/internal/schedule"
@@ -87,6 +88,9 @@ func run(args []string, stderr *os.File) int {
 	fs.StringVar(&opt.timezone, "timezone", envOr("CURFEW_TZ", ""),
 		"IANA timezone for schedules, e.g. Europe/London (default: the system zone, which on OpenWrt is UTC)")
 	showVersion := fs.Bool("version", false, "print the version and exit")
+	probe := fs.Bool("probe", false,
+		"measure whether this KERNEL supports what tickets rely on, then exit. "+
+			"Safe on a live router: it works in its own table with no chain and no hook")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -94,6 +98,10 @@ func run(args []string, stderr *os.File) int {
 	if *showVersion {
 		fmt.Println(version)
 		return 0
+	}
+
+	if *probe {
+		return runProbe(stderr)
 	}
 
 	log := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -199,6 +207,35 @@ func run(args []string, stderr *os.File) int {
 	// must not open the household's internet; removing policy is what the
 	// panic path is for, and it is an explicit choice rather than a side
 	// effect of a process dying.
+	return 0
+}
+
+// runProbe measures the kernel and prints what it found.
+//
+// It deliberately does not start the daemon, read any config or touch the
+// enforcement table, so it can be run on a live router at any time to answer
+// "is this board still one where tickets work?". That question stops being
+// answered by the test suite the moment the hardware or the firmware changes,
+// because the suite runs against the kernel of whatever machine builds it.
+func runProbe(stderr *os.File) int {
+	report, err := kernelprobe.Run()
+	if err != nil {
+		// Could not complete, which is NOT the same as a fact being false, so
+		// it gets its own exit code rather than being printed as a failure.
+		fmt.Fprintf(stderr, "curfew-daemon -probe: %v\n", err)
+		fmt.Fprintln(stderr, "the probe could not finish, so this says NOTHING about the kernel")
+		return 2
+	}
+	fmt.Print(report.String())
+	left, err := kernelprobe.Present()
+	if err == nil && left {
+		fmt.Fprintf(stderr, "WARNING: the probe table is still present. Remove it with: nft delete table inet %s\n",
+			kernelprobe.TableName)
+		return 3
+	}
+	if !report.OK() {
+		return 1
+	}
 	return 0
 }
 
