@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"time"
 
 	"github.com/wighawag/curfew/internal/registry"
 )
@@ -44,14 +45,30 @@ type Server struct {
 	log      *slog.Logger
 	user     string
 	password string
+	// loc is the zone schedules are evaluated in. It is explicit rather than
+	// implicit, because the system default on OpenWrt is UTC and a household
+	// bedtime evaluated in UTC is silently an hour out half the year.
+	loc *time.Location
+	// reconcile re-applies the ruleset immediately after a schedule change,
+	// so the page never shows "should be blocked, but is not" while waiting
+	// for a tick that is up to a minute away.
+	reconcile func() error
 }
 
 // New builds the server. An empty user or password disables authentication,
 // which the daemon warns about loudly at startup: this page grants network
 // access, and it is reachable by the very devices it is keeping off the
 // internet, since blocking applies to forwarded traffic and not to the router.
-func New(store Store, sched ScheduleStore, firewall Firewall, log *slog.Logger, user, password string) *Server {
-	return &Server{store: store, schedule: sched, firewall: firewall, log: log, user: user, password: password}
+func New(store Store, sched ScheduleStore, firewall Firewall, log *slog.Logger,
+	user, password string, loc *time.Location, reconcile func() error) *Server {
+	if loc == nil {
+		loc = time.Local
+	}
+	if reconcile == nil {
+		reconcile = func() error { return nil }
+	}
+	return &Server{store: store, schedule: sched, firewall: firewall, log: log,
+		user: user, password: password, loc: loc, reconcile: reconcile}
 }
 
 // DeviceView is one row of the page and of the API.

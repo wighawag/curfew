@@ -140,6 +140,21 @@ func GoArch(unameM string) (string, error) {
 	}
 }
 
+// DetectTimezone reads the router's own configured zone name.
+//
+// It matters because OpenWrt ships no zoneinfo database, so the daemon's
+// process default is UTC. A household that set Europe/London in LuCI would
+// otherwise get bedtimes an hour out for half the year, with nothing saying
+// so. An empty result is not an error: it means the router has no zone set
+// either, and the daemon warns about that at startup.
+func DetectTimezone(r Runner) (string, error) {
+	out, err := r.Run("uci -q get system.@system[0].zonename 2>/dev/null || true")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
 // DetectArch asks the router what it is.
 func DetectArch(r Runner) (string, error) {
 	out, err := r.Run("uname -m")
@@ -172,7 +187,8 @@ start_service() {
         -profiles %s \
         -lan "$CURFEW_LAN" \
         -wan "$CURFEW_WAN" \
-        -listen "$CURFEW_LISTEN"
+        -listen "$CURFEW_LISTEN" \
+        -timezone "$CURFEW_TZ"
     procd_set_param env CURFEW_USER="$CURFEW_USER" CURFEW_PASSWORD="$CURFEW_PASSWORD"
     procd_set_param respawn
     procd_set_param stdout 1
@@ -190,7 +206,7 @@ func shellQuote(v string) string {
 }
 
 // daemonConf renders the settings file the init script sources.
-func daemonConf(lan, wan, listen, user, password string) string {
+func daemonConf(lan, wan, listen, user, password, timezone string) string {
 	return fmt.Sprintf(`# curfew daemon settings. Written by 'curfew install'.
 # 'curfew update' deliberately leaves this file alone.
 CURFEW_LAN=%s
@@ -198,7 +214,9 @@ CURFEW_WAN=%s
 CURFEW_LISTEN=%s
 CURFEW_USER=%s
 CURFEW_PASSWORD=%s
-`, shellQuote(lan), shellQuote(wan), shellQuote(listen), shellQuote(user), shellQuote(password))
+CURFEW_TZ=%s
+`, shellQuote(lan), shellQuote(wan), shellQuote(listen), shellQuote(user),
+		shellQuote(password), shellQuote(timezone))
 }
 
 // uploadString writes content to a remote path, via a temp local file.
@@ -254,6 +272,8 @@ type InstallOptions struct {
 	Listen   string
 	User     string
 	Password string
+	// Timezone is the IANA zone schedules are evaluated in.
+	Timezone string
 	// BinaryPath is the locally built daemon to push.
 	BinaryPath string
 	// RegistryPath is the local device list, shipped only when the router has
@@ -279,7 +299,7 @@ func Install(r Runner, opt InstallOptions) error {
 	// Settings as DATA, separate from the service definition that reads them.
 	// This is what lets `update` replace the binary and the service template
 	// later without being told the WAN interface and the password again.
-	conf := daemonConf(opt.LAN, opt.WAN, opt.Listen, opt.User, opt.Password)
+	conf := daemonConf(opt.LAN, opt.WAN, opt.Listen, opt.User, opt.Password, opt.Timezone)
 	if err := uploadString(r, conf, RemoteDaemonConf, "settings"); err != nil {
 		return err
 	}

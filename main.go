@@ -225,6 +225,7 @@ func cmdInstall(args []string) error {
 	user := fs.String("user", "parent", "username for the device page")
 	password := fs.String("password", "", "password for the device page (strongly recommended)")
 	binary := fs.String("binary", "", "prebuilt daemon binary to install (default: build one)")
+	tz := fs.String("timezone", "", "IANA timezone for schedules (default: the router's own zonename)")
 	regPath := fs.String("registry", defaultRegistryPath(),
 		"device list to ship with the install, so the allowlist is never empty at startup")
 
@@ -249,6 +250,20 @@ func cmdInstall(args []string) error {
 	}
 	fmt.Printf("router architecture: %s\n", arch)
 
+	zone := *tz
+	if zone == "" {
+		if zone, err = deploy.DetectTimezone(runner); err != nil {
+			return err
+		}
+	}
+	if zone == "" {
+		fmt.Fprintln(os.Stderr, "my-router: warning: the router has no timezone set, so schedules will")
+		fmt.Fprintln(os.Stderr, "           run in UTC. A 22:00 bedtime then fires at 23:00 British summer")
+		fmt.Fprintln(os.Stderr, "           time. Set it in LuCI, or pass -timezone Europe/London.")
+	} else {
+		fmt.Printf("schedules will use the router's timezone: %s\n", zone)
+	}
+
 	binPath := *binary
 	if binPath == "" {
 		binPath, err = buildDaemon(arch)
@@ -268,7 +283,7 @@ func cmdInstall(args []string) error {
 
 	if err := deploy.Install(runner, deploy.InstallOptions{
 		LAN: *lan, WAN: *wan, Listen: *listen,
-		User: *user, Password: *password, BinaryPath: binPath,
+		User: *user, Password: *password, Timezone: zone, BinaryPath: binPath,
 		RegistryPath: *regPath, ProfilesPath: profilesPath(*regPath),
 	}); err != nil {
 		return err

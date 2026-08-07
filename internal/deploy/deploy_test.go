@@ -16,6 +16,7 @@ type fakeRunner struct {
 	downloads [][2]string
 	existing  map[string]bool
 	uploaded  map[string]string
+	zone      string
 	failOn    string
 }
 
@@ -26,6 +27,9 @@ func (f *fakeRunner) Run(cmd string) (string, error) {
 	}
 	if strings.Contains(cmd, "uname -m") {
 		return "aarch64\n", nil
+	}
+	if strings.Contains(cmd, "zonename") {
+		return f.zone + "\n", nil
 	}
 	if strings.Contains(cmd, RemoteDaemonConf) && strings.Contains(cmd, "echo yes") {
 		if f.existing[RemoteDaemonConf] {
@@ -254,7 +258,7 @@ func TestInitScriptIsAStaticTemplateCarryingNoSettings(t *testing.T) {
 func TestDaemonConfQuotesAwkwardValues(t *testing.T) {
 	// A password can contain anything. A naive quote would either break the
 	// file the init script sources, or let the value execute.
-	c := daemonConf("br-lan", "pppoe-wan", ":8080", "parent", `it's $PWD; rm -rf /`)
+	c := daemonConf("br-lan", "pppoe-wan", ":8080", "parent", `it's $PWD; rm -rf /`, "Europe/London")
 	if !strings.Contains(c, `CURFEW_PASSWORD='it'\''s $PWD; rm -rf /'`) {
 		t.Errorf("password not safely quoted:\n%s", c)
 	}
@@ -481,5 +485,39 @@ func TestInitScriptPassesTheProfilesPath(t *testing.T) {
 	s := initScript()
 	if !strings.Contains(s, "-profiles "+RemoteProfiles) {
 		t.Errorf("the daemon needs its schedule path or profiles silently do nothing:\n%s", s)
+	}
+}
+
+func TestDetectTimezone(t *testing.T) {
+	r := &fakeRunner{zone: "Europe/London"}
+	got, err := DetectTimezone(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "Europe/London" {
+		t.Errorf("got %q", got)
+	}
+	// A router with no zone set is not an error: the daemon warns instead.
+	empty := &fakeRunner{}
+	got, err = DetectTimezone(empty)
+	if err != nil || got != "" {
+		t.Errorf("want empty and no error, got %q / %v", got, err)
+	}
+}
+
+// The daemon must be told the zone, or OpenWrt's UTC default silently shifts
+// every bedtime by an hour for half the year.
+func TestInstallCarriesTheTimezoneThrough(t *testing.T) {
+	r := &fakeRunner{zone: "Europe/London"}
+	if err := Install(r, InstallOptions{
+		WAN: "pppoe-wan", BinaryPath: tempBinary(t), Timezone: "Europe/London",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if conf := r.uploaded[RemoteDaemonConf]; !strings.Contains(conf, "CURFEW_TZ='Europe/London'") {
+		t.Errorf("settings must carry the zone:\n%s", conf)
+	}
+	if init := r.uploaded[RemoteInit]; !strings.Contains(init, `-timezone "$CURFEW_TZ"`) {
+		t.Errorf("the service must pass the zone to the daemon:\n%s", init)
 	}
 }

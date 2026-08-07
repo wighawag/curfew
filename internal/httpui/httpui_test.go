@@ -86,7 +86,7 @@ func newTestServer(t *testing.T, devices []registry.Device, live []string) (*Ser
 	store := &memStore{reg: &registry.Registry{Devices: devices}}
 	fw := &fakeFirewall{live: live}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(store, &fakeSchedule{}, fw, log, "", ""), store, fw
+	return New(store, &fakeSchedule{}, fw, log, "", "", time.Local, nil), store, fw
 }
 
 func post(t *testing.T, h http.Handler, path string, form url.Values) *httptest.ResponseRecorder {
@@ -222,7 +222,7 @@ func TestAuthGatesEverythingWhenConfigured(t *testing.T) {
 	store := &memStore{reg: &registry.Registry{}}
 	fw := &fakeFirewall{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(store, &fakeSchedule{}, fw, log, "parent", "hunter2")
+	srv := New(store, &fakeSchedule{}, fw, log, "parent", "hunter2", time.Local, nil)
 	h := srv.Handler()
 
 	for _, path := range []string{"/", "/devices/", "/api/devices"} {
@@ -261,7 +261,7 @@ func TestAuthGatesEverythingWhenConfigured(t *testing.T) {
 func TestWrongPasswordIsRejected(t *testing.T) {
 	store := &memStore{reg: &registry.Registry{}}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(store, &fakeSchedule{}, &fakeFirewall{}, log, "parent", "hunter2")
+	srv := New(store, &fakeSchedule{}, &fakeFirewall{}, log, "parent", "hunter2", time.Local, nil)
 	req := httptest.NewRequest(http.MethodGet, "/devices/", nil)
 	req.SetBasicAuth("parent", "wrong")
 	rec := httptest.NewRecorder()
@@ -343,7 +343,7 @@ func TestRenameRejectsGET(t *testing.T) {
 func TestRenameIsAuthenticated(t *testing.T) {
 	store := &memStore{reg: &registry.Registry{Devices: []registry.Device{{MAC: "aa:bb:cc:dd:ee:01", Name: "old"}}}}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(store, &fakeSchedule{}, &fakeFirewall{}, log, "parent", "hunter2")
+	srv := New(store, &fakeSchedule{}, &fakeFirewall{}, log, "parent", "hunter2", time.Local, nil)
 	rec := post(t, srv.Handler(), "/devices/rename", url.Values{
 		"mac": {"aa:bb:cc:dd:ee:01"}, "name": {"intruder"},
 	})
@@ -439,7 +439,7 @@ func TestRemoveRejectsGETAndRequiresAuth(t *testing.T) {
 
 	authStore := &memStore{reg: &registry.Registry{Devices: []registry.Device{{MAC: "aa:bb:cc:dd:ee:01"}}}}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	authed := New(authStore, &fakeSchedule{}, &fakeFirewall{}, log, "parent", "hunter2")
+	authed := New(authStore, &fakeSchedule{}, &fakeFirewall{}, log, "parent", "hunter2", time.Local, nil)
 	rec = post(t, authed.Handler(), "/devices/remove", url.Values{"mac": {"aa:bb:cc:dd:ee:01"}})
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("want 401, got %d", rec.Code)
@@ -456,7 +456,17 @@ func newProfileServer(t *testing.T, devices []registry.Device, ps *schedule.Prof
 	sch := &fakeSchedule{ps: ps}
 	fw := &fakeFirewall{live: allowed, blocked: blocked}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(store, sch, fw, log, "", ""), sch, fw
+	// A reconcile that mirrors the daemon's: recompute from the schedule and
+	// push it into the fake firewall, so tests see what a user would.
+	reconcile := func() error {
+		cur, err := sch.Load()
+		if err != nil {
+			return err
+		}
+		fw.blocked = cur.BlockedMACs(time.Now().In(time.Local))
+		return nil
+	}
+	return New(store, sch, fw, log, "", "", time.Local, reconcile), sch, fw
 }
 
 func TestHomeListsProfilesWithStatus(t *testing.T) {
@@ -710,7 +720,7 @@ func TestScheduleMutationsRequireAuthAndPOST(t *testing.T) {
 	store := &memStore{reg: &registry.Registry{}}
 	sch := &fakeSchedule{ps: &schedule.Profiles{Profiles: []schedule.Profile{{Name: "eli"}}}}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(store, sch, &fakeFirewall{}, log, "parent", "hunter2")
+	srv := New(store, sch, &fakeFirewall{}, log, "parent", "hunter2", time.Local, nil)
 	for _, path := range []string{
 		"/profiles/create", "/profiles/delete", "/profiles/devices",
 		"/profiles/window/add", "/profiles/window/remove",
@@ -729,5 +739,77 @@ func TestScheduleMutationsRequireAuthAndPOST(t *testing.T) {
 	}
 	if len(sch.ps.Profiles) != 1 {
 		t.Error("nothing should have changed")
+	}
+}
+
+// Adding a window must take effect immediately. Waiting for the next tick left
+// the page honestly but alarmingly reporting "should be blocked right now, but
+// is not" for up to a minute after the button was pressed, which reads as a
+// broken system.
+func TestAddingAWindowAppliesItImmediately(t *testing.T) {
+	mac := "aa:bb:cc:dd:ee:01"
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{{Name: "eli", Devices: []string{mac}}}}
+	srv, _, fw := newProfileServer(t, []registry.Device{{MAC: mac}}, ps, []string{mac}, nil)
+
+	now := time.Now().In(time.Local)
+	day := strings.ToLower(now.Format("Mon"))
+	from := now.Add(-1 * time.Hour).Format("15:04")
+	to := now.Add(1 * time.Hour).Format("15:04")
+
+	rec := post(t, srv.Handler(), "/profiles/window/add", url.Values{
+		"name": {"eli"}, "day": {day}, "start": {from}, "end": {to}})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("want 303, got %d: %s", rec.Code, rec.Body)
+	}
+	if len(fw.blocked) != 1 || fw.blocked[0] != mac {
+		t.Fatalf("the firewall should already be blocking, got %v", fw.blocked)
+	}
+
+	// And the page must therefore NOT report drift.
+	views, err := srv.profileViews(time.Now().In(time.Local))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if views[0].Drifted() {
+		t.Errorf("no drift should be reported straight after a change: %q", views[0].Reason)
+	}
+}
+
+// Schedules are evaluated in the CONFIGURED zone, not the process default.
+// On OpenWrt the default is UTC, so a 22:00 window would fire an hour out in
+// British summer time and nothing would say so.
+func TestSchedulesUseTheConfiguredTimezone(t *testing.T) {
+	london, err := time.LoadLocation("Europe/London")
+	if err != nil {
+		t.Skipf("no tzdata in this test binary: %v", err)
+	}
+	mac := "aa:bb:cc:dd:ee:01"
+	// A window covering 12:00-13:00 London time.
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{{
+		Name: "eli", Devices: []string{mac},
+		Windows: []schedule.Window{{Days: schedule.AllDays, Start: "12:00", End: "13:00"}},
+	}}}
+	store := &memStore{reg: &registry.Registry{Devices: []registry.Device{{MAC: mac}}}}
+	sch := &fakeSchedule{ps: ps}
+	fw := &fakeFirewall{live: []string{mac}}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := New(store, sch, fw, log, "", "", london, nil)
+
+	// 11:20 UTC is 12:20 in London during BST: inside the window.
+	utcNoonish := time.Date(2026, 7, 3, 11, 20, 0, 0, time.UTC)
+	views, err := srv.profileViews(utcNoonish.In(london))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !views[0].ShouldBeBlocked {
+		t.Error("12:20 London is inside a 12:00-13:00 window; evaluating in UTC is the bug this guards")
+	}
+	// And 12:20 UTC is 13:20 London: outside.
+	views, err = srv.profileViews(time.Date(2026, 7, 3, 12, 20, 0, 0, time.UTC).In(london))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if views[0].ShouldBeBlocked {
+		t.Error("13:20 London is outside the window")
 	}
 }

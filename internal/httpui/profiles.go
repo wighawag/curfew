@@ -112,7 +112,7 @@ func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	views, err := s.profileViews(time.Now())
+	views, err := s.profileViews(time.Now().In(s.loc))
 	if err != nil {
 		s.log.Error("rendering home", "error", err)
 		http.Error(w, "failed to read state", http.StatusInternalServerError)
@@ -128,7 +128,8 @@ func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
 	data := homeData{
 		Profiles:   views,
 		Unassigned: unassigned,
-		Now:        time.Now().Format("Mon 15:04"),
+		Now:        time.Now().In(s.loc).Format("Mon 15:04 MST"),
+		Zone:       s.loc.String(),
 		Error:      r.URL.Query().Get("error"),
 		AllDays:    schedule.AllDays,
 	}
@@ -181,7 +182,16 @@ func (s *Server) mutateSchedule(fn func(*schedule.Profiles) error) error {
 	if err := fn(ps); err != nil {
 		return err
 	}
-	return s.schedule.Save(ps)
+	if err := s.schedule.Save(ps); err != nil {
+		return err
+	}
+	// Apply it NOW. Waiting for the next tick leaves the page honestly but
+	// alarmingly reporting "should be blocked right now, but is not" for up to
+	// a minute after you press the button.
+	if err := s.reconcile(); err != nil {
+		return fmt.Errorf("saved, but the firewall was NOT updated: %w", err)
+	}
+	return nil
 }
 
 func (s *Server) handleProfileCreate(w http.ResponseWriter, r *http.Request) {
@@ -350,6 +360,7 @@ type homeData struct {
 	Profiles   []ProfileView
 	Unassigned []DeviceView
 	Now        string
+	Zone       string
 	Error      string
 	AllDays    []schedule.Day
 }
@@ -388,7 +399,7 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
 </head>
 <body>
 <h1>curfew</h1>
-<div class="now">{{.Now}} &middot; <a href="/devices/">all devices</a></div>
+<div class="now">{{.Now}} ({{.Zone}}) &middot; <a href="/devices/">all devices</a></div>
 {{if .Error}}<div class="err">{{.Error}}</div>{{end}}
 
 {{range $p := .Profiles}}

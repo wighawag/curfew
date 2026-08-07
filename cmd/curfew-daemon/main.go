@@ -18,6 +18,12 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	// The IANA database, embedded in the binary. OpenWrt ships no
+	// /usr/share/zoneinfo, so without this Go cannot resolve a zone name at
+	// all and time.Local silently becomes UTC. A parental control system
+	// computing bedtime an hour out, and saying nothing, is exactly the class
+	// of quiet wrongness this project exists to remove. Costs ~450 KB.
+	_ "time/tzdata"
 
 	"github.com/wighawag/curfew/internal/enforce"
 	"github.com/wighawag/curfew/internal/httpui"
@@ -44,6 +50,7 @@ type options struct {
 	user         string
 	password     string
 	reconcile    time.Duration
+	timezone     string
 }
 
 // envOr lets every flag also come from the environment, which is how the
@@ -72,6 +79,8 @@ func run(args []string, stderr *os.File) int {
 		"HTTP basic auth password (empty disables authentication, with a warning)")
 	fs.DurationVar(&opt.reconcile, "reconcile", time.Minute,
 		"how often to re-check that the firewall still matches the registry")
+	fs.StringVar(&opt.timezone, "timezone", envOr("CURFEW_TZ", ""),
+		"IANA timezone for schedules, e.g. Europe/London (default: the system zone, which on OpenWrt is UTC)")
 	showVersion := fs.Bool("version", false, "print the version and exit")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -84,6 +93,14 @@ func run(args []string, stderr *os.File) int {
 
 	log := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	log.Info("starting", "version", version)
+
+	loc, err := resolveLocation(opt.timezone, log)
+	if err != nil {
+		log.Error("cannot resolve the timezone; refusing to start", "timezone", opt.timezone, "error", err)
+		return 1
+	}
+	log.Info("schedules evaluated in", "zone", loc.String(),
+		"local_time", time.Now().In(loc).Format("Mon 15:04 MST"))
 
 	if opt.wan == "" {
 		log.Error("no WAN interface configured; refusing to start",
@@ -112,7 +129,7 @@ func run(args []string, stderr *os.File) int {
 	// Enforce BEFORE serving. Coming up with the page available but the
 	// ruleset unapplied is precisely the state that lies about being in
 	// control, so a failure here is fatal rather than logged and ignored.
-	if err := reconcileOnce(store, sched, fw); err != nil {
+	if err := reconcileOnce(store, sched, fw, loc); err != nil {
 		log.Error("cannot apply the ruleset; refusing to start", "error", err)
 		return 1
 	}
@@ -124,15 +141,16 @@ func run(args []string, stderr *os.File) int {
 	}
 
 	srv := &http.Server{
-		Addr:              opt.listen,
-		Handler:           httpui.New(store, sched, fw, log, opt.user, opt.password).Handler(),
+		Addr: opt.listen,
+		Handler: httpui.New(store, sched, fw, log, opt.user, opt.password,
+			loc, func() error { return reconcileOnce(store, sched, fw, loc) }).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	go reconcileLoop(ctx, log, store, sched, fw, opt.reconcile)
+	go reconcileLoop(ctx, log, store, sched, fw, loc, opt.reconcile)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -167,7 +185,30 @@ func run(args []string, stderr *os.File) int {
 // have drifted. This is the level-triggered discipline the design rests on: a
 // missed moment, a crash mid-write, or something else clobbering the table all
 // self-heal on the next pass, instead of leaving a state nothing corrects.
-func reconcileLoop(ctx context.Context, log *slog.Logger, store registry.FileStore, sched schedule.FileStore, fw *enforce.Enforcer, every time.Duration) {
+// resolveLocation picks the zone schedules are evaluated in.
+//
+// It refuses an unknown zone rather than falling back, because falling back
+// means running everyone's bedtime an hour out with nothing said. When no zone
+// is configured it warns, since the system default on this platform is UTC and
+// that is almost never what a household means.
+func resolveLocation(name string, log *slog.Logger) (*time.Location, error) {
+	if name == "" {
+		now := time.Now()
+		if zone, _ := now.Zone(); zone == "UTC" {
+			log.Warn("NO TIMEZONE SET: schedules will be evaluated in UTC",
+				"why_it_matters", "a 22:00 bedtime fires at 22:00 UTC, which is an hour out in British summer time",
+				"fix", "pass -timezone Europe/London, or reinstall so the router's own zone is picked up")
+		}
+		return time.Local, nil
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		return nil, err
+	}
+	return loc, nil
+}
+
+func reconcileLoop(ctx context.Context, log *slog.Logger, store registry.FileStore, sched schedule.FileStore, fw *enforce.Enforcer, loc *time.Location, every time.Duration) {
 	if every <= 0 {
 		return
 	}
@@ -178,7 +219,7 @@ func reconcileLoop(ctx context.Context, log *slog.Logger, store registry.FileSto
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := reconcileOnce(store, sched, fw); err != nil {
+			if err := reconcileOnce(store, sched, fw, loc); err != nil {
 				log.Error("reconcile failed", "error", err)
 			}
 		}
@@ -187,7 +228,7 @@ func reconcileLoop(ctx context.Context, log *slog.Logger, store registry.FileSto
 
 // reconcileOnce applies the registry only when the firewall disagrees with it,
 // so a steady state costs one read rather than a ruleset rewrite every tick.
-func reconcileOnce(store registry.FileStore, sched schedule.FileStore, fw *enforce.Enforcer) error {
+func reconcileOnce(store registry.FileStore, sched schedule.FileStore, fw *enforce.Enforcer, loc *time.Location) error {
 	reg, err := store.Load()
 	if err != nil {
 		return fmt.Errorf("reading registry: %w", err)
@@ -198,7 +239,7 @@ func reconcileOnce(store registry.FileStore, sched schedule.FileStore, fw *enfor
 	}
 	// Desired state, computed from the clock. Nothing here depends on having
 	// observed a boundary, which is what makes a missed moment impossible.
-	blocked := ps.BlockedMACs(time.Now())
+	blocked := ps.BlockedMACs(time.Now().In(loc))
 	if _, err := fw.EnsureAppliedState(reg.MACs(), blocked); err != nil {
 		return fmt.Errorf("applying ruleset: %w", err)
 	}
