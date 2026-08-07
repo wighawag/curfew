@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/wighawag/curfew/internal/blockstate"
 	"github.com/wighawag/curfew/internal/contract"
 )
 
@@ -96,8 +97,23 @@ const (
 	RemoteConfDir  = "/etc/config/curfew"
 	RemoteRegistry = "/etc/config/curfew/devices.json"
 	RemoteProfiles = "/etc/config/curfew/profiles.json"
-	RemoteInit     = "/etc/init.d/curfew"
-	ServiceName    = "curfew"
+	// RemoteState is the persisted block state: which profiles a parent has
+	// blocked until they say otherwise. It is STATE rather than config, and it
+	// lives here anyway for the same measured reason as everything else in
+	// this directory. If a reboot or an upgrade lost it, a grounded child would
+	// come back online with nothing saying so.
+	//
+	// Neither push nor pull touches it. It is the router's own state, and
+	// copying a laptop's idea of who is grounded over the top of it would
+	// silently undo a decision made on the phone five minutes earlier.
+	//
+	// Taken from the daemon's own default rather than written out again here.
+	// Two literals for one path is how the table name once desynchronised (see
+	// the comment on internal/contract), and the failure would be quiet: the
+	// service would be told to keep state in a file nothing else reads.
+	RemoteState = blockstate.DefaultPath
+	RemoteInit  = "/etc/init.d/curfew"
+	ServiceName = "curfew"
 	// RemoteKeepList registers our files for preservation across a firmware
 	// upgrade. Without it a sysupgrade removes the daemon AND its service
 	// definition, so the router comes back enforcing nothing, with every
@@ -185,6 +201,7 @@ start_service() {
     procd_set_param command %s \
         -registry %s \
         -profiles %s \
+        -state %s \
         -lan "$CURFEW_LAN" \
         -wan "$CURFEW_WAN" \
         -listen "$CURFEW_LISTEN" \
@@ -195,7 +212,7 @@ start_service() {
     procd_set_param stderr 1
     procd_close_instance
 }
-`, RemoteDaemonConf, RemoteBinary, RemoteRegistry, RemoteProfiles)
+`, RemoteDaemonConf, RemoteBinary, RemoteRegistry, RemoteProfiles, RemoteState)
 }
 
 // shellQuote renders a value safe to `.` into a POSIX shell. Passwords can

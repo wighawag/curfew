@@ -5,11 +5,20 @@ import (
 	"html/template"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/wighawag/curfew/internal/contract"
 	"github.com/wighawag/curfew/internal/schedule"
 )
+
+// ticketDurations are the taps a parent gets on their phone. Kept short and
+// few on purpose: a ticket is "a bit more time now", and anything long enough
+// to need a date picker is a schedule change instead.
+var ticketDurations = []time.Duration{
+	15 * time.Minute, 30 * time.Minute, time.Hour, 2 * time.Hour,
+}
 
 // ScheduleStore loads and saves profiles and their windows.
 type ScheduleStore interface {
@@ -31,11 +40,26 @@ type ProfileView struct {
 	// not. That is always drift: a half-enforced bedtime is a child online on
 	// their other device.
 	Partial bool
-	// ShouldBeBlocked is what the schedule says SHOULD be true. When the two
-	// disagree the page says so, because that gap is the entire failure this
+	// ShouldBeBlocked is what the schedule AND the parent's stored decision say
+	// SHOULD be true, allowing for a live ticket. When it disagrees with the
+	// firewall the page says so, because that gap is the entire failure this
 	// project exists to make visible rather than hide.
 	ShouldBeBlocked bool
 	Reason          string
+	// ManuallyBlocked is the parent's stored DECISION: this profile is off
+	// until they say otherwise. It drives which of the two buttons is offered,
+	// so it is intent rather than what the firewall is doing.
+	ManuallyBlocked bool
+	// ManualEnforced is whether the FIREWALL is dropping every one of this
+	// profile's devices in the manual tier. It is tracked separately from
+	// Blocked because a profile can be offline for the RIGHT overall answer
+	// and the WRONG reason: blocked by a window that is about to end, while a
+	// parent believes they blocked it indefinitely.
+	ManualEnforced bool
+	// TicketLeft is the KERNEL's own countdown on this profile's grant, empty
+	// when there is none. Nothing here tracks a parallel clock, which is why
+	// it cannot drift and why an expiring ticket needs no bookkeeping.
+	TicketLeft string
 	// NeedsDevices flags a profile with no devices. It is a warning rather
 	// than a neutral state because a schedule with nothing to apply it to
 	// enforces nothing while looking configured, which is the shape of every
@@ -62,10 +86,17 @@ func (p ProfileView) Drifted() bool {
 	if len(p.Devices) == 0 {
 		return false
 	}
+	if p.ManuallyBlocked != p.ManualEnforced {
+		// Right answer, wrong reason. A profile a parent blocked indefinitely,
+		// which the firewall is only holding down with a bedtime window, comes
+		// back online at 08:00 while the page says it is blocked until lifted.
+		return true
+	}
 	return p.Partial || p.Blocked != p.ShouldBeBlocked
 }
 
-// profileViews joins the schedule (intent) with the firewall (truth).
+// profileViews joins intent (the schedule, and the parent's stored decision)
+// with truth (what the firewall is doing to packets right now).
 func (s *Server) profileViews(now time.Time) ([]ProfileView, error) {
 	ps, err := s.schedule.Load()
 	if err != nil {
@@ -75,21 +106,13 @@ func (s *Server) profileViews(now time.Time) ([]ProfileView, error) {
 	if err != nil {
 		return nil, err
 	}
-	blockedNow, err := s.firewall.Blocked()
+	fw, err := s.readFirewall()
 	if err != nil {
 		return nil, err
 	}
-	allowedNow, err := s.firewall.Allowlist()
+	manualIntent, err := s.core.ManuallyBlocked()
 	if err != nil {
 		return nil, err
-	}
-	isBlocked := map[string]bool{}
-	for _, m := range blockedNow {
-		isBlocked[m] = true
-	}
-	isAllowed := map[string]bool{}
-	for _, m := range allowedNow {
-		isAllowed[m] = true
 	}
 	name := map[string]string{}
 	for _, d := range reg.Devices {
@@ -98,16 +121,28 @@ func (s *Server) profileViews(now time.Time) ([]ProfileView, error) {
 
 	out := make([]ProfileView, 0, len(ps.Profiles))
 	for _, p := range ps.Profiles {
-		v := ProfileView{Name: p.Name, ShouldBeBlocked: p.BlockedAt(now)}
+		v := ProfileView{Name: p.Name, ManuallyBlocked: manualIntent[p.Name]}
 		for _, w := range p.Windows {
 			v.Windows = append(v.Windows, w.Describe())
 		}
+		left, hasTicket := fw.ticketLeft(p.Devices)
+		if hasTicket {
+			v.TicketLeft = humanDuration(left)
+		}
+		windowActive := p.BlockedAt(now)
+		// What SHOULD be true, as the reason set of ADR 0006 computes it: a
+		// manual block on its own is enough, and a schedule block is overridden
+		// by a live ticket. A manual block is NOT, which is the rule that stops
+		// a child ticketing their way out of being grounded.
+		v.ShouldBeBlocked = v.ManuallyBlocked || (windowActive && !hasTicket)
+
 		blockedCount := 0
+		byReason := map[string]int{}
 		for _, m := range p.Devices {
-			v.Devices = append(v.Devices, DeviceView{
-				MAC: m, Name: name[m], Allowed: isAllowed[m] && !isBlocked[m],
-			})
-			if isBlocked[m] {
+			allowed, reason := fw.verdict(m)
+			v.Devices = append(v.Devices, DeviceView{MAC: m, Name: name[m], Allowed: allowed})
+			byReason[reason]++
+			if !allowed {
 				blockedCount++
 			}
 		}
@@ -117,6 +152,11 @@ func (s *Server) profileViews(now time.Time) ([]ProfileView, error) {
 		// their second device.
 		v.Blocked = len(p.Devices) > 0 && blockedCount == len(p.Devices)
 		v.Partial = blockedCount > 0 && blockedCount < len(p.Devices)
+		// Whether the FIREWALL, not the state file, is enforcing each kind of
+		// block on every one of the profile's devices.
+		allManual := len(p.Devices) > 0 && byReason[contract.ReasonManual] == len(p.Devices)
+		allTicketed := len(p.Devices) > 0 && byReason[contract.ReasonTicket] == len(p.Devices)
+		v.ManualEnforced = allManual
 
 		v.NeedsDevices = len(p.Devices) == 0
 		switch {
@@ -134,12 +174,29 @@ func (s *Server) profileViews(now time.Time) ([]ProfileView, error) {
 			v.Reason = ""
 		case v.Partial:
 			v.Reason = fmt.Sprintf("only %d of %d devices are blocked", blockedCount, len(p.Devices))
-		case v.Blocked && v.ShouldBeBlocked:
-			v.Reason = "inside a blocked window"
+		// The disagreements come FIRST. They are what the badge shows when a
+		// profile has drifted, so a descriptive line reaching the badge ahead of
+		// them would replace the warning with a reassurance.
+		case v.ManuallyBlocked && !v.ManualEnforced:
+			v.Reason = "you blocked this, but the firewall is not enforcing that block"
+		case !v.ManuallyBlocked && v.ManualEnforced:
+			v.Reason = "the firewall is blocking this by hand, but no decision here says so"
 		case v.Blocked && !v.ShouldBeBlocked:
-			v.Reason = "blocked, but no window says it should be"
+			v.Reason = "blocked, but nothing says it should be"
 		case !v.Blocked && v.ShouldBeBlocked:
 			v.Reason = "should be blocked right now, but is not"
+		// The rest read alongside the badge, which already names the state, so
+		// each says something the badge does not.
+		case allManual && windowActive:
+			v.Reason = "and inside a blocked window, so unblocking leaves them blocked"
+		case allManual:
+			v.Reason = "until you unblock them"
+		case allTicketed && windowActive:
+			v.Reason = "then the window takes over again"
+		case allTicketed:
+			v.Reason = "nothing else is blocking them right now"
+		case v.Blocked && windowActive:
+			v.Reason = "inside a blocked window"
 		case len(p.Windows) == 0:
 			v.Reason = "no schedule"
 		default:
@@ -154,8 +211,12 @@ func (s *Server) profileViews(now time.Time) ([]ProfileView, error) {
 			v.StateClass, v.StateLabel = "idle", "no devices, would be blocked"
 		case v.NeedsDevices:
 			v.StateClass, v.StateLabel = "idle", "no devices, would be allowed"
+		case v.Blocked && allManual:
+			v.StateClass, v.StateLabel = "off", "blocked by you"
 		case v.Blocked:
 			v.StateClass, v.StateLabel = "off", "blocked"
+		case allTicketed:
+			v.StateClass, v.StateLabel = "on", "ticket: "+v.TicketLeft+" left"
 		default:
 			v.StateClass, v.StateLabel = "on", "allowed"
 		}
@@ -195,6 +256,7 @@ func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
 		Zone:       s.loc.String(),
 		Error:      r.URL.Query().Get("error"),
 		AllDays:    schedule.AllDays,
+		Tickets:    ticketChoices(),
 	}
 	s.render(w, homeTemplate, data, "home")
 }
@@ -251,10 +313,64 @@ func (s *Server) mutateSchedule(fn func(*schedule.Profiles) error) error {
 	// Apply it NOW. Waiting for the next tick leaves the page honestly but
 	// alarmingly reporting "should be blocked right now, but is not" for up to
 	// a minute after you press the button.
-	if err := s.reconcile(); err != nil {
+	if err := s.core.Reconcile(); err != nil {
 		return fmt.Errorf("saved, but the firewall was NOT updated: %w", err)
 	}
 	return nil
+}
+
+// handleProfileBlock turns a profile off until a parent turns it back on.
+func (s *Server) handleProfileBlock(w http.ResponseWriter, r *http.Request) {
+	name, ok := s.postedProfile(w, r)
+	if !ok {
+		return
+	}
+	redirectHome(w, r, s.core.Block(name))
+}
+
+// handleProfileUnblock lifts that decision, and only that decision. A profile
+// inside its bedtime window stays blocked, because the schedule reason is
+// still live (ADR 0006).
+func (s *Server) handleProfileUnblock(w http.ResponseWriter, r *http.Request) {
+	name, ok := s.postedProfile(w, r)
+	if !ok {
+		return
+	}
+	redirectHome(w, r, s.core.Unblock(name))
+}
+
+// handleProfileTicket grants a time-limited pass.
+//
+// It is one call that grants exactly one thing. Giving a manually blocked
+// child time is deliberately TWO taps here, unblock and then ticket, and the
+// core refuses the fused version: fusing them would mean a parent who wanted
+// thirty minutes silently cancelled an indefinite block as well.
+func (s *Server) handleProfileTicket(w http.ResponseWriter, r *http.Request) {
+	name, ok := s.postedProfile(w, r)
+	if !ok {
+		return
+	}
+	minutes, err := strconv.Atoi(strings.TrimSpace(r.FormValue("minutes")))
+	if err != nil || minutes <= 0 {
+		redirectHome(w, r, fmt.Errorf("a ticket needs a duration in whole minutes, got %q",
+			r.FormValue("minutes")))
+		return
+	}
+	redirectHome(w, r, s.core.GrantTicket(name, time.Duration(minutes)*time.Minute))
+}
+
+// postedProfile enforces POST and pulls the profile name out of the form.
+func (s *Server) postedProfile(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return "", false
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return "", false
+	}
+	return r.FormValue("name"), true
 }
 
 func (s *Server) handleProfileCreate(w http.ResponseWriter, r *http.Request) {
@@ -297,6 +413,14 @@ func (s *Server) handleProfileDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.FormValue("name")
+	// Lift any manual block FIRST, while the profile still exists. Otherwise
+	// the persisted decision outlives the thing it was about, and a profile
+	// later recreated under the same name would come back mysteriously
+	// blocked by a parent who does not remember doing it.
+	if err := s.core.Unblock(name); err != nil {
+		redirectHome(w, r, err)
+		return
+	}
 	err := s.mutateSchedule(func(ps *schedule.Profiles) error {
 		for i := range ps.Profiles {
 			if ps.Profiles[i].Name == name {
@@ -426,6 +550,21 @@ type homeData struct {
 	Zone       string
 	Error      string
 	AllDays    []schedule.Day
+	Tickets    []ticketChoice
+}
+
+// ticketChoice is one duration button.
+type ticketChoice struct {
+	Minutes int
+	Label   string
+}
+
+func ticketChoices() []ticketChoice {
+	out := make([]ticketChoice, 0, len(ticketDurations))
+	for _, d := range ticketDurations {
+		out = append(out, ticketChoice{Minutes: int(d.Minutes()), Label: humanDuration(d)})
+	}
+	return out
 }
 
 var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
@@ -457,6 +596,15 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
  input[type=time], input[type=text] { padding: .35rem; font-size: .9rem; }
  button { padding: .35rem .6rem; font-size: .85rem; }
  .danger { color: #b00020; }
+ .actions { display: flex; gap: .4rem; flex-wrap: wrap; align-items: center;
+            margin-top: .6rem; padding-top: .6rem; border-top: 1px dashed #e2e2e2; }
+ .actions form { display: inline; }
+ .block { padding: .45rem .8rem; font-weight: 600; color: #b00020; border: 1px solid #f0b6bd;
+          background: #fdecea; border-radius: .3rem; }
+ .unblock { padding: .45rem .8rem; font-weight: 600; color: #0a7d28; border: 1px solid #a9dcb9;
+            background: #e7f6ec; border-radius: .3rem; }
+ .tickets { display: flex; gap: .3rem; flex-wrap: wrap; align-items: center; margin-top: .5rem; }
+ .tickets button { padding: .45rem .7rem; }
  .days label { font-size: .8rem; margin-right: .4rem; white-space: nowrap; }
  .err { background: #fdecea; color: #b00020; padding: .6rem; margin-bottom: 1rem; }
  details { margin-top: .6rem; }
@@ -476,6 +624,39 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
     <span class="muted">{{if not .Drifted}}{{.Reason}}{{end}}</span>
   </div>
   {{if .NeedsDevices}}<div class="warnline">{{.Warning}}</div>{{end}}
+
+  <div class="actions">
+    {{if .ManuallyBlocked}}
+      <form method="POST" action="/profiles/unblock">
+        <input type="hidden" name="name" value="{{.Name}}">
+        <button type="submit" class="unblock">unblock {{.Name}}</button>
+      </form>
+      <span class="muted">off until you lift it. Lifting it leaves any bedtime window in force.</span>
+    {{else}}
+      <form method="POST" action="/profiles/block">
+        <input type="hidden" name="name" value="{{.Name}}">
+        <button type="submit" class="block">block {{.Name}}</button>
+      </form>
+      <span class="muted">off until you say otherwise. Cancels any ticket.</span>
+    {{end}}
+  </div>
+
+  {{if .ManuallyBlocked}}
+  <div class="muted" style="margin-top:.5rem">Unblock first to give {{.Name}} time:
+    a ticket cannot lift a block you imposed.</div>
+  {{else}}
+  <div class="tickets">
+    <span class="muted">give time:</span>
+    {{range $.Tickets}}
+    <form method="POST" action="/profiles/ticket">
+      <input type="hidden" name="name" value="{{$p.Name}}">
+      <input type="hidden" name="minutes" value="{{.Minutes}}">
+      <button type="submit">{{.Label}}</button>
+    </form>
+    {{end}}
+    {{if $p.TicketLeft}}<span class="muted">{{$p.TicketLeft}} left; tapping again adds a fresh ticket</span>{{end}}
+  </div>
+  {{end}}
 
   <ul>
   {{range $i, $w := .Windows}}
@@ -553,6 +734,9 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
 {{end}}
 <p class="muted">Blocked/allowed is read from the firewall itself. If it ever disagrees with
 the schedule, this page says so rather than showing you what it hoped.</p>
+<p class="muted">A block you impose outranks a ticket, so a ticket cannot undo it, and
+blocking cancels any ticket already running. To end a ticket early, block and then unblock.
+Tickets are held by the kernel and are gone after a reboot; a block you impose is not.</p>
 </body>
 </html>
 `))

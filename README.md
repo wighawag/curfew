@@ -87,13 +87,25 @@ Resolve by editing your local list and pushing, or take a side wholesale with `-
 
 ## What it does today
 
-The **MAC allowlist**, and nothing else yet. Registered devices reach the internet; everything else is dropped. Add, rename and remove devices from the page at `http://<router>:8080`. Names are optional labels: the allowlist works on MAC addresses, so renaming never changes who has internet, while removing a device revokes its access immediately.
+The **MAC allowlist**: registered devices reach the internet, everything else is dropped. Add, rename and remove devices from the page at `http://<router>:8080`. Names are optional labels: the allowlist works on MAC addresses, so renaming never changes who has internet, while removing a device revokes its access immediately.
+
+Per profile, it also does **schedules** (recurring blocked windows), **manual blocks** and **tickets**:
+
+- **Block** turns a profile off until you turn it back on. It survives a reboot, because it is a decision rather than something the system can recompute.
+- **Unblock** lifts that decision and nothing else. A child inside their bedtime window stays offline, because the window is a separate reason and unblocking removes only the reason it owns.
+- **A ticket** grants a profile a fixed extra period, by tapping a duration. It overrides a bedtime window while it lasts, and then simply lapses: the kernel holds the deadline and reclaims it, so nothing has to remember to take the access away.
+
+A block you impose **outranks** a ticket, so a child cannot ticket their way out of being grounded, and blocking cancels any ticket already running so that unblocking later cannot resurrect one. Giving a blocked child time is deliberately two taps, unblock and then a duration, rather than one button that quietly cancels an indefinite block. The decisions behind all of this are in `docs/adr/0006-a-block-carries-a-set-of-reasons-and-manual-outranks-a-ticket.md`.
+
+The page is password-gated, and that matters more than it looks: blocking applies to forwarded traffic, so the router still answers the device it is blocking. The password and the precedence above are two independent halves of stopping a child freeing themselves, and neither is sufficient alone.
+
+A ticket is **gone after a reboot**, deliberately. A manual block is not.
 
 Status is read from the **firewall**, never from re-evaluating the schedule or reading back our own config. If the schedule says a profile should be blocked and the firewall disagrees, the page says exactly that instead of showing you what it hoped. A green dot derived from our own config file is precisely the reassurance that let the previous system claim to be working.
 
-The daemon re-asserts the ruleset on a timer, so a table wiped by hand, by a recovery path, or by anything else heals itself on the next tick.
+The daemon re-asserts the ruleset on a timer, so a table wiped by hand, by a recovery path, or by anything else heals itself on the next tick. That re-assertion replaces the whole table in one transaction and carries live tickets across it with the time they have left, so a reconcile can neither cut a ticket short nor quietly restart its clock.
 
-Schedules, time budgets, tickets and website blocking are designed but not built. The decisions behind them are recorded in `docs/adr/` so they land as decisions rather than guesses.
+Time budgets, guest passes and website blocking are designed but not built. The decisions behind them are recorded in `docs/adr/` so they land as decisions rather than guesses.
 
 ## If something goes wrong
 
@@ -111,11 +123,15 @@ The daemon deliberately leaves the ruleset in place when it exits. Stopping it m
 | Path | Survives a reboot | Survives a firmware upgrade |
 |---|---|---|
 | `/etc/config/curfew/devices.json` | yes | yes |
+| `/etc/config/curfew/profiles.json` | yes | yes |
+| `/etc/config/curfew/state.json` | yes | yes |
 | `/usr/sbin/curfew-daemon` | yes | yes, via `/lib/upgrade/keep.d/curfew` |
 | `/etc/init.d/curfew` | yes | yes, same |
 | `/etc/config/curfew/daemon.conf` | yes | yes |
 
 The daemon's settings (WAN interface, listen address, credentials) live in `daemon.conf` as data rather than baked into the service definition. That is what lets `curfew update` replace the binary without being told them again, and it means updating can never change them by accident. `install` writes that file; `update` deliberately never touches it, nor the device list.
+
+`state.json` holds the manual blocks. It is state rather than configuration, and `push` and `pull` deliberately never touch it: it belongs to the router, and copying a laptop's idea of who is grounded over the top of it would undo a decision made on a phone five minutes earlier.
 
 `/etc/config/` is the only location OpenWrt's sysupgrade keep list preserves by default, which is measured, not assumed. `curfew install` registers the binary and the init script for preservation too, so a firmware upgrade cannot leave you with a config that says who is allowed and a firewall that allows everyone.
 

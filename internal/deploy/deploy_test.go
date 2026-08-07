@@ -521,3 +521,36 @@ func TestInstallCarriesTheTimezoneThrough(t *testing.T) {
 		t.Errorf("the service must pass the zone to the daemon:\n%s", init)
 	}
 }
+
+// The persisted block state must survive a firmware upgrade for the same
+// reason the device list must: a manual block is a decision a parent made, and
+// losing it puts a grounded child back online with nothing saying so.
+func TestBlockStateLivesSomewhereSysupgradePreserves(t *testing.T) {
+	if !strings.HasPrefix(RemoteState, "/etc/config/") {
+		t.Errorf("RemoteState = %q, but only /etc/config/ survives a sysupgrade; "+
+			"a manual block stored elsewhere is silently lifted by a firmware upgrade", RemoteState)
+	}
+	// The generated service must actually pass it, or the daemon falls back to
+	// its own default and two paths exist for one file.
+	if !strings.Contains(initScript(), "-state "+RemoteState) {
+		t.Errorf("the init script must tell the daemon where the state lives:\n%s", initScript())
+	}
+}
+
+// Update replaces the binary and the service definition and NOTHING else.
+// Clearing the block state on an update would lift every manual block, which
+// is exactly the silent unblock this project exists to remove.
+func TestUpdateLeavesTheBlockStateAlone(t *testing.T) {
+	r := &fakeRunner{existing: map[string]bool{RemoteDaemonConf: true}}
+	if err := Update(r, tempBinary(t)); err != nil {
+		t.Fatal(err)
+	}
+	for _, cmd := range r.cmds {
+		if strings.Contains(cmd, RemoteState) {
+			t.Errorf("update touched the block state: %q", cmd)
+		}
+	}
+	if r.uploadedTo(RemoteState) {
+		t.Error("update must not overwrite the router's own block state")
+	}
+}

@@ -22,13 +22,43 @@ import (
 	"github.com/wighawag/curfew/internal/registry"
 )
 
-// Firewall is the enforcement surface this package needs. Narrow on purpose,
+// Firewall is the READ surface this package needs: what the kernel is doing
+// right now, one method per tier of the ordering contract. Narrow on purpose,
 // so the UI can be tested without root, netlink or a kernel.
+//
+// There is deliberately no Apply here. Every write goes through Core, because
+// a handler that applies a partial view of the desired state wipes the tiers
+// it did not know about: this interface used to carry Apply(macs), and adding
+// a device therefore cleared every schedule block until the next reconcile
+// tick, up to a minute later.
 type Firewall interface {
-	Apply(macs []string) error
 	Allowlist() ([]string, error)
-	// Blocked is what the firewall is currently dropping by schedule.
+	// Blocked is what the firewall is dropping by schedule or budget.
 	Blocked() ([]string, error)
+	// ManualBlocked is what it is dropping because a parent said so. A status
+	// derived without this reads a manually blocked profile as allowed, which
+	// docs/adr/0006 names as the trap in splitting the block into two sets.
+	ManualBlocked() ([]string, error)
+	// Tickets maps a MAC to the time the KERNEL says its grant has left.
+	Tickets() (map[string]time.Duration, error)
+}
+
+// Core is the policy layer: everything that CHANGES what the firewall is asked
+// to do. Keeping it behind an interface is what stops this package importing
+// the enforcement code, which the laptop binary must never reach (see
+// separation_test.go).
+type Core interface {
+	// Reconcile makes the firewall match the desired state.
+	Reconcile() error
+	// Block turns a profile off until a parent turns it back on.
+	Block(profile string) error
+	// Unblock lifts that decision, and nothing else.
+	Unblock(profile string) error
+	// GrantTicket gives a profile access for d.
+	GrantTicket(profile string, d time.Duration) error
+	// ManuallyBlocked reports the parent's INTENT, against which what the
+	// firewall is doing can be compared.
+	ManuallyBlocked() (map[string]bool, error)
 }
 
 // Store loads and saves the device registry.
@@ -42,6 +72,7 @@ type Server struct {
 	store    Store
 	schedule ScheduleStore
 	firewall Firewall
+	core     Core
 	log      *slog.Logger
 	user     string
 	password string
@@ -49,26 +80,23 @@ type Server struct {
 	// implicit, because the system default on OpenWrt is UTC and a household
 	// bedtime evaluated in UTC is silently an hour out half the year.
 	loc *time.Location
-	// reconcile re-applies the ruleset immediately after a schedule change,
-	// so the page never shows "should be blocked, but is not" while waiting
-	// for a tick that is up to a minute away.
-	reconcile func() error
 }
 
 // New builds the server. An empty user or password disables authentication,
 // which the daemon warns about loudly at startup: this page grants network
 // access, and it is reachable by the very devices it is keeping off the
 // internet, since blocking applies to forwarded traffic and not to the router.
-func New(store Store, sched ScheduleStore, firewall Firewall, log *slog.Logger,
-	user, password string, loc *time.Location, reconcile func() error) *Server {
+//
+// That reachability is why the password is half of the defence against a child
+// freeing themselves, and why the other half is that a manual block outranks a
+// ticket in the chain (ADR 0006). Neither half is sufficient alone.
+func New(store Store, sched ScheduleStore, firewall Firewall, core Core, log *slog.Logger,
+	user, password string, loc *time.Location) *Server {
 	if loc == nil {
 		loc = time.Local
 	}
-	if reconcile == nil {
-		reconcile = func() error { return nil }
-	}
-	return &Server{store: store, schedule: sched, firewall: firewall, log: log,
-		user: user, password: password, loc: loc, reconcile: reconcile}
+	return &Server{store: store, schedule: sched, firewall: firewall, core: core, log: log,
+		user: user, password: password, loc: loc}
 }
 
 // DeviceView is one row of the page and of the API.
@@ -109,6 +137,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/profiles/devices", s.handleProfileDevices)
 	mux.HandleFunc("/profiles/window/add", s.handleWindowAdd)
 	mux.HandleFunc("/profiles/window/remove", s.handleWindowRemove)
+	mux.HandleFunc("/profiles/block", s.handleProfileBlock)
+	mux.HandleFunc("/profiles/unblock", s.handleProfileUnblock)
+	mux.HandleFunc("/profiles/ticket", s.handleProfileTicket)
 	mux.HandleFunc("/devices", s.handleAddDevice)
 	mux.HandleFunc("/devices/rename", s.handleRenameDevice)
 	mux.HandleFunc("/devices/remove", s.handleRemoveDevice)
@@ -157,8 +188,18 @@ func (s *Server) render(w http.ResponseWriter, t *template.Template, data any, w
 }
 
 // view joins the registry (names) with the firewall (truth).
+//
+// Allowed is the verdict the whole chain would reach, not membership of the
+// allowlist. A device that is registered but inside its bedtime, or blocked by
+// a parent, is not allowed out, and a page saying otherwise because it read
+// only one set is the exact defect ADR 0006 warns about when the block splits
+// into two sets.
 func (s *Server) view() ([]DeviceView, error) {
 	reg, err := s.store.Load()
+	if err != nil {
+		return nil, err
+	}
+	fw, err := s.readFirewall()
 	if err != nil {
 		return nil, err
 	}
@@ -166,20 +207,18 @@ func (s *Server) view() ([]DeviceView, error) {
 	if err != nil {
 		return nil, err
 	}
-	allowed := make(map[string]bool, len(live))
-	for _, m := range live {
-		allowed[m] = true
-	}
 
 	out := make([]DeviceView, 0, len(reg.Devices))
 	seen := make(map[string]bool, len(reg.Devices))
 	for _, d := range reg.Devices {
 		seen[d.MAC] = true
-		out = append(out, DeviceView{MAC: d.MAC, Name: d.Name, Allowed: allowed[d.MAC]})
+		allowed, _ := fw.verdict(d.MAC)
+		out = append(out, DeviceView{MAC: d.MAC, Name: d.Name, Allowed: allowed})
 	}
 	for _, m := range live {
 		if !seen[m] {
-			out = append(out, DeviceView{MAC: m, Allowed: true, Unregistered: true})
+			allowed, _ := fw.verdict(m)
+			out = append(out, DeviceView{MAC: m, Allowed: allowed, Unregistered: true})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].MAC < out[j].MAC })
@@ -233,6 +272,10 @@ func (s *Server) handleDevicesPage(w http.ResponseWriter, r *http.Request) {
 // two leaves a device registered but not yet enforced, which the next
 // reconcile fixes; the reverse order would leave the firewall allowing a
 // device no file records, which nothing would ever correct.
+//
+// It reconciles the WHOLE desired state rather than pushing the new allowlist
+// on its own. Pushing one tier is what this used to do, and it silently
+// emptied every block set for as long as it took the next tick to arrive.
 func (s *Server) handleAddDevice(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
@@ -266,7 +309,7 @@ func (s *Server) handleAddDevice(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to save the registry", http.StatusInternalServerError)
 		return
 	}
-	if err := s.firewall.Apply(reg.MACs()); err != nil {
+	if err := s.core.Reconcile(); err != nil {
 		// Loudly, and with a non-2xx status. The device is registered but not
 		// enforced, and saying so is the entire point of this project.
 		s.log.Error("applying ruleset", "error", err)
@@ -350,7 +393,7 @@ func (s *Server) handleRemoveDevice(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to save the registry", http.StatusInternalServerError)
 		return
 	}
-	if err := s.firewall.Apply(reg.MACs()); err != nil {
+	if err := s.core.Reconcile(); err != nil {
 		s.log.Error("applying ruleset", "error", err)
 		http.Error(w, fmt.Sprintf("device removed from the list but the firewall was NOT updated, "+
 			"so it may still have access: %v", err), http.StatusInternalServerError)

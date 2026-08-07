@@ -13,9 +13,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wighawag/curfew/internal/blockstate"
+	"github.com/wighawag/curfew/internal/enforce"
+	"github.com/wighawag/curfew/internal/policy"
 	"github.com/wighawag/curfew/internal/registry"
 	"github.com/wighawag/curfew/internal/schedule"
 )
+
+// These tests drive the REAL policy layer, with only the kernel replaced by a
+// double. A hand-written fake core would let the page and the rules it is
+// supposed to reflect drift apart, which is the failure mode this project
+// keeps rediscovering, so the UI is tested against the same block, unblock and
+// ticket semantics the daemon runs.
 
 // fakeFirewall stands in for nftables so the UI is testable without a kernel.
 type fakeSchedule struct{ ps *schedule.Profiles }
@@ -32,20 +41,59 @@ func (f *fakeSchedule) Save(ps *schedule.Profiles) error {
 	return nil
 }
 
+// fakeFirewall is an in-memory stand-in for nftables: four sets and a ticket
+// timer, and no behaviour of its own.
+//
+// Keeping the enforcer's logic OUT of the double is deliberate, and was
+// learned here: a version of this double that reproduced the rule "a rebuild
+// drops a ticket for a manually blocked MAC" made the tests pass with that
+// rule deleted from the code. The page derives a device's state by walking
+// contract.Tiers, so if the double also encoded an order, a wrong order could
+// agree with itself and pass. What the chain does to a packet is settled in
+// internal/enforce, with packets.
 type fakeFirewall struct {
 	live      []string
 	blocked   []string
+	manual    []string
+	tickets   map[string]time.Duration
 	applyErr  error
 	readErr   error
+	grantErr  error
 	applyCall int
+	grants    int
+	cancels   int
 }
 
-func (f *fakeFirewall) Apply(macs []string) error {
+func (f *fakeFirewall) EnsureApplied(d enforce.Desired) (bool, error) {
 	f.applyCall++
 	if f.applyErr != nil {
-		return f.applyErr
+		return false, f.applyErr
 	}
-	f.live = append([]string(nil), macs...)
+	f.live = append([]string(nil), d.Allowed...)
+	f.blocked = append([]string(nil), d.Blocked...)
+	f.manual = append([]string(nil), d.Manual...)
+	return true, nil
+}
+
+func (f *fakeFirewall) GrantTicket(macs []string, d time.Duration) error {
+	if f.grantErr != nil {
+		return f.grantErr
+	}
+	f.grants++
+	if f.tickets == nil {
+		f.tickets = map[string]time.Duration{}
+	}
+	for _, m := range macs {
+		f.tickets[m] = d
+	}
+	return nil
+}
+
+func (f *fakeFirewall) CancelTickets(macs []string) error {
+	f.cancels++
+	for _, m := range macs {
+		delete(f.tickets, m)
+	}
 	return nil
 }
 
@@ -61,6 +109,45 @@ func (f *fakeFirewall) Blocked() ([]string, error) {
 		return nil, f.readErr
 	}
 	return append([]string(nil), f.blocked...), nil
+}
+
+func (f *fakeFirewall) ManualBlocked() ([]string, error) {
+	if f.readErr != nil {
+		return nil, f.readErr
+	}
+	return append([]string(nil), f.manual...), nil
+}
+
+func (f *fakeFirewall) Tickets() (map[string]time.Duration, error) {
+	if f.readErr != nil {
+		return nil, f.readErr
+	}
+	out := map[string]time.Duration{}
+	for m, d := range f.tickets {
+		out[m] = d
+	}
+	return out, nil
+}
+
+// memState is the persisted block state, in memory.
+type memState struct {
+	st      *blockstate.State
+	saveErr error
+}
+
+func (m *memState) Load() (*blockstate.State, error) {
+	if m.st == nil {
+		return &blockstate.State{ManualBlocked: []string{}}, nil
+	}
+	return &blockstate.State{ManualBlocked: append([]string(nil), m.st.ManualBlocked...)}, nil
+}
+
+func (m *memState) Save(s *blockstate.State) error {
+	if m.saveErr != nil {
+		return m.saveErr
+	}
+	m.st = &blockstate.State{ManualBlocked: append([]string(nil), s.ManualBlocked...)}
+	return nil
 }
 
 type memStore struct {
@@ -85,8 +172,21 @@ func newTestServer(t *testing.T, devices []registry.Device, live []string) (*Ser
 	t.Helper()
 	store := &memStore{reg: &registry.Registry{Devices: devices}}
 	fw := &fakeFirewall{live: live}
+	srv, _ := assemble(store, &fakeSchedule{}, &memState{}, fw, "", "", time.Local)
+	return srv, store, fw
+}
+
+// assemble wires the page to the real policy core over in-memory stores.
+func assemble(store *memStore, sch *fakeSchedule, st *memState, fw *fakeFirewall,
+	user, password string, loc *time.Location) (*Server, *policy.Core) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(store, &fakeSchedule{}, fw, log, "", "", time.Local, nil), store, fw
+	core := policy.New(store, sch, st, fw, loc, log)
+	return New(store, sch, fw, core, log, user, password, loc), core
+}
+
+func newAuthedServer(store *memStore, fw *fakeFirewall) *Server {
+	srv, _ := assemble(store, &fakeSchedule{}, &memState{}, fw, "parent", "hunter2", time.Local)
+	return srv
 }
 
 func post(t *testing.T, h http.Handler, path string, form url.Values) *httptest.ResponseRecorder {
@@ -221,9 +321,7 @@ func TestViewFlagsAMACTheFirewallAllowsButNobodyRegistered(t *testing.T) {
 func TestAuthGatesEverythingWhenConfigured(t *testing.T) {
 	store := &memStore{reg: &registry.Registry{}}
 	fw := &fakeFirewall{}
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(store, &fakeSchedule{}, fw, log, "parent", "hunter2", time.Local, nil)
-	h := srv.Handler()
+	h := newAuthedServer(store, fw).Handler()
 
 	for _, path := range []string{"/", "/devices/", "/api/devices"} {
 		rec := httptest.NewRecorder()
@@ -260,8 +358,7 @@ func TestAuthGatesEverythingWhenConfigured(t *testing.T) {
 
 func TestWrongPasswordIsRejected(t *testing.T) {
 	store := &memStore{reg: &registry.Registry{}}
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(store, &fakeSchedule{}, &fakeFirewall{}, log, "parent", "hunter2", time.Local, nil)
+	srv := newAuthedServer(store, &fakeFirewall{})
 	req := httptest.NewRequest(http.MethodGet, "/devices/", nil)
 	req.SetBasicAuth("parent", "wrong")
 	rec := httptest.NewRecorder()
@@ -342,8 +439,7 @@ func TestRenameRejectsGET(t *testing.T) {
 
 func TestRenameIsAuthenticated(t *testing.T) {
 	store := &memStore{reg: &registry.Registry{Devices: []registry.Device{{MAC: "aa:bb:cc:dd:ee:01", Name: "old"}}}}
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(store, &fakeSchedule{}, &fakeFirewall{}, log, "parent", "hunter2", time.Local, nil)
+	srv := newAuthedServer(store, &fakeFirewall{})
 	rec := post(t, srv.Handler(), "/devices/rename", url.Values{
 		"mac": {"aa:bb:cc:dd:ee:01"}, "name": {"intruder"},
 	})
@@ -438,8 +534,7 @@ func TestRemoveRejectsGETAndRequiresAuth(t *testing.T) {
 	}
 
 	authStore := &memStore{reg: &registry.Registry{Devices: []registry.Device{{MAC: "aa:bb:cc:dd:ee:01"}}}}
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	authed := New(authStore, &fakeSchedule{}, &fakeFirewall{}, log, "parent", "hunter2", time.Local, nil)
+	authed := newAuthedServer(authStore, &fakeFirewall{})
 	rec = post(t, authed.Handler(), "/devices/remove", url.Values{"mac": {"aa:bb:cc:dd:ee:01"}})
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("want 401, got %d", rec.Code)
@@ -452,21 +547,24 @@ func TestRemoveRejectsGETAndRequiresAuth(t *testing.T) {
 func newProfileServer(t *testing.T, devices []registry.Device, ps *schedule.Profiles,
 	allowed, blocked []string) (*Server, *fakeSchedule, *fakeFirewall) {
 	t.Helper()
+	srv, _, sch, fw := newProfileServerWithState(t, devices, ps, allowed, blocked, nil)
+	return srv, sch, fw
+}
+
+// newProfileServerWithState is the same, plus the persisted manual blocks and
+// the state store the test can inspect afterwards.
+func newProfileServerWithState(t *testing.T, devices []registry.Device, ps *schedule.Profiles,
+	allowed, blocked, manuallyBlocked []string) (*Server, *memState, *fakeSchedule, *fakeFirewall) {
+	t.Helper()
 	store := &memStore{reg: &registry.Registry{Devices: devices}}
 	sch := &fakeSchedule{ps: ps}
 	fw := &fakeFirewall{live: allowed, blocked: blocked}
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	// A reconcile that mirrors the daemon's: recompute from the schedule and
-	// push it into the fake firewall, so tests see what a user would.
-	reconcile := func() error {
-		cur, err := sch.Load()
-		if err != nil {
-			return err
-		}
-		fw.blocked = cur.BlockedMACs(time.Now().In(time.Local))
-		return nil
+	st := &memState{}
+	if manuallyBlocked != nil {
+		st.st = &blockstate.State{ManualBlocked: manuallyBlocked}
 	}
-	return New(store, sch, fw, log, "", "", time.Local, reconcile), sch, fw
+	srv, _ := assemble(store, sch, st, fw, "", "", time.Local)
+	return srv, st, sch, fw
 }
 
 func TestHomeListsProfilesWithStatus(t *testing.T) {
@@ -586,7 +684,9 @@ func TestHomeSurfacesDriftBetweenScheduleAndFirewall(t *testing.T) {
 	if !views[0].Drifted() {
 		t.Fatal("a firewall block with no window behind it is drift and must be reported")
 	}
-	if !strings.Contains(views[0].Reason, "no window") {
+	// "nothing" rather than "no window": with manual blocks in the model, the
+	// absent explanation could be either a window or a parent's decision.
+	if !strings.Contains(views[0].Reason, "nothing says it should be") {
 		t.Errorf("the reason should explain the drift, got %q", views[0].Reason)
 	}
 }
@@ -719,11 +819,17 @@ func TestSetProfileMembership(t *testing.T) {
 func TestScheduleMutationsRequireAuthAndPOST(t *testing.T) {
 	store := &memStore{reg: &registry.Registry{}}
 	sch := &fakeSchedule{ps: &schedule.Profiles{Profiles: []schedule.Profile{{Name: "eli"}}}}
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(store, sch, &fakeFirewall{}, log, "parent", "hunter2", time.Local, nil)
+	st := &memState{}
+	fw := &fakeFirewall{}
+	srv, _ := assemble(store, sch, st, fw, "parent", "hunter2", time.Local)
+	// The ticket and block routes are on this list for the reason ADR 0006
+	// gives: this page is served BY the router, so it is reachable by the very
+	// device being blocked. A measured attack had a blocked child load the
+	// unauthenticated page and issue itself a ticket.
 	for _, path := range []string{
 		"/profiles/create", "/profiles/delete", "/profiles/devices",
 		"/profiles/window/add", "/profiles/window/remove",
+		"/profiles/block", "/profiles/unblock", "/profiles/ticket",
 	} {
 		rec := post(t, srv.Handler(), path, url.Values{"name": {"eli"}})
 		if rec.Code != http.StatusUnauthorized {
@@ -739,6 +845,12 @@ func TestScheduleMutationsRequireAuthAndPOST(t *testing.T) {
 	}
 	if len(sch.ps.Profiles) != 1 {
 		t.Error("nothing should have changed")
+	}
+	if st.st != nil {
+		t.Errorf("an unauthenticated request must not record a block: %+v", st.st)
+	}
+	if fw.grants != 0 {
+		t.Errorf("an unauthenticated request must not issue a ticket, got %d", fw.grants)
 	}
 }
 
@@ -792,8 +904,7 @@ func TestSchedulesUseTheConfiguredTimezone(t *testing.T) {
 	store := &memStore{reg: &registry.Registry{Devices: []registry.Device{{MAC: mac}}}}
 	sch := &fakeSchedule{ps: ps}
 	fw := &fakeFirewall{live: []string{mac}}
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(store, sch, fw, log, "", "", london, nil)
+	srv, _ := assemble(store, sch, &memState{}, fw, "", "", london)
 
 	// 11:20 UTC is 12:20 in London during BST: inside the window.
 	utcNoonish := time.Date(2026, 7, 3, 11, 20, 0, 0, time.UTC)
@@ -1029,5 +1140,408 @@ func TestSubmittingNoDaysIsStillAnError(t *testing.T) {
 	p, _ := sch.ps.Find("eli")
 	if len(p.Windows) != 0 {
 		t.Error("nothing should have been saved")
+	}
+}
+
+// --- manual blocks and tickets -------------------------------------------
+//
+// Every page assertion below ends in assertWholePage. A template error halfway
+// down leaves a 200 with a truncated body, and a real bug shipped here that
+// way: the status near the top looked right while the forms below it had
+// silently vanished.
+
+func eliHousehold() *schedule.Profiles {
+	return &schedule.Profiles{Profiles: []schedule.Profile{
+		{Name: "eli", Devices: []string{"aa:bb:cc:dd:ee:01"},
+			Windows: []schedule.Window{{Days: schedule.AllDays, Start: "22:00", End: "08:00"}}},
+		{Name: "dad", Devices: []string{"aa:bb:cc:dd:ee:02"}},
+	}}
+}
+
+func eliDevices() []registry.Device {
+	return []registry.Device{
+		{MAC: "aa:bb:cc:dd:ee:01", Name: "eli phone"},
+		{MAC: "aa:bb:cc:dd:ee:02", Name: "dad phone"},
+	}
+}
+
+func getHome(t *testing.T, srv *Server) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	assertWholePage(t, rec)
+	return rec
+}
+
+func TestHomeOffersABlockButtonAndTicketDurations(t *testing.T) {
+	srv, _, _ := newProfileServer(t, eliDevices(), eliHousehold(),
+		[]string{"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"}, nil)
+	body := getHome(t, srv).Body.String()
+
+	if got := strings.Count(body, `action="/profiles/block"`); got != 2 {
+		t.Errorf("want a block button for each of the 2 profiles, got %d", got)
+	}
+	if strings.Contains(body, `action="/profiles/unblock"`) {
+		t.Error("nothing is blocked, so no unblock button should be offered")
+	}
+	// Four durations per profile, and each must carry its OWN profile name:
+	// a shared name here would block or ticket the wrong child.
+	if got := strings.Count(body, `action="/profiles/ticket"`); got != 2*len(ticketDurations) {
+		t.Errorf("want %d ticket buttons, got %d", 2*len(ticketDurations), got)
+	}
+	if !strings.Contains(body, `name="minutes" value="30"`) {
+		t.Error("the 30 minute tap should be there")
+	}
+	for _, name := range []string{"eli", "dad"} {
+		if !strings.Contains(body, `<input type="hidden" name="name" value="`+name+`">`) {
+			t.Errorf("the controls must carry the profile they belong to, %q missing", name)
+		}
+	}
+}
+
+func TestBlockingFromThePageEnforcesItAndSwapsTheControls(t *testing.T) {
+	srv, st, _, fw := newProfileServerWithState(t, eliDevices(), eliHousehold(),
+		[]string{"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"}, nil, nil)
+
+	rec := post(t, srv.Handler(), "/profiles/block", url.Values{"name": {"eli"}})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("want 303, got %d: %s", rec.Code, rec.Body)
+	}
+	if loc := rec.Header().Get("Location"); strings.Contains(loc, "error=") {
+		t.Fatalf("unexpected error: %s", loc)
+	}
+	if st.st == nil || !st.st.IsBlocked("eli") {
+		t.Errorf("the decision must be persisted, got %+v", st.st)
+	}
+	if len(fw.manual) != 1 || fw.manual[0] != "aa:bb:cc:dd:ee:01" {
+		t.Errorf("eli's device must be in the manual tier of the firewall, got %v", fw.manual)
+	}
+
+	body := getHome(t, srv).Body.String()
+	if !strings.Contains(body, "unblock eli") {
+		t.Error("a blocked profile must offer the way back")
+	}
+	// Ticket buttons for eli must be gone: a ticket cannot lift this block, so
+	// offering one would be a button that does nothing.
+	if got := strings.Count(body, `action="/profiles/ticket"`); got != len(ticketDurations) {
+		t.Errorf("only dad should still offer tickets, got %d buttons", got)
+	}
+	if !strings.Contains(body, "Unblock first") {
+		t.Error("the page should say why the ticket buttons are gone")
+	}
+}
+
+// The trap ADR 0006 names: a status derived without a manual_blocked_macs case
+// reads a manually blocked profile as ALLOWED.
+func TestAManuallyBlockedProfileNeverReadsAsAllowed(t *testing.T) {
+	srv, _, _, _ := newProfileServerWithState(t, eliDevices(), eliHousehold(),
+		[]string{"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"}, nil, []string{"eli"})
+	if err := srv.core.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	noon := time.Date(2026, 3, 4, 12, 0, 0, 0, time.UTC)
+	views, err := srv.profileViews(noon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eli, dad := views[1], views[0] // sorted by name: adults/dad first
+	if eli.Name != "eli" || dad.Name != "dad" {
+		t.Fatalf("fixture confusion: %s, %s", views[0].Name, views[1].Name)
+	}
+	if !eli.Blocked {
+		t.Error("a manually blocked profile must read as blocked, not allowed")
+	}
+	if eli.Devices[0].Allowed {
+		t.Error("its device must read as not allowed")
+	}
+	if eli.StateLabel != "blocked by you" {
+		t.Errorf("the badge should name the reason, got %q", eli.StateLabel)
+	}
+	// It is NOT drift: the firewall and the parent's decision agree.
+	if eli.Drifted() {
+		t.Errorf("a manual block is intended state, not drift: %q", eli.Reason)
+	}
+	// Control: the profile nobody blocked still reads as allowed.
+	if dad.Blocked || !dad.Devices[0].Allowed {
+		t.Error("the unblocked profile must still read as allowed")
+	}
+}
+
+func TestATicketFromThePageIsGrantedAndShown(t *testing.T) {
+	srv, _, _, fw := newProfileServerWithState(t, eliDevices(), eliHousehold(),
+		[]string{"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"}, nil, nil)
+
+	rec := post(t, srv.Handler(), "/profiles/ticket", url.Values{
+		"name": {"eli"}, "minutes": {"30"}})
+	if loc := rec.Header().Get("Location"); strings.Contains(loc, "error=") {
+		t.Fatalf("unexpected error: %s", loc)
+	}
+	if fw.tickets["aa:bb:cc:dd:ee:01"] != 30*time.Minute {
+		t.Fatalf("the ticket must reach the firewall, got %v", fw.tickets)
+	}
+	if fw.tickets["aa:bb:cc:dd:ee:02"] != 0 {
+		t.Error("ticketing eli must not ticket dad")
+	}
+
+	// The page shows the KERNEL's remaining time, rounded down, so it can
+	// never promise time that has already gone.
+	fw.tickets["aa:bb:cc:dd:ee:01"] = 23*time.Minute + 45*time.Second
+	body := getHome(t, srv).Body.String()
+	if !strings.Contains(body, "23m left") {
+		t.Errorf("the page should show the time left, got:\n%s", body)
+	}
+}
+
+// A ticket inside a bedtime window is the point of a ticket. The page must
+// read that as intended, not as the firewall disagreeing with the schedule.
+func TestATicketedProfileInsideItsWindowIsNotDrift(t *testing.T) {
+	srv, _, _, fw := newProfileServerWithState(t, eliDevices(), eliHousehold(),
+		[]string{"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"},
+		[]string{"aa:bb:cc:dd:ee:01"}, nil)
+	fw.tickets = map[string]time.Duration{"aa:bb:cc:dd:ee:01": 25 * time.Minute}
+
+	bedtime := time.Date(2026, 3, 4, 23, 0, 0, 0, time.UTC)
+	views, err := srv.profileViews(bedtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eli := views[1]
+	if eli.Name != "eli" {
+		t.Fatalf("fixture confusion: %+v", eli.Name)
+	}
+	if eli.Blocked {
+		t.Error("a live ticket must show the profile as reachable")
+	}
+	if eli.Drifted() {
+		t.Errorf("a ticket overriding a window is intended, not drift: %q", eli.Reason)
+	}
+	if !strings.Contains(eli.Reason, "then the window takes over again") {
+		t.Errorf("the page should say the window resumes on expiry, got %q", eli.Reason)
+	}
+	// And once it lapses, with no bookkeeping anywhere, the window is back.
+	fw.tickets = nil
+	views, err = srv.profileViews(bedtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !views[1].Blocked || views[1].Drifted() {
+		t.Errorf("after expiry the window must simply apply again, got %+v", views[1].StateLabel)
+	}
+}
+
+func TestATicketWithNonsenseMinutesIsRefused(t *testing.T) {
+	srv, _, _, fw := newProfileServerWithState(t, eliDevices(), eliHousehold(),
+		[]string{"aa:bb:cc:dd:ee:01"}, nil, nil)
+	for _, bad := range []string{"", "soon", "-5", "0"} {
+		rec := post(t, srv.Handler(), "/profiles/ticket", url.Values{
+			"name": {"eli"}, "minutes": {bad}})
+		if loc := rec.Header().Get("Location"); !strings.Contains(loc, "error=") {
+			t.Errorf("minutes=%q should be refused, got %q", bad, loc)
+		}
+	}
+	if fw.grants != 0 {
+		t.Errorf("nothing should have been granted, got %d", fw.grants)
+	}
+}
+
+func TestAFailedTicketIsReportedRatherThanClaimed(t *testing.T) {
+	srv, _, _, fw := newProfileServerWithState(t, eliDevices(), eliHousehold(),
+		[]string{"aa:bb:cc:dd:ee:01"}, nil, nil)
+	fw.grantErr = errors.New("table curfew is not present")
+	rec := post(t, srv.Handler(), "/profiles/ticket", url.Values{
+		"name": {"eli"}, "minutes": {"30"}})
+	loc := rec.Header().Get("Location")
+	if !strings.Contains(loc, "error=") {
+		t.Fatalf("a firewall failure must be surfaced, got %q", loc)
+	}
+	if !strings.Contains(loc, "not+present") && !strings.Contains(loc, "not%20present") {
+		t.Errorf("the message should say what went wrong, got %q", loc)
+	}
+}
+
+func TestBlockingAnUnknownProfileIsAnError(t *testing.T) {
+	srv, st, _, _ := newProfileServerWithState(t, eliDevices(), eliHousehold(), nil, nil, nil)
+	rec := post(t, srv.Handler(), "/profiles/block", url.Values{"name": {"ghost"}})
+	if loc := rec.Header().Get("Location"); !strings.Contains(loc, "error=") {
+		t.Errorf("want the error surfaced, got %q", loc)
+	}
+	if st.st != nil && len(st.st.ManualBlocked) != 0 {
+		t.Errorf("nothing should have been recorded: %+v", st.st)
+	}
+}
+
+// A persisted decision must not outlive the profile it was about, or a profile
+// later recreated under the same name comes back mysteriously blocked.
+func TestDeletingAProfileClearsItsManualBlock(t *testing.T) {
+	srv, st, sch, _ := newProfileServerWithState(t, eliDevices(), eliHousehold(),
+		[]string{"aa:bb:cc:dd:ee:01"}, nil, []string{"eli"})
+	rec := post(t, srv.Handler(), "/profiles/delete", url.Values{"name": {"eli"}})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("want 303, got %d", rec.Code)
+	}
+	if _, ok := sch.ps.Find("eli"); ok {
+		t.Fatal("the profile should be gone")
+	}
+	if st.st.IsBlocked("eli") {
+		t.Error("the manual block must go with the profile")
+	}
+}
+
+// The devices page answers "can this device reach the internet", which is the
+// whole chain, not membership of the allowlist.
+func TestTheDevicePageReportsTheWholeChain(t *testing.T) {
+	srv, _, _, fw := newProfileServerWithState(t, eliDevices(), eliHousehold(),
+		[]string{"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"}, nil, []string{"eli"})
+	if err := srv.core.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if len(fw.manual) != 1 {
+		t.Fatalf("fixture: eli should be manually blocked, got %v", fw.manual)
+	}
+	devices, err := srv.view()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byMAC := map[string]DeviceView{}
+	for _, d := range devices {
+		byMAC[d.MAC] = d
+	}
+	if byMAC["aa:bb:cc:dd:ee:01"].Allowed {
+		t.Error("a registered but manually blocked device must not read as allowed")
+	}
+	if !byMAC["aa:bb:cc:dd:ee:02"].Allowed {
+		t.Error("the other device must still read as allowed, or the check above proves nothing")
+	}
+}
+
+// A ticket for a device that is not on the allowlist still gets it out: the
+// ticket accept sits above the allowlist. Asserted here because the page must
+// tell the same story the chain does.
+func TestTheDevicePageShowsATicketedDeviceAsAllowed(t *testing.T) {
+	srv, _, _, fw := newProfileServerWithState(t, eliDevices(), eliHousehold(),
+		nil, nil, nil)
+	fw.tickets = map[string]time.Duration{"aa:bb:cc:dd:ee:01": time.Minute}
+	devices, err := srv.view()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range devices {
+		if d.MAC == "aa:bb:cc:dd:ee:01" && !d.Allowed {
+			t.Error("a device with a live ticket reaches the internet, so the page must say so")
+		}
+		if d.MAC == "aa:bb:cc:dd:ee:02" && d.Allowed {
+			t.Error("a device with no ticket and no allowlist entry must read as blocked")
+		}
+	}
+}
+
+func TestHumanDurationRoundsDownAndNeverPromisesTimeThatIsGone(t *testing.T) {
+	for _, c := range []struct {
+		in   time.Duration
+		want string
+	}{
+		{30 * time.Second, "under a minute"},
+		{59*time.Second + 999*time.Millisecond, "under a minute"},
+		{time.Minute, "1m"},
+		{89 * time.Second, "1m"},
+		{25*time.Minute + 59*time.Second, "25m"},
+		{time.Hour, "1h"},
+		{90 * time.Minute, "1h 30m"},
+		{2 * time.Hour, "2h"},
+	} {
+		if got := humanDuration(c.in); got != c.want {
+			t.Errorf("humanDuration(%s) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// The page must reach the same verdict the chain does, on the one state where
+// the tiers disagree: a MAC in BOTH the manual set and the ticket set.
+//
+// The core refuses to create that state, so this is about the page never
+// contradicting the kernel if it arises anyway (a race, or something writing
+// the set out of band). It is also what makes the tier order load-bearing for
+// this file: reordering contract.Tiers breaks this test and the packet-path
+// test in internal/enforce together.
+func TestThePageAgreesWithTheChainWhenAMACIsInBothSets(t *testing.T) {
+	srv, _, _, fw := newProfileServerWithState(t, eliDevices(), eliHousehold(),
+		[]string{"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"}, nil, []string{"eli"})
+	if err := srv.core.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	// A ticket that should lose to the manual block.
+	fw.tickets = map[string]time.Duration{"aa:bb:cc:dd:ee:01": 20 * time.Minute}
+
+	noon := time.Date(2026, 3, 4, 12, 0, 0, 0, time.UTC)
+	views, err := srv.profileViews(noon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eli := views[1]
+	if eli.Name != "eli" {
+		t.Fatalf("fixture confusion: %q", eli.Name)
+	}
+	if !eli.Blocked {
+		t.Error("a manual block outranks a ticket in the chain, so the page must say blocked")
+	}
+	if strings.Contains(eli.StateLabel, "ticket") {
+		t.Errorf("the badge must not advertise a ticket that the chain is ignoring, got %q", eli.StateLabel)
+	}
+	// Control: without the manual block the same ticket does free them, so the
+	// assertion above is about precedence rather than tickets being ignored.
+	fw.manual = nil
+	views, err = srv.profileViews(noon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if views[1].Blocked {
+		t.Error("with the manual block gone the ticket must let them out")
+	}
+}
+
+// Right answer, wrong reason.
+//
+// A profile a parent blocked indefinitely, which the firewall is only holding
+// down with a bedtime window, is OFFLINE, so a status that only asks
+// "blocked?" reports everything as fine. It is not fine: at 08:00 the window
+// lifts and the child is online while the page still says a parent blocked
+// them. The page has to compare the manual tier itself, not just the verdict.
+func TestAManualBlockTheFirewallIsNotEnforcingIsDrift(t *testing.T) {
+	srv, _, _, fw := newProfileServerWithState(t, eliDevices(), eliHousehold(),
+		[]string{"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"},
+		[]string{"aa:bb:cc:dd:ee:01"}, // held down by the WINDOW only
+		[]string{"eli"})               // but a parent blocked them indefinitely
+	fw.manual = nil
+
+	bedtime := time.Date(2026, 3, 4, 23, 0, 0, 0, time.UTC)
+	views, err := srv.profileViews(bedtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eli := views[1]
+	if eli.Name != "eli" {
+		t.Fatalf("fixture confusion: %q", eli.Name)
+	}
+	if !eli.Blocked {
+		t.Fatal("the window has them offline, which is what makes this trap quiet")
+	}
+	if !eli.Drifted() {
+		t.Error("a manual block the firewall is not enforcing must be reported, " +
+			"even though the profile happens to be offline for another reason")
+	}
+	if !strings.Contains(eli.Reason, "not enforcing") {
+		t.Errorf("the reason must name the disagreement, got %q", eli.Reason)
+	}
+
+	// Control: once the firewall really is enforcing it, the same state is not
+	// drift, so the check above is about the disagreement and not about manual
+	// blocks always looking wrong.
+	fw.manual = []string{"aa:bb:cc:dd:ee:01"}
+	views, err = srv.profileViews(bedtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if views[1].Drifted() {
+		t.Errorf("an enforced manual block is not drift: %q", views[1].Reason)
 	}
 }

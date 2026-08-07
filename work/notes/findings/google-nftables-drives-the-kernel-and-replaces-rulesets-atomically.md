@@ -1,7 +1,7 @@
 ---
 title: google/nftables drives the kernel directly and can replace a whole ruleset atomically, carrying live timeouts
 slug: google-nftables-drives-the-kernel-and-replaces-rulesets-atomically
-source: 'measured 2026-08-06 with github.com/google/nftables v0.3.0, Go 1.26, CGO_ENABLED=0 static amd64 binary, run inside openwrt/rootfs:x86-64-25.12.4 with NET_ADMIN/SYS_ADMIN/NET_RAW, against the repo packet-path harness (test/test_helper/netns.bash). IMPORTANT FIDELITY LIMIT: a container shares the HOST kernel, so this exercised Linux 6.12.96 (Debian amd64), NOT the router aarch64 OpenWrt 25.12.5 kernel. Netlink is a kernel interface, so unlike the shell tests this gap is not obviously irrelevant and needs one confirmation on the real router.'
+source: 'measured 2026-08-06 with github.com/google/nftables v0.3.0, Go 1.26, CGO_ENABLED=0 static amd64 binary, run inside openwrt/rootfs:x86-64-25.12.4 with NET_ADMIN/SYS_ADMIN/NET_RAW, against the repo packet-path harness (test/test_helper/netns.bash). ORIGINAL FIDELITY LIMIT, now closed: a container shares the HOST kernel, so this exercised Linux 6.12.96 (Debian amd64), NOT the router aarch64 OpenWrt kernel. That gap was closed on 2026-08-07 on the real GL-MT6000; see the section at the end.'
 ---
 
 ## The library drives the kernel, with `nft` never invoked
@@ -47,3 +47,31 @@ Two details worth knowing:
 ```
 
 Semantically identical (offset 48 bits, length 48 bits, being bytes 6 to 11 of the link-layer header), and it enforces correctly on packets. But any test asserting on ruleset TEXT will break across a shell-to-Go port even when behaviour is unchanged. This is independent evidence for `docs/adr/0004-tests-assert-on-the-packet-path.md`: packet-path assertions survive the port, text assertions do not, which is exactly what a language-agnostic acceptance suite needs.
+
+## CONFIRMED on the router's own kernel (2026-08-07)
+
+The fidelity limit above is closed. The same library behaviour was measured directly on the live GL-MT6000, **aarch64, kernel 6.12.94**, by a standalone static arm64 binary working in its own table (`curfew_probe`) with no chain and no hook, so it could not affect a packet in the house. All five facts held, and the probe removed its table afterwards:
+
+```
+PASS  the kernel accepted an ether_addr set with 'flags timeout'
+PASS  a 30s element reports a live countdown (got 30s)
+PASS  the countdown decreases on its own (30s then 28s)
+PASS  a whole-table replace carrying a live element succeeded in one transaction
+PASS  the carried element survived the replace (got 27.95s)
+PASS  the replace did NOT restart the clock (28s before, 27.95s after)
+PASS  the kernel reclaimed an expired element with no process involved
+```
+
+The probe was itself validated before being trusted: it passes in the container, and with its central check deliberately broken (re-granting the original 30s instead of the remaining time) it reports FAIL and exits non-zero, so a PASS is evidence rather than an absence of output.
+
+**The same behaviour was then observed in production**, which is stronger than the probe because it is the daemon's own reconcile path rather than a test harness. A 15 minute ticket, after a config change forced a whole-table rebuild:
+
+```
+elements = { aa:bb:cc:dd:ee:01 timeout 14m48s550ms expires 14m34s880ms }
+```
+
+(The MAC is redacted to the fixtures' placeholder; the timings are verbatim.)
+
+Read that pair carefully, because it is self-evidencing. The `timeout` field no longer says the granted `15m`, which means this element was re-emitted with the time remaining at the moment of the rebuild; an element that had never been carried would still read `15m`. And the deadline is preserved exactly: 900s granted, 888.55s carried, so the rebuild landed 11.45s in, and 888.55 + 11.45 = 900.00.
+
+**Consequence worth restating, because it is now visible in production:** after the first rebuild the originally granted duration is unrecoverable, since the kernel keeps only the deadline. Anything wanting to display "a 30 minute ticket" must store that separately. curfew deliberately does not, and shows the kernel's remaining time instead, so there is no parallel clock that can drift from the kernel's.
