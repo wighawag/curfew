@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wighawag/curfew/internal/budget"
 	"github.com/wighawag/curfew/internal/contract"
 	"github.com/wighawag/curfew/internal/schedule"
 )
@@ -73,6 +74,11 @@ type ProfileView struct {
 	// "allowed", which hid the fact that a window was active.
 	StateLabel string
 	StateClass string
+	// Timing answers the two questions a parent has with a child in front of
+	// them: when does this end, and when does the next one start. Empty when
+	// there is no answer, which is honest: a manual block ends when a parent
+	// says so, and a profile with no windows has no next block.
+	Timing string
 	// Budget is this profile's allowance line, empty when it has none.
 	Budget string
 	// Observed is what the profile's devices actually sent in the last
@@ -178,6 +184,7 @@ func (s *Server) profileViews(now time.Time) ([]ProfileView, error) {
 		allTicketed := len(p.Devices) > 0 && byReason[contract.ReasonTicket] == len(p.Devices)
 		v.ManualEnforced = allManual
 
+		v.Timing = timingLine(p, budgets[p.Name], v.ManuallyBlocked, windowActive, now)
 		v.Budget, v.Observed = budgetLines(budgets[p.Name], interval)
 
 		v.NeedsDevices = len(p.Devices) == 0
@@ -602,4 +609,53 @@ func ticketChoices() []ticketChoice {
 		out = append(out, ticketChoice{Minutes: int(d.Minutes()), Label: humanDuration(d)})
 	}
 	return out
+}
+
+// timingLine says when the current block lifts, or when the next one lands.
+//
+// It exists because a window list is not an answer. "22:00 to 08:00, every
+// day" makes a parent do the arithmetic at the moment they least want to, and
+// a cooldown had no visible end at all: the page said "nothing else is blocking
+// them right now" while a budget cooldown was very much still running, which
+// is precisely the reassuring half-truth this project exists to remove.
+//
+// Everything here is DERIVED from the clock on each render, so nothing can go
+// stale and nothing is scheduled.
+func timingLine(p schedule.Profile, b budget.Status, manuallyBlocked, windowActive bool,
+	now time.Time) string {
+
+	if manuallyBlocked {
+		// No time to give, and inventing one would be a lie: it lifts when a
+		// parent lifts it.
+		return "blocked until you unblock it"
+	}
+	// A live cooldown is reported even when a ticket is currently overriding
+	// it, because it is what the child falls back to when the ticket lapses.
+	if b.CooldownLeft > 0 {
+		return fmt.Sprintf("stretch used up; next allowed at %s (in %s)",
+			now.Add(b.CooldownLeft).Format("15:04"), humanDuration(b.CooldownLeft))
+	}
+	if b.Blocked && b.Reason == budget.ReasonDaily {
+		return "daily allowance spent; back when the day resets"
+	}
+	when, willBlock, ok := p.NextChange(now)
+	if !ok {
+		return ""
+	}
+	at := when.Format("15:04")
+	// The weekday appears only when the moment is genuinely far off. Keying
+	// on "a different calendar day" instead reads "blocked until Tue 08:00"
+	// for an ordinary overnight bedtime, which is noise eight hours before it
+	// happens; but a weekday-only window seen on a Saturday really does need
+	// to say Monday.
+	if when.Sub(now) > 18*time.Hour {
+		at = when.Format("Mon 15:04")
+	}
+	if windowActive && !willBlock {
+		return fmt.Sprintf("blocked until %s", at)
+	}
+	if !windowActive && willBlock {
+		return fmt.Sprintf("next blocked at %s", at)
+	}
+	return ""
 }

@@ -315,3 +315,70 @@ func TestBudgetsSurviveTheRoundTripThatPullPerforms(t *testing.T) {
 		t.Error("Equal ignores a changed reset time, so one side would keep the other's day boundary")
 	}
 }
+
+func atLocal(t *testing.T, s string) time.Time {
+	t.Helper()
+	got, err := time.ParseInLocation("2006-01-02 15:04", s, time.UTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// The two questions a parent has with a child in front of them.
+func TestNextChangeAnswersWhenABlockEndsAndWhenTheNextBegins(t *testing.T) {
+	// Bedtime 22:00 to 08:00, every night.
+	p := Profile{Name: "eli", Windows: []Window{{Days: AllDays, Start: "22:00", End: "08:00"}}}
+
+	// Inside the window: when does it END?
+	when, blocked, ok := p.NextChange(atLocal(t, "2026-08-10 23:30"))
+	if !ok {
+		t.Fatal("want an answer while blocked")
+	}
+	if blocked {
+		t.Error("the change should be to ALLOWED")
+	}
+	if got := when.Format("2006-01-02 15:04"); got != "2026-08-11 08:00" {
+		t.Errorf("bedtime should end at 08:00 the next morning, got %s", got)
+	}
+
+	// Outside it: when does the next one START?
+	when, blocked, ok = p.NextChange(atLocal(t, "2026-08-10 09:00"))
+	if !ok {
+		t.Fatal("want an answer while allowed")
+	}
+	if !blocked {
+		t.Error("the change should be to BLOCKED")
+	}
+	if got := when.Format("2006-01-02 15:04"); got != "2026-08-10 22:00" {
+		t.Errorf("the next bedtime should be 22:00 the same evening, got %s", got)
+	}
+}
+
+// A weekday-only window must skip the weekend rather than reporting tomorrow.
+func TestNextChangeSkipsDaysTheWindowDoesNotApplyOn(t *testing.T) {
+	// 2026-08-08 is a Saturday.
+	p := Profile{Name: "eli", Windows: []Window{
+		{Days: []Day{Mon, Tue, Wed, Thu, Fri}, Start: "09:00", End: "10:00"}}}
+	when, blocked, ok := p.NextChange(atLocal(t, "2026-08-08 12:00"))
+	if !ok || !blocked {
+		t.Fatalf("want a future block, got ok=%v blocked=%v", ok, blocked)
+	}
+	if got := when.Format("Mon 2006-01-02 15:04"); got != "Mon 2026-08-10 09:00" {
+		t.Errorf("a weekday window should next fire on Monday, got %s", got)
+	}
+}
+
+// A profile with no windows never changes, and must say so rather than
+// inventing a time.
+func TestNextChangeSaysNothingWhenNothingEverChanges(t *testing.T) {
+	if _, _, ok := (Profile{Name: "ronan"}).NextChange(time.Now()); ok {
+		t.Error("a profile with no windows must report no upcoming change")
+	}
+	// An all-day, every-day window never flips either.
+	always := Profile{Windows: []Window{{Days: AllDays, Start: "00:00", End: "23:59"}}}
+	when, _, ok := always.NextChange(atLocal(t, "2026-08-10 12:00"))
+	if ok && when.Sub(atLocal(t, "2026-08-10 12:00")) > 8*24*time.Hour {
+		t.Errorf("an answer beyond the search horizon: %s", when)
+	}
+}

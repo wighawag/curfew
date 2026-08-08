@@ -153,8 +153,10 @@ func TestReconcileIsANoOpWhenTheRouterAlreadyAgrees(t *testing.T) {
 	}
 	already := []Host{
 		{Section: "@host[0]", MAC: "f8:25:51:09:38:38", IP: "192.168.1.10", Name: "parental_printer"},
-		{Section: "curfew_14e01d6a9c6c", MAC: "14:e0:1d:6a:9c:6c", IP: "192.168.1.123", Name: "eli phone"},
-		{Section: "curfew_f0d7aada6635", MAC: "f0:d7:aa:da:66:35", IP: "192.168.1.182", Name: "tia phone"},
+		// No names: curfew writes none, so this is what a converged router
+		// actually looks like.
+		{Section: "curfew_14e01d6a9c6c", MAC: "14:e0:1d:6a:9c:6c", IP: "192.168.1.123"},
+		{Section: "curfew_f0d7aada6635", MAC: "f0:d7:aa:da:66:35", IP: "192.168.1.182"},
 	}
 	plan := Reconcile(already, devices)
 	if len(plan.Commands) != 0 {
@@ -171,24 +173,71 @@ func TestReconcileIsANoOpWhenTheRouterAlreadyAgrees(t *testing.T) {
 // slightly too eager would freeze every device at its first-ever address.
 func TestAChangedAddressIsRewritten(t *testing.T) {
 	already := []Host{{Section: "curfew_14e01d6a9c6c", MAC: "14:e0:1d:6a:9c:6c",
-		IP: "192.168.1.123", Name: "eli phone"}}
+		IP: "192.168.1.123"}}
 	plan := Reconcile(already, []Device{
 		{MAC: "14:e0:1d:6a:9c:6c", Name: "eli phone", IP: "192.168.1.150"}})
 	if !strings.Contains(strings.Join(plan.Commands, "\n"), "ip='192.168.1.150'") {
 		t.Errorf("the new address was not written:\n%v", plan.Commands)
 	}
-	// A rename alone must also be picked up, or the file drifts from the page.
-	plan = Reconcile(already, []Device{
-		{MAC: "14:e0:1d:6a:9c:6c", Name: "eli's phone", IP: "192.168.1.123"}})
-	if !strings.Contains(strings.Join(plan.Commands, "\n"), "name='eli'\\''s phone'") {
-		t.Errorf("a rename was not written, or was not quoted safely:\n%v", plan.Commands)
+}
+
+// THE regression test for the outage this package caused.
+//
+// A device name is free text from a web form. OpenWrt renders a host entry's
+// name into `dhcp-host=<mac>,<ip>,<name>`, and dnsmasq requires a DNS HOSTNAME
+// there: given "eli phone" it answers `bad DHCP host name` and `FAILED to
+// start up`, so the WHOLE HOUSEHOLD loses DHCP. curfew therefore writes no
+// name at all.
+func TestNoDeviceNameIsEverWrittenIntoTheDHCPConfig(t *testing.T) {
+	plan := Reconcile(nil, []Device{
+		{MAC: "00:08:2b:4f:c8:5b", Name: "Foxwell NT710", IP: "192.168.1.195"},
+		{MAC: "14:e0:1d:6a:9c:6c", Name: "eli phone", IP: "192.168.1.123"},
+	})
+	joined := strings.Join(plan.Commands, "\n")
+	if strings.Contains(joined, "uci set") && strings.Contains(joined, ".name=") {
+		t.Errorf("a device name reached the dhcp config; dnsmasq will refuse to start:\n%s", joined)
+	}
+	for _, leaked := range []string{"Foxwell", "eli phone", "NT710"} {
+		if strings.Contains(joined, leaked) {
+			t.Errorf("the device name %q leaked into the dhcp config:\n%s", leaked, joined)
+		}
+	}
+	// The control: the pin itself IS written, so this is not passing because
+	// nothing happens.
+	if !strings.Contains(joined, "ip='192.168.1.123'") {
+		t.Errorf("the address was not pinned:\n%s", joined)
+	}
+}
+
+// And a name an OLDER curfew already wrote must be REMOVED, or every router
+// installed before the fix stays broken after the upgrade.
+func TestANameWrittenByAnOlderCurfewIsRemoved(t *testing.T) {
+	already := []Host{{Section: "curfew_14e01d6a9c6c", MAC: "14:e0:1d:6a:9c:6c",
+		IP: "192.168.1.123", Name: "eli phone"}}
+	plan := Reconcile(already, []Device{
+		{MAC: "14:e0:1d:6a:9c:6c", Name: "eli phone", IP: "192.168.1.123"}})
+	joined := strings.Join(plan.Commands, "\n")
+	if !strings.Contains(joined, "uci -q delete dhcp.curfew_14e01d6a9c6c.name") {
+		t.Errorf("the bad name was left in place, so dnsmasq stays down:\n%s", joined)
+	}
+}
+
+// Once the name is gone, a re-run must settle. Without this the delete would
+// be re-issued for ever and dnsmasq reloaded every minute.
+func TestOnceTheNameIsGoneReconcileSettles(t *testing.T) {
+	already := []Host{{Section: "curfew_14e01d6a9c6c", MAC: "14:e0:1d:6a:9c:6c",
+		IP: "192.168.1.123"}}
+	plan := Reconcile(already, []Device{
+		{MAC: "14:e0:1d:6a:9c:6c", Name: "eli phone", IP: "192.168.1.123"}})
+	if len(plan.Commands) != 0 {
+		t.Errorf("a converged router still wants changes:\n%v", plan.Commands)
 	}
 }
 
 func TestADeregisteredDeviceLosesItsPin(t *testing.T) {
 	already := []Host{
 		{Section: "@host[0]", MAC: "f8:25:51:09:38:38", IP: "192.168.1.10", Name: "parental_printer"},
-		{Section: "curfew_14e01d6a9c6c", MAC: "14:e0:1d:6a:9c:6c", IP: "192.168.1.123", Name: "eli phone"},
+		{Section: "curfew_14e01d6a9c6c", MAC: "14:e0:1d:6a:9c:6c", IP: "192.168.1.123"},
 	}
 	plan := Reconcile(already, nil)
 	joined := strings.Join(plan.Commands, "\n")
@@ -308,14 +357,23 @@ func TestApplyRevertsWhenACommandFails(t *testing.T) {
 // deliberately dumb: it knows nothing about uci, so it cannot agree with a
 // broken implementation the way a double reproducing production logic would.
 type recordingRunner struct {
-	ran    []string
-	failOn string
+	ran         []string
+	failOn      string
+	dnsmasqDown bool
 }
 
 func (r *recordingRunner) Run(cmd string) (string, error) {
 	r.ran = append(r.ran, cmd)
 	if r.failOn != "" && strings.Contains(cmd, r.failOn) {
 		return "", errShellFailed
+	}
+	// Replays the router's answer to the liveness probe. Dumb on purpose: the
+	// test sets dnsmasqDown, this just reports it.
+	if strings.Contains(cmd, "pgrep dnsmasq") {
+		if r.dnsmasqDown {
+			return "no\n", nil
+		}
+		return "yes\n", nil
 	}
 	return "", nil
 }
@@ -341,6 +399,11 @@ func TestAdoptionTakesOverAForeignEntryWithoutMovingTheDevice(t *testing.T) {
 	}
 	if e.OldName != "parental_printer" || e.NewName != "printer" {
 		t.Errorf("the rename must be visible before it happens, got %+v", e)
+	}
+	// ...but no name is WRITTEN, for the same reason as everywhere else: a
+	// free-text name in a dhcp-host line stops dnsmasq starting.
+	if strings.Contains(strings.Join(a.Commands, "\n"), ".name=") {
+		t.Errorf("adoption wrote a device name into the dhcp config:\n%v", a.Commands)
 	}
 
 	joined := strings.Join(a.Commands, "\n")
@@ -423,5 +486,44 @@ func TestAdoptionSkipsEntriesCurfewAlreadyOwns(t *testing.T) {
 	a := PlanAdoption(current, map[string]string{"14:e0:1d:6a:9c:6c": "eli phone"})
 	if len(a.Entries) != 0 || len(a.Commands) != 0 {
 		t.Errorf("re-adopted an entry curfew already owns: %+v", a)
+	}
+}
+
+// A dnsmasq that does not come back must be ROLLED BACK, not left down. This
+// is the guard that was missing when a bad name took the household's DHCP away
+// and nothing noticed for hours.
+func TestApplyRollsBackWhenDnsmasqDoesNotComeBack(t *testing.T) {
+	r := &recordingRunner{dnsmasqDown: true}
+	_, err := Apply(r, Plan{Commands: []string{"uci set dhcp.curfew_x=host"}})
+	if err == nil {
+		t.Fatal("a dnsmasq that never came back must be an error")
+	}
+	joined := strings.Join(r.ran, "\n")
+	if !strings.Contains(joined, "cp /etc/config/dhcp /tmp/dhcp.curfew-rollback") {
+		t.Errorf("no backup was taken before committing:\n%s", joined)
+	}
+	if !strings.Contains(joined, "cp /tmp/dhcp.curfew-rollback /etc/config/dhcp") {
+		t.Errorf("the previous dhcp config was not restored:\n%s", joined)
+	}
+	if !strings.Contains(joined, "/etc/init.d/dnsmasq restart") {
+		t.Errorf("dnsmasq was not restarted after the rollback:\n%s", joined)
+	}
+	// And the message must be unmistakable, because this is the case where a
+	// household has no addresses.
+	if !strings.Contains(err.Error(), "NO DHCP") {
+		t.Errorf("a failed rollback must say so plainly, got: %v", err)
+	}
+}
+
+// The happy path must NOT roll back, or a working pin would be undone every
+// time.
+func TestApplyKeepsThePinWhenDnsmasqIsFine(t *testing.T) {
+	r := &recordingRunner{}
+	changed, err := Apply(r, Plan{Commands: []string{"uci set dhcp.curfew_x=host"}})
+	if err != nil || !changed {
+		t.Fatalf("a healthy apply must succeed: changed=%v err=%v", changed, err)
+	}
+	if strings.Contains(strings.Join(r.ran, "\n"), "cp /tmp/dhcp.curfew-rollback /etc/config/dhcp") {
+		t.Errorf("a successful apply rolled itself back:\n%v", r.ran)
 	}
 }

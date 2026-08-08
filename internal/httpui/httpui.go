@@ -193,6 +193,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/settings/blocklist", s.handleBlockListSave)
 	mux.HandleFunc("/settings/blocklist/delete", s.handleBlockListDelete)
 	mux.HandleFunc("/settings/dns", s.handleDNSSettings)
+	mux.HandleFunc("/settings/allowed", s.handleAllowedDomains)
 	mux.HandleFunc("/profiles/block", s.handleProfileBlock)
 	mux.HandleFunc("/profiles/unblock", s.handleProfileUnblock)
 	mux.HandleFunc("/profiles/ticket", s.handleProfileTicket)

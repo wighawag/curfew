@@ -7,7 +7,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/wighawag/curfew/internal/budget"
 	"github.com/wighawag/curfew/internal/schedule"
+	"time"
 )
 
 // Tests for the settings UI that sets a website restriction on a window.
@@ -383,5 +385,72 @@ func TestSavingBudgetSettingsLeavesTheDoHSettingAlone(t *testing.T) {
 
 	if sch.ps.DoHBootstrapBlocked() {
 		t.Error("saving the budget form turned the DoH block back on")
+	}
+}
+
+// The home page must answer "when does this end?" and "when does the next one
+// start?". Before this it showed a window list and left the arithmetic to the
+// parent, and during a budget cooldown it said "nothing else is blocking them
+// right now" while the cooldown was very much still running.
+func TestTheHomePageSaysWhenABlockEndsAndWhenTheNextOneStarts(t *testing.T) {
+	// Bedtime 22:00 to 08:00. The clock is fixed so the assertion does not
+	// depend on when the suite runs.
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{{Name: "eli",
+		Devices: []string{"aa:bb:cc:dd:ee:01"},
+		Windows: []schedule.Window{{Days: schedule.AllDays, Start: "22:00", End: "08:00"}}}}}
+
+	// Outside the window: it must say when the next block lands.
+	atNoon := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	if got := timingLine(ps.Profiles[0], budget.Status{}, false, false, atNoon); got != "next blocked at 22:00" {
+		t.Errorf("outside the window: got %q, want the next block time", got)
+	}
+	// Inside it: it must say when it lifts.
+	atNight := time.Date(2026, 8, 10, 23, 30, 0, 0, time.UTC)
+	if got := timingLine(ps.Profiles[0], budget.Status{}, false, true, atNight); got != "blocked until 08:00" {
+		t.Errorf("inside the window: got %q, want the end time", got)
+	}
+	// A manual block has no end to give, and must not invent one.
+	if got := timingLine(ps.Profiles[0], budget.Status{}, true, false, atNoon); !strings.Contains(got, "you unblock") {
+		t.Errorf("a manual block should say it lifts when the parent lifts it, got %q", got)
+	}
+}
+
+// The cooldown case, which is the one the page got wrong on the live router:
+// it must be reported even while a ticket is overriding it, because it is what
+// the child falls back to the moment the ticket lapses.
+func TestACooldownIsReportedWithItsEndTime(t *testing.T) {
+	p := schedule.Profile{Name: "eli"}
+	now := time.Date(2026, 8, 8, 11, 47, 0, 0, time.UTC)
+	got := timingLine(p, budget.Status{CooldownLeft: 20 * time.Minute}, false, false, now)
+	if !strings.Contains(got, "12:07") {
+		t.Errorf("the cooldown's end time is missing: %q", got)
+	}
+	if !strings.Contains(got, "stretch used up") {
+		t.Errorf("the reason is missing: %q", got)
+	}
+}
+
+// The exceptions must round-trip through the page, because the whole point is
+// that they live in curfew's config rather than in AdGuard where a reinstall
+// loses them.
+func TestAllowedDomainsRoundTripThroughTheSettingsPage(t *testing.T) {
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{{Name: "eli"}}}
+	srv, sch, _ := newProfileServer(t, nil, ps, nil, nil)
+
+	post(t, srv.Handler(), "/settings/allowed", url.Values{
+		"domains": {"opensea.io\neth.limo\n# both blocked by curfew's own lists\n"}})
+	got := sch.ps.AllowedDomains
+	if len(got) != 2 || got[0] != "opensea.io" || got[1] != "eth.limo" {
+		t.Fatalf("exceptions not stored: %v", got)
+	}
+
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/settings", nil))
+	assertWholePage(t, rec)
+	form := formAction(t, rec.Body.String(), "/settings/allowed")
+	for _, want := range []string{"opensea.io", "eth.limo"} {
+		if !strings.Contains(form, want) {
+			t.Errorf("the page does not show the stored exception %q", want)
+		}
 	}
 }

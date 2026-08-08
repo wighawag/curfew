@@ -89,6 +89,8 @@ type settingsData struct {
 	DNSOff bool
 	// BlockDoH is the household's DoH-bootstrap setting, on unless turned off.
 	BlockDoH bool
+	// Allowed is the household's exception list, one domain per line.
+	Allowed string
 	// ServicesUnavailable is true when AdGuard is configured but its catalogue
 	// could not be read, so the page can say why the service list is empty
 	// rather than implying this AdGuard has no services.
@@ -220,6 +222,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		AccountingOff:      interval == 0,
 
 		BlockDoH:            ps.DoHBootstrapBlocked(),
+		Allowed:             strings.Join(ps.AllowedDomains, "\n"),
 		BlockLists:          lists,
 		ListNames:           names,
 		Services:            services,
@@ -583,6 +586,18 @@ var settingsTemplate = template.Must(template.New("settings").Parse(`<!DOCTYPE h
   {{else}}
   <p class="muted">No lists yet.</p>
   {{end}}
+  <h3 style="font-size:.9rem">Always allow these sites</h3>
+  <form method="POST" action="/settings/allowed">
+    <textarea name="domains" rows="4" placeholder="opensea.io&#10;eth.limo"
+              aria-label="always-allowed domains">{{.Allowed}}</textarea>
+    <div class="row"><button type="submit">save</button></div>
+    <div class="muted">Exceptions to the category filter lists, for everyone. The lists
+    curfew installs do block legitimate sites: <code>opensea.io</code> is in the Porn list
+    and <code>eth.limo</code> in the Malware list. Listing a site here overrides that.
+    Subdomains are covered. These live in curfew&rsquo;s config, so they survive a reinstall
+    and travel with push and pull, unlike an exception added in AdGuard&rsquo;s own UI.</div>
+  </form>
+
   <form method="POST" action="/settings/dns">
     <div class="row">
       <label><input type="checkbox" name="block_doh" value="1" {{if .BlockDoH}}checked{{end}}>

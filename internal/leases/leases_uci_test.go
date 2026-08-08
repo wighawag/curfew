@@ -81,6 +81,26 @@ func uciShow(t *testing.T) string {
 	return string(out)
 }
 
+// applyCommands runs a plan's uci commands and commits, WITHOUT Apply's
+// dnsmasq liveness check and rollback.
+//
+// Those tests are about what ends up in the config file. The liveness gate and
+// its rollback are a different claim and are unit-tested separately with a
+// recording runner, because this image has no procd and therefore no running
+// dnsmasq to be alive: going through Apply here would roll every change back
+// and the tests would be asserting on an empty file.
+func applyCommands(t *testing.T, plan Plan) {
+	t.Helper()
+	for _, cmd := range plan.Commands {
+		if out, err := exec.Command("sh", "-c", cmd).CombinedOutput(); err != nil {
+			t.Fatalf("%s: %s %v", cmd, out, err)
+		}
+	}
+	if out, err := exec.Command("sh", "-c", "uci commit dhcp").CombinedOutput(); err != nil {
+		t.Fatalf("uci commit dhcp: %s %v", out, err)
+	}
+}
+
 func TestPinningARealRouterConfigPreservesEverythingElse(t *testing.T) {
 	requireUCI(t)
 	writeDHCP(t, realRouterDHCP)
@@ -100,11 +120,7 @@ func TestPinningARealRouterConfigPreservesEverythingElse(t *testing.T) {
 		{MAC: "14:e0:1d:6a:9c:6c", Name: "eli phone", IP: "192.168.1.123"},
 		{MAC: "f0:d7:aa:da:66:35", Name: "tia phone", IP: "192.168.1.182"},
 	})
-	if _, err := Apply(r, plan); err != nil && !strings.Contains(err.Error(), "dnsmasq") {
-		// A reload failure is expected in a container with no procd, and is
-		// not what this test is about.
-		t.Fatalf("Apply: %v", err)
-	}
+	applyCommands(t, plan)
 
 	file, err := os.ReadFile("/etc/config/dhcp")
 	if err != nil {
@@ -154,7 +170,7 @@ func TestASecondReconcileAgainstRealUCIPlansNothing(t *testing.T) {
 	if len(plan.Commands) == 0 {
 		t.Fatal("baseline: the first pass should have something to do")
 	}
-	_, _ = Apply(r, plan)
+	applyCommands(t, plan)
 
 	// Re-read what uci ACTUALLY holds and plan again.
 	second, err := Read(r)
@@ -179,11 +195,11 @@ func TestRemovingADeviceThroughRealUCIKeepsTheForeignEntry(t *testing.T) {
 
 	devices := []Device{{MAC: "14:e0:1d:6a:9c:6c", Name: "eli phone", IP: "192.168.1.123"}}
 	first, _ := Read(r)
-	_, _ = Apply(r, Reconcile(first, devices))
+	applyCommands(t, Reconcile(first, devices))
 
 	// Now deregister everything.
 	second, _ := Read(r)
-	_, _ = Apply(r, Reconcile(second, nil))
+	applyCommands(t, Reconcile(second, nil))
 
 	after, err := Read(r)
 	if err != nil {
@@ -210,7 +226,7 @@ func TestCurfewNeverCreatesASecondLeaseForAForeignPinnedMAC(t *testing.T) {
 	// Register the printer, observed somewhere else entirely.
 	plan := Reconcile(current, []Device{
 		{MAC: "f8:25:51:09:38:38", Name: "printer", IP: "192.168.1.200"}})
-	_, _ = Apply(r, plan)
+	applyCommands(t, plan)
 
 	after, _ := Read(r)
 	count := 0
@@ -281,10 +297,7 @@ func TestAdoptingOneEntryThroughRealUCILeavesTheOthersExactlyAsTheyWere(t *testi
 	if len(a.Entries) != 1 {
 		t.Fatalf("want exactly the printer adopted, got %+v", a.Entries)
 	}
-	if _, err := Apply(r, Plan{Commands: a.Commands}); err != nil &&
-		!strings.Contains(err.Error(), "dnsmasq") {
-		t.Fatalf("Apply: %v", err)
-	}
+	applyCommands(t, Plan{Commands: a.Commands})
 
 	after, err := Read(r)
 	if err != nil {
@@ -310,8 +323,11 @@ func TestAdoptingOneEntryThroughRealUCILeavesTheOthersExactlyAsTheyWere(t *testi
 	if printer.IP != "192.168.1.10" {
 		t.Errorf("adoption moved the printer to %q", printer.IP)
 	}
-	if printer.Name != "printer" {
-		t.Errorf("name = %q, want the registered name", printer.Name)
+	// No name is written, deliberately: a device name is free text and dnsmasq
+	// refuses to start on anything that is not a DNS hostname. The name lives
+	// in curfew's registry and on its page.
+	if printer.Name != "" {
+		t.Errorf("adoption wrote a device name into the dhcp config: %q", printer.Name)
 	}
 
 	// THE CONTROL: the two entries curfew was not told about, untouched.
@@ -351,7 +367,7 @@ func TestAfterAdoptionAReconcilePlansNothing(t *testing.T) {
 
 	current, _ := Read(r)
 	a := PlanAdoption(current, map[string]string{"f8:25:51:09:38:38": "printer"})
-	_, _ = Apply(r, Plan{Commands: a.Commands})
+	applyCommands(t, Plan{Commands: a.Commands})
 
 	after, _ := Read(r)
 	plan := Reconcile(after, []Device{{MAC: "f8:25:51:09:38:38", Name: "printer", IP: "192.168.1.10"}})
@@ -409,10 +425,7 @@ config host
 	if len(a.Entries) != 2 {
 		t.Fatalf("want two adoptions, got %+v", a.Entries)
 	}
-	if _, err := Apply(r, Plan{Commands: a.Commands}); err != nil &&
-		!strings.Contains(err.Error(), "dnsmasq") {
-		t.Fatalf("Apply: %v", err)
-	}
+	applyCommands(t, Plan{Commands: a.Commands})
 
 	after, _ := Read(r)
 	byMAC := map[string]Host{}
@@ -449,5 +462,74 @@ config host
 		if h.Name != want || h.Owned() {
 			t.Errorf("%s: got %+v, want an untouched foreign entry named %q", mac, h, want)
 		}
+	}
+}
+
+// THE test this package was missing, and the reason a household lost DHCP.
+//
+// Everything here previously asserted on uci config TEXT. dnsmasq is the thing
+// that has to accept the result, and it is far pickier: a host entry's name
+// becomes the third field of `dhcp-host=<mac>,<ip>,<name>`, which must be a DNS
+// hostname. Given a device called "eli phone" it answers `bad DHCP host name`
+// and `FAILED to start up` -- it does not skip the entry, it refuses to run --
+// so every device in the house stops getting an address as its lease expires.
+//
+// This is the packet-path rule of ADR 0004 one level up: assert on what the
+// system DOES with the configuration, not on what the configuration says.
+func TestDnsmasqAcceptsTheConfigCurfewCauses(t *testing.T) {
+	requireUCI(t)
+	if _, err := exec.LookPath("dnsmasq"); err != nil {
+		t.Skip("no dnsmasq; run this in the test image")
+	}
+	writeDHCP(t, realRouterDHCP)
+	r := shellRunner{t}
+
+	// Names of exactly the kind a parent types into the device page, and
+	// exactly the kind that broke the live router.
+	devices := []Device{
+		{MAC: "00:08:2b:4f:c8:5b", Name: "Foxwell NT710", IP: "192.168.1.195"},
+		{MAC: "14:e0:1d:6a:9c:6c", Name: "eli phone", IP: "192.168.1.123"},
+		{MAC: "54:3a:d6:70:e1:fe", Name: "Samsung TV", IP: "192.168.1.185"},
+	}
+	current, err := Read(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyCommands(t, Reconcile(current, devices))
+
+	// Render the dhcp-host lines the way OpenWrt's init script does, from what
+	// uci now holds, and ask dnsmasq whether it would start on them.
+	conf := t.TempDir() + "/dnsmasq.conf"
+	var b strings.Builder
+	hosts, err := Read(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range hosts {
+		b.WriteString("dhcp-host=" + h.MAC + "," + h.IP)
+		if h.Name != "" {
+			b.WriteString("," + h.Name)
+		}
+		b.WriteString("\n")
+	}
+	if err := os.WriteFile(conf, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("dnsmasq", "--test", "-C", conf).CombinedOutput()
+	if err != nil {
+		t.Errorf("dnsmasq REFUSES the config curfew causes, so the whole household "+
+			"loses DHCP:\n%s\nconfig was:\n%s", out, b.String())
+	}
+
+	// BASELINE, and the point of the whole test: prove dnsmasq really does
+	// reject a name with a space, so the assertion above is not passing
+	// because dnsmasq accepts anything.
+	bad := t.TempDir() + "/bad.conf"
+	if err := os.WriteFile(bad,
+		[]byte("dhcp-host=14:e0:1d:6a:9c:6c,192.168.1.123,eli phone\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("dnsmasq", "--test", "-C", bad).CombinedOutput(); err == nil {
+		t.Errorf("baseline: dnsmasq was expected to reject a spaced host name, but accepted it: %s", out)
 	}
 }

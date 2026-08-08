@@ -148,6 +148,7 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
       </form>
     {{end}}
   </div>
+  {{if .Timing}}<div class="sub">{{.Timing}}</div>{{end}}
   {{if .TicketLeft}}<div class="sub">ticket: {{.TicketLeft}} left; tapping again adds a fresh one</div>{{end}}
 </div>
 {{else}}

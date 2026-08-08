@@ -69,6 +69,21 @@ func Compute(ps *schedule.Profiles, pinned map[string]string,
 	d := Desired{Clients: map[string]adguard.ClientObject{}}
 	var rules []string
 
+	// The household's own exceptions, GLOBAL and unconditional: a name the
+	// filter lists block that this household wants anyway. Emitted first and
+	// with no $client, so they apply to everyone all the time.
+	//
+	// They exist because curfew's own default lists produce false positives:
+	// measured on the live router, opensea.io is blocked by the Porn list and
+	// eth.limo by the Malware list, both from blocklistproject. A household
+	// should not have to choose between filtering and reaching a site it uses.
+	for _, d := range ps.AllowedDomains {
+		d = strings.ToLower(strings.TrimSpace(d))
+		if d != "" {
+			rules = append(rules, fmt.Sprintf("@@||%s^", d))
+		}
+	}
+
 	profiles := append([]schedule.Profile(nil), ps.Profiles...)
 	sort.Slice(profiles, func(i, j int) bool { return profiles[i].Name < profiles[j].Name })
 
@@ -148,6 +163,22 @@ func Compute(ps *schedule.Profiles, pinned map[string]string,
 	return d
 }
 
+// anchorRule keeps the list from ever being EMPTY.
+//
+// Measured on the live router, and it broke the whole feature: AdGuard refuses
+// a filter list with no rules in it, answering add_url with
+// `HTTP 400: Filter with URL "..." is invalid (maybe it points to blank
+// page?)`. A household that has configured no restrictions yet serves exactly
+// that, so registration failed on every pass, once a minute, for ever, and the
+// DNS half never started. The unit tests could not see it because a fake API
+// has no opinion about the body.
+//
+// The anchor is an ALLOW rule for a name in the reserved .invalid TLD (RFC
+// 2606), which can never resolve and which nothing will ever ask for, so it
+// cannot affect a single answer. It doubles as a visible marker for anyone who
+// finds this list in AdGuard's UI and wonders what it is.
+const anchorRule = "@@||curfew-managed-list.invalid^"
+
 // renderList produces the filter list curfew serves.
 //
 // The header is addressed to a person who has found this list in AdGuard's UI
@@ -164,8 +195,10 @@ func renderList(rules []string) string {
 	b.WriteString("! curfew never touches.\n")
 	if len(rules) == 0 {
 		b.WriteString("! No restrictions are active right now.\n")
-		return b.String()
 	}
+	// Always present, so the list is never blank. See anchorRule.
+	b.WriteString(anchorRule)
+	b.WriteByte('\n')
 	for _, r := range rules {
 		b.WriteString(r)
 		b.WriteByte('\n')

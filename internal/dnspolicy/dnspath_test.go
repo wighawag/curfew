@@ -152,7 +152,8 @@ func startAdGuard(t *testing.T) {
 	if out, err := sh("dnsmasq --port=5454 --no-hosts --no-resolv --bind-interfaces " +
 		"--listen-address=127.0.0.1 --address=/twitch.tv/10.9.9.9 " +
 		"--address=/homework.example/10.9.9.8 --address=/youtube.com/10.9.9.7 " +
-		"--address=/use-application-dns.net/10.9.9.6 --address=/cloudflare-dns.com/10.9.9.5"); err != nil {
+		"--address=/use-application-dns.net/10.9.9.6 --address=/cloudflare-dns.com/10.9.9.5 " +
+		"--address=/opensea.io/10.9.9.4"); err != nil {
 		t.Fatalf("fixture upstream: %s %v", out, err)
 	}
 
@@ -535,4 +536,98 @@ func TestDoHEndpointsAreUnresolvableForARestrictedChild(t *testing.T) {
 	}
 	mustResolve(t, "after the window", v6EliA, v6Server, "twitch.tv")
 	mustBlock(t, "DoH stays blocked after the window", v6EliA, v6Server, "cloudflare-dns.com")
+}
+
+// AdGuard REFUSES a filter list that contains no rules.
+//
+// Found on the live router, not here: with no profile carrying a restriction,
+// curfew served a list of nothing but comments, and every single pass logged
+// `add_url ... HTTP 400: Filter with URL "..." is invalid (maybe it points to
+// blank page?)`. It retried once a minute, for ever, and the DNS half of the
+// system never started at all.
+//
+// The unit tests missed it because they drive a fake API, which cannot have an
+// opinion about the body. Only a real AdGuard rejects this, which is precisely
+// the argument for these tests existing.
+func TestAnEmptyFilterListIsStillAcceptedByAdGuard(t *testing.T) {
+	requireAdGuard(t)
+	startAdGuard(t)
+
+	// A household with NO restrictions at all: the state the live router was
+	// in, and the state every household is in before it configures anything.
+	m, _ := newManagerUnderTest(t)
+	m.schedule = memSchedule{&schedule.Profiles{Profiles: []schedule.Profile{
+		{Name: "eli", Devices: []string{macEliPhone}},
+	}}}
+	m.now = func() time.Time { return atClock("09:00") }
+
+	if err := m.Tick(); err != nil {
+		t.Fatalf("a household with no restrictions must still reconcile cleanly: %v", err)
+	}
+
+	// And AdGuard must actually hold the list, not merely have not errored.
+	api := adguard.NewClient(aghAPI, "parent", aghPwd)
+	filters, err := api.Filters()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, f := range filters {
+		if strings.HasSuffix(f.URL, FilterListPath) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("curfew's filter list was never registered: %+v", filters)
+	}
+
+	// A second pass must also be clean, since the live symptom was an error
+	// EVERY minute rather than once.
+	if err := m.Tick(); err != nil {
+		t.Errorf("the second pass failed: %v", err)
+	}
+}
+
+// A household exception must beat a block that came from a DIFFERENT filter
+// list, which is the only case that matters: the false positives this exists
+// for come from the big category lists, not from anything curfew wrote.
+//
+// Measured on the live router: opensea.io is blocked by the Porn list and
+// eth.limo by the Malware list, both of which curfew itself installs.
+func TestAnAllowedDomainOverridesABlockFromAnotherList(t *testing.T) {
+	requireAdGuard(t)
+	startAdGuard(t)
+	api := adguard.NewClient(aghAPI, "parent", aghPwd)
+
+	// A second subscribed list playing the part of blocklistproject's Porn
+	// list, blocking a name this household actually wants.
+	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "! Title: pretend category list\n||opensea.io^\n")
+	}))
+	defer blocked.Close()
+	if err := api.AddFilterURL("pretend category list", blocked.URL+"/list.txt"); err != nil {
+		t.Fatalf("setting up the blocking list: %v", err)
+	}
+
+	// BASELINE: it really is blocked, by that other list, before curfew says
+	// anything. Without this the assertion below would pass against a name
+	// that was never blocked at all.
+	if v := lookupVerdict(t, v6EliA, v6Server, "opensea.io"); v != "BLOCKED" {
+		t.Fatalf("baseline: opensea.io should be blocked by the category list, got %s", v)
+	}
+
+	m, _ := newManagerUnderTest(t)
+	ps := eliAndTia()
+	ps.AllowedDomains = []string{"opensea.io"}
+	m.schedule = memSchedule{ps}
+	m.now = func() time.Time { return atClock("09:00") }
+	if err := m.Tick(); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	mustResolve(t, "household exception", v6EliA, v6Server, "opensea.io")
+	mustResolve(t, "household exception over IPv4", v4Eli, v4Server, "opensea.io")
+	// The control: the exception must not switch filtering off wholesale. The
+	// child's own restriction is still in force.
+	mustBlock(t, "control: the restriction still applies", v6EliA, v6Server, "twitch.tv")
 }

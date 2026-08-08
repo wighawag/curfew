@@ -348,3 +348,104 @@ func spendBudget(t *testing.T, net *netnstest.Topology, core *Core) bool {
 	}
 	return false
 }
+
+// A ticket must override the CONTINUOUS block too, not just the daily one.
+//
+// The existing ticket test uses a daily-only budget, so the combination a
+// parent actually meets at 9pm -- "the stretch ran out, give them twenty more
+// minutes" -- was never asserted on the packet path. Reported from the live
+// router: when the continuous block triggered, a ticket did not let the child
+// back online.
+func TestPacketPathATicketOverridesTheContinuousBlock(t *testing.T) {
+	net := netnstest.Require(t)
+	limits := budget.Limits{
+		Daily:      budget.D(time.Hour), // huge on purpose: must not be what blocks
+		Continuous: budget.D(2 * testInterval),
+		Gap:        budget.D(time.Second),
+		ResetGap:   budget.D(10 * time.Minute), // long: the ticket, not the gap, must unblock
+	}
+	reg, sched, state := budgetHousehold(t, limits)
+	core := bootWithBudget(t, reg, sched, state)
+	if err := core.Tick(); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if !burnFrom(t, net, eliMAC) {
+		t.Fatal("baseline: eli must start out online")
+	}
+	if !spendBudget(t, net, core) {
+		t.Fatal("the continuous allowance never ran out")
+	}
+
+	// The control: it really is the CONTINUOUS allowance blocking, with the
+	// daily one barely touched, so a pass below cannot be the daily budget
+	// quietly doing something else.
+	status, err := core.BudgetStatus()
+	if err != nil {
+		t.Fatalf("BudgetStatus: %v", err)
+	}
+	if got := status["eli"].Reason; got != budget.ReasonContinuous {
+		t.Fatalf("reason = %q, want %q", got, budget.ReasonContinuous)
+	}
+
+	if err := core.GrantTicket("eli", 20*time.Second); err != nil {
+		t.Fatalf("GrantTicket during a continuous block: %v", err)
+	}
+	if !burnFrom(t, net, eliMAC) {
+		t.Fatal("a ticket did NOT override the continuous block: the child is still offline")
+	}
+	// And a tick during the ticket must not kill it, since the cooldown is
+	// still running and the reconcile recomputes the same block every minute.
+	if err := core.Tick(); err != nil {
+		t.Fatalf("Tick during a live ticket: %v", err)
+	}
+	if !burnFrom(t, net, eliMAC) {
+		t.Error("a reconcile during the cooldown killed a live ticket")
+	}
+}
+
+// A daemon RESTART must not kill a live ticket.
+//
+// From the live router's log: a ticket was granted at 11:40:41 while the
+// profile was in a continuous cooldown, the daemon restarted 34 seconds later,
+// and the parent then blocked/unblocked and re-ticketed, which is what someone
+// does when a ticket appears not to have worked. A ticket is kernel state that
+// is MEANT to survive anything except its own deadline, so a restart taking it
+// away would be exactly the reported symptom.
+func TestPacketPathADaemonRestartDoesNotKillALiveTicketDuringACooldown(t *testing.T) {
+	net := netnstest.Require(t)
+	limits := budget.Limits{
+		Daily:      budget.D(time.Hour),
+		Continuous: budget.D(2 * testInterval),
+		Gap:        budget.D(time.Second),
+		ResetGap:   budget.D(10 * time.Minute),
+	}
+	reg, sched, state := budgetHousehold(t, limits)
+	core := bootWithBudget(t, reg, sched, state)
+	if err := core.Tick(); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if !burnFrom(t, net, eliMAC) {
+		t.Fatal("baseline: eli must start out online")
+	}
+	if !spendBudget(t, net, core) {
+		t.Fatal("the continuous allowance never ran out")
+	}
+	if err := core.GrantTicket("eli", 30*time.Second); err != nil {
+		t.Fatalf("GrantTicket: %v", err)
+	}
+	if !burnFrom(t, net, eliMAC) {
+		t.Fatal("the ticket did not take effect at all")
+	}
+
+	// The restart: a brand new Core over the same files, exactly as procd
+	// would start one, including the boot-time Tick the daemon performs
+	// before it serves anything.
+	restarted := bootWithBudget(t, reg, sched, state)
+	if err := restarted.Tick(); err != nil {
+		t.Fatalf("Tick after restart: %v", err)
+	}
+	if !burnFrom(t, net, eliMAC) {
+		t.Error("a daemon restart killed a live ticket: the child goes offline " +
+			"and the parent sees a ticket that did nothing")
+	}
+}

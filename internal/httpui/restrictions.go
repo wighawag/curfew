@@ -352,3 +352,34 @@ func (s *Server) handleDNSSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	redirectSettings(w, r, err)
 }
+
+// handleAllowedDomains saves the household's DNS exceptions.
+//
+// These exist because curfew's OWN default filter lists produce false
+// positives: measured on the live router, opensea.io is blocked by the Porn
+// list and eth.limo by the Malware list, both from blocklistproject. Without
+// this a household has to choose between filtering and reaching a site it
+// uses, or keep the exception in AdGuard where a reinstall loses it, which is
+// the exact defect ADR 0002 recorded.
+func (s *Server) handleAllowedDomains(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	domains := splitDomains(r.FormValue("domains"))
+	err := s.mutateSchedule(func(ps *schedule.Profiles) error {
+		ps.AllowedDomains = domains
+		return nil
+	})
+	if err == nil {
+		s.log.Info("allowed domains saved", "count", len(domains))
+		redirectSaved(w, r, "always-allowed sites saved")
+		return
+	}
+	redirectSettings(w, r, err)
+}

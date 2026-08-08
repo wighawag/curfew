@@ -44,10 +44,12 @@
 package leases
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // SectionPrefix marks a uci host section as curfew's own. It is the ONLY
@@ -225,6 +227,23 @@ type Conflict struct {
 // nothing. dnsmasq honours a static lease that falls inside its own pool, so
 // being in-pool is not an obstacle.
 //
+// # curfew writes NO hostname, and that is a scar rather than a preference
+//
+// A `config host` entry may carry a `name`, which OpenWrt renders into
+// `dhcp-host=<mac>,<ip>,<name>`. dnsmasq requires that third field to be a DNS
+// HOSTNAME. curfew's device names are free text typed into a web form, so
+// "eli phone" and "Foxwell NT710" are ordinary, and dnsmasq's response to one
+// is `bad DHCP host name at line N` followed by `FAILED to start up`. Not a
+// skipped entry: it refuses to start at all, so the WHOLE HOUSEHOLD loses DHCP
+// and devices stop getting addresses as their leases expire. That happened on
+// the live router.
+//
+// The name is cosmetic here, and it is the only field that can be invalid, so
+// it is simply not written. Device names live in curfew's registry and on its
+// page, which is where a person reads them. A sanitised hostname would be a
+// nice feature and is deliberately NOT smuggled in as part of a fix: it needs
+// its own collision rules and its own tests.
+//
 // A device with no known address is NOT given one. The alternative, allocating
 // from a reserved range, would hand out an address the device does not have
 // and cannot be told about until its next DHCP renewal, so the AdGuard rule
@@ -278,7 +297,7 @@ func Reconcile(current []Host, devices []Device) Plan {
 		plan.Pinned[mac] = d.IP
 
 		have, exists := owned[mac]
-		if exists && have.Section == section && have.IP == d.IP && have.Name == d.Name {
+		if exists && have.Section == section && have.IP == d.IP && have.Name == "" {
 			continue // already correct: emit nothing, so a re-run is a no-op
 		}
 		plan.Commands = append(plan.Commands,
@@ -286,17 +305,16 @@ func Reconcile(current []Host, devices []Device) Plan {
 			fmt.Sprintf("uci set dhcp.%s.mac=%s", section, shellQuote(mac)),
 			fmt.Sprintf("uci set dhcp.%s.ip=%s", section, shellQuote(d.IP)),
 			fmt.Sprintf("uci set dhcp.%s.%s=1", section, MarkerOption),
-		)
-		if d.Name != "" {
-			plan.Commands = append(plan.Commands,
-				fmt.Sprintf("uci set dhcp.%s.name=%s", section, shellQuote(d.Name)))
-		} else {
+			// NO name. See the comment on Reconcile: a device name is free
+			// text from a web form and dnsmasq requires a DNS hostname here,
+			// and it refuses to start AT ALL when it gets anything else.
+			//
 			// `uci -q delete` exits NON-ZERO when the option is not set
-			// (measured in the OpenWrt image), which would abort a command
-			// chain half-done, so every delete carries its own `|| true`.
-			plan.Commands = append(plan.Commands,
-				fmt.Sprintf("uci -q delete dhcp.%s.name || true", section))
-		}
+			// (measured), which would abort the chain half-done, so the
+			// delete carries its own `|| true`. It is unconditional because
+			// it also has to REMOVE a bad name an older curfew wrote.
+			fmt.Sprintf("uci -q delete dhcp.%s.name || true", section),
+		)
 	}
 
 	// Remove entries curfew owns that no longer correspond to a device: a
@@ -349,16 +367,76 @@ func Apply(r Runner, plan Plan) (bool, error) {
 			return false, fmt.Errorf("pinning static leases (%s): %w", cmd, err)
 		}
 	}
+	// Keep the file as it was BEFORE committing, so a rollback can restore it
+	// exactly. `uci revert` only helps before a commit, and the failure this
+	// guards against is only visible after one.
+	if _, err := r.Run("cp /etc/config/dhcp /tmp/dhcp.curfew-rollback"); err != nil {
+		return false, fmt.Errorf("backing up the dhcp config before pinning leases: %w", err)
+	}
 	if _, err := r.Run("uci commit dhcp"); err != nil {
 		return false, fmt.Errorf("committing static leases: %w", err)
 	}
-	// reload rather than restart: dnsmasq re-reads its config and keeps
-	// serving, where a restart drops DHCP for the whole household for a moment
-	// to achieve the same thing.
 	if _, err := r.Run("/etc/init.d/dnsmasq reload"); err != nil {
-		return true, fmt.Errorf("reloading dnsmasq after pinning static leases: %w", err)
+		return true, rollbackDHCP(r, fmt.Errorf("reloading dnsmasq after pinning static leases: %w", err))
+	}
+	// VERIFY, because a dnsmasq that refuses its config does not fail the
+	// reload command: it exits, and the household silently stops being able to
+	// get an address as leases expire. Measured on the live router, where a
+	// device name containing a space produced `bad DHCP host name` and
+	// `FAILED to start up`, and nothing noticed for hours.
+	if err := dnsmasqAlive(r); err != nil {
+		return true, rollbackDHCP(r, err)
 	}
 	return true, nil
+}
+
+// dnsmasqAlive reports whether dnsmasq is actually serving, quoting its own
+// reason when it is not.
+func dnsmasqAlive(r Runner) error {
+	for range 10 {
+		out, err := r.Run("pgrep dnsmasq >/dev/null 2>&1 && echo yes || echo no")
+		if err == nil && strings.TrimSpace(out) == "yes" {
+			return nil
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	reason, _ := r.Run("logread 2>/dev/null | grep -i dnsmasq | tail -2")
+	msg := "dnsmasq is NOT running after the static leases were written, " +
+		"so nothing on the LAN can get a DHCP address"
+	if t := strings.TrimSpace(reason); t != "" {
+		msg += "\n       dnsmasq said: " + t
+	}
+	return errors.New(msg)
+}
+
+// rollbackDHCP puts the dhcp config back and restarts dnsmasq, so a bad pin
+// costs nothing rather than costing the household its addresses.
+//
+// This is the same shape as the port-53 rollback in internal/deploy, and for
+// the same reason: writing static leases is the only thing this package does
+// that can leave a device unable to get on the network at all. A rollback that
+// itself fails says so unmistakably and carries the manual fix.
+func rollbackDHCP(r Runner, cause error) error {
+	restore := "[ -f /tmp/dhcp.curfew-rollback ] && cp /tmp/dhcp.curfew-rollback /etc/config/dhcp"
+	if _, err := r.Run(restore); err != nil {
+		return fmt.Errorf("%w.\n       WORSE: restoring the previous dhcp config also failed: %v.\n"+
+			"       The household may have NO DHCP. Fix by hand:\n"+
+			"         uci show dhcp | grep -oE '^dhcp\\.curfew_[a-z0-9]+' | sort -u | "+
+			"while read s; do uci -q delete $s; done; uci commit dhcp; /etc/init.d/dnsmasq restart",
+			cause, err)
+	}
+	if _, err := r.Run("/etc/init.d/dnsmasq restart"); err != nil {
+		return fmt.Errorf("%w.\n       WORSE: restarting dnsmasq after the rollback failed: %v.\n"+
+			"       The household may have NO DHCP. Fix by hand: /etc/init.d/dnsmasq restart",
+			cause, err)
+	}
+	if err := dnsmasqAlive(r); err != nil {
+		return fmt.Errorf("%w.\n       WORSE: dnsmasq did not come back after the rollback: %v.\n"+
+			"       The household has NO DHCP. Fix by hand: /etc/init.d/dnsmasq restart",
+			cause, err)
+	}
+	return fmt.Errorf("%w.\n       The previous dhcp config has been restored and dnsmasq is "+
+		"running again, so addresses still work; no lease was pinned", cause)
 }
 
 // Read lists the host entries currently on the router.
@@ -463,10 +541,6 @@ func PlanAdoption(current []Host, registered map[string]string) Adoption {
 			fmt.Sprintf("uci set dhcp.%s.mac=%s", section, shellQuote(e.MAC)),
 			fmt.Sprintf("uci set dhcp.%s.ip=%s", section, shellQuote(e.IP)),
 			fmt.Sprintf("uci set dhcp.%s.%s=1", section, MarkerOption))
-		if e.NewName != "" {
-			a.Commands = append(a.Commands,
-				fmt.Sprintf("uci set dhcp.%s.name=%s", section, shellQuote(e.NewName)))
-		}
 	}
 	return a
 }

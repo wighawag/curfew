@@ -218,6 +218,16 @@ type Profiles struct {
 	// It applies only to profiles that already have restrictions configured,
 	// so parents and ungoverned devices are unaffected.
 	BlockDoHBootstrap *bool `json:"block_doh_bootstrap,omitempty"`
+	// AllowedDomains are the household's DNS EXCEPTIONS: names the filter
+	// lists block that this household wants anyway.
+	//
+	// They live here rather than in AdGuard's own custom rules so they travel
+	// with push and pull, and so a reinstall cannot lose them, which is the
+	// exact defect ADR 0002 recorded: a panic-off plus reinstall cycle
+	// silently discarded every hand-made exception. AdGuard's own rules
+	// remain the household's space and curfew still never touches them; this
+	// is simply an exception list curfew can own and carry.
+	AllowedDomains []string `json:"allowed_domains,omitempty"`
 }
 
 // DoHBootstrapBlocked reports whether restricted profiles should be stopped
@@ -283,6 +293,12 @@ func (ps *Profiles) Validate() error {
 		}
 	}
 	problems = append(problems, ps.validateRestrictions()...)
+	for _, d := range ps.AllowedDomains {
+		if strings.ContainsAny(d, " \t/^|$") {
+			problems = append(problems, fmt.Sprintf(
+				"allowed domain %q is not a plain domain name", d))
+		}
+	}
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))
 	}
@@ -501,6 +517,16 @@ func Equal(a, b *Profiles) bool {
 	if !sameLists(la, lb) {
 		return false
 	}
+	var aa, ab []string
+	if a != nil {
+		aa = a.AllowedDomains
+	}
+	if b != nil {
+		ab = b.AllowedDomains
+	}
+	if !sameStrings(aa, ab) {
+		return false
+	}
 	// Part of the comparison for the same reason the budget knobs are: a
 	// household that deliberately turned this OFF must not have it silently
 	// turned back on by the other side's push.
@@ -547,4 +573,57 @@ func Equal(a, b *Profiles) bool {
 		}
 	}
 	return true
+}
+
+// NextChange reports the next moment this profile's SCHEDULE verdict flips,
+// and what it flips to.
+//
+// It answers the two questions a parent actually has in front of a child:
+// "when does this end?" while they are blocked, and "when does this start?"
+// while they are not. Both were previously answerable only by reading the
+// window list and doing the arithmetic in your head.
+//
+// It is DERIVED from the clock on every call, exactly as BlockedAt is, so it
+// cannot go stale and nothing has to be scheduled or remembered. The search is
+// bounded at 8 days: a window with a day selector repeats weekly, so anything
+// that is ever going to happen happens inside 8 days, and a profile whose
+// windows never flip (none at all, or every minute covered) correctly reports
+// that nothing changes.
+func (p Profile) NextChange(now time.Time) (time.Time, bool, bool) {
+	if len(p.Windows) == 0 {
+		return time.Time{}, false, false
+	}
+	state := p.BlockedAt(now)
+
+	// Candidate boundaries: every window's start and end, on every day in
+	// range. Evaluating AT a boundary gives the new state, because a window's
+	// start is inclusive and its end exclusive.
+	var candidates []time.Time
+	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	for d := 0; d <= 8; d++ {
+		base := day.AddDate(0, 0, d)
+		for _, w := range p.Windows {
+			for _, hhmm := range []string{w.Start, w.End} {
+				mins, err := minutes(hhmm)
+				if err != nil {
+					continue
+				}
+				// Built by adding minutes to local midnight rather than by
+				// constructing an hour and minute directly, so a DST jump
+				// cannot produce a time that does not exist.
+				candidates = append(candidates, base.Add(time.Duration(mins)*time.Minute))
+			}
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Before(candidates[j]) })
+
+	for _, c := range candidates {
+		if !c.After(now) {
+			continue
+		}
+		if p.BlockedAt(c) != state {
+			return c, !state, true
+		}
+	}
+	return time.Time{}, false, false
 }
