@@ -30,6 +30,19 @@ CGO_ENABLED=0 go test -c -o .acceptance/accounting.test ./internal/accounting
 # ships.
 CGO_ENABLED=0 go test -c -o .acceptance/deploy.test ./internal/deploy
 
+# internal/leases writes static DHCP host entries with uci. The claim that
+# matters is what it does NOT touch, and only the real uci on a real
+# /etc/config/dhcp can settle that: the previous stage's gate stayed green
+# while `uci delete dhcp.lan.dhcp_option` destroyed every option the household
+# had set.
+CGO_ENABLED=0 go test -c -o .acceptance/leases.test ./internal/leases
+
+# internal/dnspolicy applies per-profile, time-windowed DNS restrictions. A
+# claim that a profile is restricted is only credible if a real query from that
+# client's own address was sent and the answer observed, over BOTH address
+# families, so it runs against the real AdGuard the image ships.
+CGO_ENABLED=0 go test -c -o .acceptance/dnspolicy.test ./internal/dnspolicy
+
 # The kernel probe both measures a kernel and claims to be safe on a live
 # router. The second half is a packet-path assertion, so it belongs here.
 CGO_ENABLED=0 go test -c -o .acceptance/kernelprobe.test ./internal/kernelprobe

@@ -19,6 +19,7 @@ import (
 
 	"github.com/wighawag/curfew/internal/adguard"
 	"github.com/wighawag/curfew/internal/deploy"
+	"github.com/wighawag/curfew/internal/leases"
 	"github.com/wighawag/curfew/internal/legacyconfig"
 	"github.com/wighawag/curfew/internal/registry"
 	"github.com/wighawag/curfew/internal/schedule"
@@ -37,6 +38,7 @@ Usage:
   curfew push <host> [flags]      send your local device list to the router
   curfew pull <host> [flags]      merge the router's device list into yours
   curfew probe <host>             check the router's KERNEL still supports tickets
+  curfew adopt-leases <host>      take over static DHCP leases written by something else
   curfew version
 
 The host is an ssh destination, for example root@192.168.1.1.
@@ -68,6 +70,8 @@ func run(args []string) int {
 		err = cmdPull(rest)
 	case "probe":
 		err = cmdProbe(rest)
+	case "adopt-leases":
+		err = cmdAdoptLeases(rest)
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 		return 0
@@ -306,10 +310,23 @@ func cmdInstall(args []string) error {
 		fmt.Fprintln(os.Stderr, "           if you are migrating from the shell scripts.")
 	}
 
+	// The daemon gets AdGuard's credentials even though AdGuard is set up
+	// below, because daemon.conf is written once here and never again: update
+	// deliberately leaves it alone. The daemon retries every tick, so a
+	// credential written before AdGuard exists costs one failed pass, not a
+	// broken install. With -no-adguard they are left empty, which turns the
+	// DNS refinement off and nothing else.
+	routerIP := hostAddress(host)
+	aghURL := ""
+	if !*noAdGuard {
+		aghURL = fmt.Sprintf("127.0.0.1:%d", adguard.DefaultPort)
+	}
 	if err := deploy.Install(runner, deploy.InstallOptions{
 		LAN: *lan, WAN: *wan, Listen: *listen,
 		User: *user, Password: curfewPass, Timezone: zone, BinaryPath: binPath,
 		RegistryPath: *regPath, ProfilesPath: profilesPath(*regPath),
+		AdGuardURL: aghURL, AdGuardUser: *adguardUser, AdGuardPassword: adguardPass,
+		RouterIP: routerIP,
 	}); err != nil {
 		return err
 	}
@@ -317,7 +334,6 @@ func cmdInstall(args []string) error {
 	// allowlist and the schedules; if AdGuard setup fails, the household still
 	// ends up with working parental control and a clear message about the DNS
 	// half, rather than neither.
-	routerIP := hostAddress(host)
 	agh, aghErr := deploy.SetupAdGuard(runner, deploy.AdGuardOptions{
 		Enabled: !*noAdGuard, User: *adguardUser, Password: adguardPass, RouterIP: routerIP,
 	})
@@ -655,4 +671,112 @@ func hostAddress(host string) string {
 		}
 	}
 	return strings.Trim(host, "[]")
+}
+
+// cmdAdoptLeases hands curfew a static DHCP lease that something else wrote.
+//
+// This is deliberately a SEPARATE, opt-in command rather than something the
+// daemon does on a tick. curfew's whole leases design rests on the promise
+// that it only ever touches host entries it created, and "curfew deletes
+// entries it did not create" must never become automatic behaviour. So the
+// reconciler always YIELDS to a foreign entry, and only this command, run by a
+// person who has seen exactly what it will do, can transfer ownership.
+//
+// The motivating case is the entry the shell tool this project replaces wrote
+// for the printer. Left alone it makes the daemon report a conflict on every
+// pass for ever, and leaves one device pinned by a mechanism curfew does not
+// own.
+func cmdAdoptLeases(args []string) error {
+	fs := flag.NewFlagSet("adopt-leases", flag.ContinueOnError)
+	yes := fs.Bool("yes", false, "actually make the change (without this, it only shows the plan)")
+	regPath := fs.String("registry", defaultRegistryPath(), "device list to match MACs against")
+
+	host, err := hostAndFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	runner := deploy.SSHRunner{Host: host}
+
+	reg, err := registry.Load(*regPath)
+	if err != nil {
+		return err
+	}
+	names := make(map[string]string, len(reg.Devices))
+	for _, d := range reg.Devices {
+		names[strings.ToLower(d.MAC)] = d.Name
+	}
+
+	current, err := leases.Read(runner)
+	if err != nil {
+		return err
+	}
+	plan := leases.PlanAdoption(current, names)
+	if len(plan.Entries) == 0 {
+		fmt.Println("Nothing to adopt: every static lease on this router is either curfew's")
+		fmt.Println("already, or belongs to a device curfew does not know about.")
+		return nil
+	}
+
+	fmt.Printf("These static DHCP leases were written by something other than curfew,\n")
+	fmt.Printf("and their MAC is a device in your list:\n\n")
+	for _, e := range plan.Entries {
+		fmt.Printf("  dhcp.%s\n", e.Section)
+		fmt.Printf("      mac  %s\n", e.MAC)
+		fmt.Printf("      ip   %s   (kept exactly as it is: the device does not move)\n", e.IP)
+		if e.OldName != e.NewName {
+			fmt.Printf("      name %s  ->  %s\n", e.OldName, e.NewName)
+		} else {
+			fmt.Printf("      name %s\n", e.OldName)
+		}
+		fmt.Println()
+	}
+	fmt.Printf("curfew would delete each entry above and write its own (dhcp.%s...) in the\n",
+		leases.SectionPrefix)
+	fmt.Printf("same commit, so dnsmasq never sees two leases for one MAC. Every other host\n")
+	fmt.Printf("entry on the router is left alone.\n\n")
+
+	if !*yes {
+		fmt.Println("Nothing has been changed. Re-run with -yes to do it.")
+		return nil
+	}
+
+	changed, err := leases.Apply(runner, leases.Plan{Commands: plan.Commands})
+	if err != nil {
+		return fmt.Errorf("adopting leases: %w\n"+
+			"       The change was staged and reverted, so the router is as it was.\n"+
+			"       Check with: ssh %s 'uci show dhcp | grep host'", err, host)
+	}
+	if !changed {
+		return fmt.Errorf("nothing was applied, which should not happen with %d entries to adopt",
+			len(plan.Entries))
+	}
+
+	// Read it back off the router rather than trusting that the commands
+	// exited zero. An adopt that says "done" without checking is the lie this
+	// project exists to remove.
+	after, err := leases.Read(runner)
+	if err != nil {
+		return fmt.Errorf("adopted, but reading the result back FAILED: %w", err)
+	}
+	owned := map[string]leases.Host{}
+	for _, h := range after {
+		if h.Owned() {
+			owned[h.MAC] = h
+		}
+	}
+	for _, e := range plan.Entries {
+		got, ok := owned[e.MAC]
+		if !ok {
+			return fmt.Errorf("%s is NOT pinned by curfew after adoption; check the router by hand:\n"+
+				"       ssh %s 'uci show dhcp | grep host'", e.MAC, host)
+		}
+		if got.IP != e.IP {
+			return fmt.Errorf("%s was adopted at %s but should be at %s; the device may have moved",
+				e.MAC, got.IP, e.IP)
+		}
+	}
+	fmt.Printf("adopted %d lease(s), verified on the router\n", len(plan.Entries))
+	fmt.Println("Remove the matching line from config/local/device_ips: the shell tool that")
+	fmt.Println("wrote it is retired, and curfew owns that entry now.")
+	return nil
 }

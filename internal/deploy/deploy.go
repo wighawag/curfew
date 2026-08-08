@@ -206,7 +206,11 @@ start_service() {
         -wan "$CURFEW_WAN" \
         -listen "$CURFEW_LISTEN" \
         -timezone "$CURFEW_TZ"
-    procd_set_param env CURFEW_USER="$CURFEW_USER" CURFEW_PASSWORD="$CURFEW_PASSWORD"
+    procd_set_param env CURFEW_USER="$CURFEW_USER" CURFEW_PASSWORD="$CURFEW_PASSWORD" \
+        CURFEW_ADGUARD_URL="$CURFEW_ADGUARD_URL" \
+        CURFEW_ADGUARD_USER="$CURFEW_ADGUARD_USER" \
+        CURFEW_ADGUARD_PASSWORD="$CURFEW_ADGUARD_PASSWORD" \
+        CURFEW_ROUTER_IP="$CURFEW_ROUTER_IP"
     procd_set_param respawn
     procd_set_param stdout 1
     procd_set_param stderr 1
@@ -222,8 +226,17 @@ func shellQuote(v string) string {
 	return "'" + strings.ReplaceAll(v, "'", `'\''`) + "'"
 }
 
+// AdGuardConfKey is the setting that tells the daemon where AdGuard is.
+//
+// It is named here because `curfew update` checks for it: a router installed
+// before per-profile DNS restrictions existed has a daemon.conf without it,
+// and update deliberately never rewrites that file, so the only honest thing
+// to do is notice and say so rather than silently ship a daemon whose DNS half
+// can never start.
+const AdGuardConfKey = "CURFEW_ADGUARD_URL"
+
 // daemonConf renders the settings file the init script sources.
-func daemonConf(lan, wan, listen, user, password, timezone string) string {
+func daemonConf(o InstallOptions, timezone string) string {
 	return fmt.Sprintf(`# curfew daemon settings. Written by 'curfew install'.
 # 'curfew update' deliberately leaves this file alone.
 CURFEW_LAN=%s
@@ -232,8 +245,16 @@ CURFEW_LISTEN=%s
 CURFEW_USER=%s
 CURFEW_PASSWORD=%s
 CURFEW_TZ=%s
-`, shellQuote(lan), shellQuote(wan), shellQuote(listen), shellQuote(user),
-		shellQuote(password), shellQuote(timezone))
+# AdGuard, for per-profile DNS restrictions only. Empty means that feature is
+# off; nothing else depends on it.
+%s=%s
+CURFEW_ADGUARD_USER=%s
+CURFEW_ADGUARD_PASSWORD=%s
+CURFEW_ROUTER_IP=%s
+`, shellQuote(o.LAN), shellQuote(o.WAN), shellQuote(o.Listen), shellQuote(o.User),
+		shellQuote(o.Password), shellQuote(timezone),
+		AdGuardConfKey, shellQuote(o.AdGuardURL), shellQuote(o.AdGuardUser),
+		shellQuote(o.AdGuardPassword), shellQuote(o.RouterIP))
 }
 
 // uploadString writes content to a remote path, via a temp local file.
@@ -298,6 +319,15 @@ type InstallOptions struct {
 	RegistryPath string
 	// ProfilesPath is the local schedule, shipped on the same terms.
 	ProfilesPath string
+	// AdGuardURL, AdGuardUser and AdGuardPassword let the DAEMON drive
+	// AdGuard's API for per-profile DNS restrictions. They are separate from
+	// AdGuardOptions, which is the laptop-side setup run: this is the
+	// credential the router keeps. All empty means the feature is off.
+	AdGuardURL      string
+	AdGuardUser     string
+	AdGuardPassword string
+	// RouterIP is the address AdGuard fetches curfew's filter list from.
+	RouterIP string
 }
 
 // Install puts the daemon on the router, writes its settings and service
@@ -316,7 +346,7 @@ func Install(r Runner, opt InstallOptions) error {
 	// Settings as DATA, separate from the service definition that reads them.
 	// This is what lets `update` replace the binary and the service template
 	// later without being told the WAN interface and the password again.
-	conf := daemonConf(opt.LAN, opt.WAN, opt.Listen, opt.User, opt.Password, opt.Timezone)
+	conf := daemonConf(opt, opt.Timezone)
 	if err := uploadString(r, conf, RemoteDaemonConf, "settings"); err != nil {
 		return err
 	}
@@ -413,6 +443,22 @@ func Update(r Runner, binaryPath string) error {
 	if err := pushBinary(r, binaryPath); err != nil {
 		return err
 	}
+	// Warn about settings this build needs that the file predates. update must
+	// not rewrite daemon.conf (that is the whole reason the file exists), so
+	// the only honest move is to notice and say what to do about it.
+	missing, err := MissingSettings(r)
+	if err != nil {
+		return err
+	}
+	if len(missing) > 0 {
+		fmt.Fprintf(os.Stderr,
+			"curfew: this daemon supports per-profile DNS restrictions, but %s has no %s.\n"+
+				"        That feature will stay OFF. Everything else (allowlist, schedules,\n"+
+				"        budgets, blocks, tickets) is unaffected, because none of it uses AdGuard.\n"+
+				"        To turn it on, re-run 'curfew install' once: update deliberately never\n"+
+				"        rewrites this file, so it cannot add the setting for you.\n",
+			RemoteDaemonConf, strings.Join(missing, ", "))
+	}
 	// The init script is a static template now, so replacing it is safe: it
 	// carries no settings of its own.
 	if err := uploadString(r, initScript(), RemoteInit, "init script"); err != nil {
@@ -425,6 +471,26 @@ func Update(r Runner, binaryPath string) error {
 		return err
 	}
 	return nil
+}
+
+// MissingSettings reports which settings this build needs that the router's
+// daemon.conf does not carry.
+//
+// It exists because daemon.conf is written once by install and never touched
+// by update, which is what makes updating safe, and which also means a new
+// setting can only ever arrive by a reinstall. Detecting that is the
+// difference between a feature that is off and says so, and one that is off
+// and looks broken.
+func MissingSettings(r Runner) ([]string, error) {
+	conf, err := r.Run(fmt.Sprintf("cat %s 2>/dev/null || true", RemoteDaemonConf))
+	if err != nil {
+		return nil, err
+	}
+	var missing []string
+	if !strings.Contains(conf, AdGuardConfKey) {
+		missing = append(missing, AdGuardConfKey)
+	}
+	return missing, nil
 }
 
 // Verify reads the allowlist back OUT OF THE FIREWALL on the router and

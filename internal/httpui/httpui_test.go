@@ -1599,3 +1599,52 @@ func TestAManualBlockTheFirewallIsNotEnforcingIsDrift(t *testing.T) {
 		t.Errorf("an enforced manual block is not drift: %q", views[1].Reason)
 	}
 }
+
+// The filter list is the ONE route served without a password, because AdGuard
+// fetches it with no credentials and has nowhere to put any. That exemption
+// has to be exactly one route wide, so this asserts the exemption AND that
+// everything else is still gated. Without the second half, widening the hole
+// would go unnoticed.
+func TestOnlyTheFilterListRouteEscapesThePassword(t *testing.T) {
+	store := &memStore{reg: &registry.Registry{}}
+	srv := newAuthedServer(store, &fakeFirewall{})
+	srv.ServeFilterList("/curfew-filter.txt", func() string {
+		return "! Title: curfew (managed)\n||twitch.tv^$client=curfew-eli\n"
+	})
+	h := srv.Handler()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/curfew-filter.txt", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("AdGuard cannot fetch the list: want 200, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "twitch.tv") {
+		t.Errorf("the list was not served: %q", rec.Body.String())
+	}
+
+	// Every other route must still demand the password. This is the control:
+	// without it, serving the whole site unauthenticated would pass above.
+	for _, path := range []string{"/", "/devices/", "/api/devices", "/settings"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s is reachable without a password: got %d", path, rec.Code)
+		}
+	}
+	// And the mutating route, which is the one that grants internet access.
+	rec = post(t, h, "/devices", url.Values{"mac": {"aa:bb:cc:dd:ee:05"}})
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("POST /devices is reachable without a password: got %d", rec.Code)
+	}
+}
+
+// A server with no AdGuard integration must expose no extra route at all,
+// rather than an empty one that reads as "the feature is on but idle".
+func TestWithoutTheIntegrationThereIsNoUnauthenticatedRoute(t *testing.T) {
+	h := newAuthedServer(&memStore{reg: &registry.Registry{}}, &fakeFirewall{}).Handler()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/curfew-filter.txt", nil))
+	if rec.Code == http.StatusOK {
+		t.Errorf("an unauthenticated route exists with no integration configured: %d", rec.Code)
+	}
+}

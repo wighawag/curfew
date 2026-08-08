@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -26,14 +27,17 @@ import (
 	_ "time/tzdata"
 
 	"github.com/wighawag/curfew/internal/accounting"
+	"github.com/wighawag/curfew/internal/adguard"
 	"github.com/wighawag/curfew/internal/blockstate"
 	"github.com/wighawag/curfew/internal/budget"
+	"github.com/wighawag/curfew/internal/dnspolicy"
 	"github.com/wighawag/curfew/internal/enforce"
 	"github.com/wighawag/curfew/internal/httpui"
 	"github.com/wighawag/curfew/internal/kernelprobe"
 	"github.com/wighawag/curfew/internal/policy"
 	"github.com/wighawag/curfew/internal/registry"
 	"github.com/wighawag/curfew/internal/schedule"
+	"github.com/wighawag/curfew/internal/shellrun"
 )
 
 // version is stamped at release time via -ldflags "-X main.version=<tag>".
@@ -57,6 +61,16 @@ type options struct {
 	password     string
 	reconcile    time.Duration
 	timezone     string
+	// AdGuard credentials, for the per-profile DNS restrictions. Absent means
+	// the whole DNS refinement is off, which degrades nothing else: schedules,
+	// budgets, manual blocks and tickets are nftables on MAC and do not consult
+	// AdGuard at all.
+	adguardURL      string
+	adguardUser     string
+	adguardPassword string
+	// listenIP is the address AdGuard will fetch curfew's filter list from. It
+	// must be one the ROUTER can reach, since AdGuard does the fetching.
+	routerIP string
 }
 
 // envOr lets every flag also come from the environment, which is how the
@@ -90,6 +104,14 @@ func run(args []string, stderr *os.File) int {
 			"how often budget usage is accounted for")
 	fs.StringVar(&opt.timezone, "timezone", envOr("CURFEW_TZ", ""),
 		"IANA timezone for schedules, e.g. Europe/London (default: the system zone, which on OpenWrt is UTC)")
+	fs.StringVar(&opt.adguardURL, "adguard", envOr("CURFEW_ADGUARD_URL", ""),
+		"AdGuard admin API address, e.g. 127.0.0.1:3000 (empty disables per-profile DNS restrictions)")
+	fs.StringVar(&opt.adguardUser, "adguard-user", envOr("CURFEW_ADGUARD_USER", "parent"),
+		"AdGuard admin username")
+	fs.StringVar(&opt.adguardPassword, "adguard-password", envOr("CURFEW_ADGUARD_PASSWORD", ""),
+		"AdGuard admin password")
+	fs.StringVar(&opt.routerIP, "router-ip", envOr("CURFEW_ROUTER_IP", "127.0.0.1"),
+		"the address AdGuard should fetch curfew's filter list from")
 	showVersion := fs.Bool("version", false, "print the version and exit")
 	probe := fs.Bool("probe", false,
 		"measure whether this KERNEL supports what tickets rely on, then exit. "+
@@ -200,9 +222,19 @@ func run(args []string, stderr *os.File) int {
 			"why_it_matters", "blocking applies to forwarded traffic, so a device kept off the internet can still reach this page and allow itself")
 	}
 
+	// The DNS refinement: per-profile, time-windowed restrictions in AdGuard,
+	// plus the static DHCP leases that give it something to key on. Set up
+	// BEFORE the HTTP server, because the server has to serve the filter list
+	// AdGuard will fetch.
+	dns := setUpDNSRestrictions(opt, sched, store, loc, log)
+
+	ui := httpui.New(store, sched, fw, core, log, opt.user, opt.password, loc)
+	if dns != nil {
+		ui.ServeFilterList(dnspolicy.FilterListPath, dns.FilterList)
+	}
 	srv := &http.Server{
 		Addr:              opt.listen,
-		Handler:           httpui.New(store, sched, fw, core, log, opt.user, opt.password, loc).Handler(),
+		Handler:           ui.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -210,6 +242,9 @@ func run(args []string, stderr *os.File) int {
 	defer stop()
 
 	go reconcileLoop(ctx, log, core, opt.reconcile)
+	if dns != nil {
+		go dnsLoop(ctx, log, dns, opt.reconcile)
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -313,6 +348,98 @@ func reconcileLoop(ctx context.Context, log *slog.Logger, core *policy.Core, eve
 			// tapping buttons would burn a child's afternoon.
 			if err := core.Tick(); err != nil {
 				log.Error("reconcile failed", "error", err)
+			}
+		}
+	}
+}
+
+// setUpDNSRestrictions wires the per-profile DNS refinement, or explains why it
+// is off and returns nil.
+//
+// Returning nil is a first-class outcome rather than a failure. The refinement
+// is the ONLY thing that depends on AdGuard, and losing it costs a household
+// "no streaming between 08:00 and 10:00" while bedtime, budgets, manual blocks
+// and tickets carry on untouched, because those are nftables on MAC. Refusing
+// to start over it would trade a working household for a missing feature.
+//
+// It is also the upgrade path. `curfew update` deliberately never rewrites
+// daemon.conf, so a router installed before this feature existed has no AdGuard
+// credentials in that file and will land here. Saying so plainly, with the fix,
+// is the whole mitigation.
+func setUpDNSRestrictions(opt options, sched schedule.FileStore, store registry.FileStore,
+	loc *time.Location, log *slog.Logger) *dnspolicy.Manager {
+
+	if opt.adguardURL == "" || opt.adguardPassword == "" {
+		log.Warn("per-profile DNS restrictions are OFF: no AdGuard credentials configured",
+			"what_still_works", "schedules, budgets, manual blocks, tickets and the MAC allowlist, "+
+				"none of which use AdGuard",
+			"what_does_not", "per-profile website and service restrictions",
+			"how_to_fix", "re-run 'curfew install' from your laptop, which writes the AdGuard "+
+				"settings into "+deployDaemonConf+"; 'curfew update' deliberately leaves that file alone")
+		return nil
+	}
+	ps, err := sched.Load()
+	if err == nil && !ps.AnyRestrictions() {
+		// Said out loud so "AdGuard is wired up" is never confused with
+		// "something is being restricted". An integration that manages nothing
+		// looks identical from outside to one that is broken.
+		log.Info("AdGuard is configured but no profile has any DNS restrictions, " +
+			"so curfew will create no AdGuard objects")
+	}
+
+	api := adguard.NewClient(opt.adguardURL, opt.adguardUser, opt.adguardPassword)
+	listURL := fmt.Sprintf("http://%s%s", net.JoinHostPort(opt.routerIP, listenPort(opt.listen)),
+		dnspolicy.FilterListPath)
+	log.Info("per-profile DNS restrictions are on",
+		"adguard", opt.adguardURL, "filter_list", listURL)
+
+	return dnspolicy.NewManager(dnspolicy.Config{
+		Registry: store, Schedule: sched, Runner: shellrun.Local{}, API: api,
+		ListURL: listURL, LANInterface: opt.lan, Location: loc, Log: log,
+	})
+}
+
+// deployDaemonConf is where the settings file lives on the router. Stated here
+// rather than imported, because the daemon must not depend on the laptop-side
+// deploy package (see separation_test.go); it is only ever printed.
+const deployDaemonConf = "/etc/config/curfew/daemon.conf"
+
+// listenPort extracts the port from a listen address like ":8080".
+func listenPort(listen string) string {
+	if _, port, err := net.SplitHostPort(listen); err == nil && port != "" {
+		return port
+	}
+	return "8080"
+}
+
+// dnsLoop re-asserts the DNS refinement on the same cadence as the firewall.
+//
+// It runs on a tick rather than only on action, which ADR 0010 reserved for
+// AdGuard, and the reason it is safe is SCOPE rather than frequency: every
+// write it makes is to an object curfew created and named, so a household
+// editing its own AdGuard rules, lists or clients is never fought. See the
+// package comment on internal/dnspolicy.
+//
+// A failure is logged and the loop continues. This is the fail-open half of
+// the safety property: the refinement going quiet must never take the
+// load-bearing controls down with it.
+func dnsLoop(ctx context.Context, log *slog.Logger, m *dnspolicy.Manager, every time.Duration) {
+	if every <= 0 {
+		return
+	}
+	if err := m.Tick(); err != nil {
+		log.Error("DNS restrictions could not be applied; the firewall is unaffected", "error", err)
+	}
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := m.Tick(); err != nil {
+				log.Error("DNS restrictions could not be applied; the firewall is unaffected",
+					"error", err)
 			}
 		}
 	}

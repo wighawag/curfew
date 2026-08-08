@@ -170,6 +170,12 @@ type Profile struct {
 	// registry. A MAC here that is not registered simply matches nothing.
 	Devices []string `json:"devices"`
 	Windows []Window `json:"windows"`
+	// Restrictions are per-profile DNS restrictions that apply during their
+	// own windows: "no streaming from 08:00 to 10:00". They are layered ON TOP
+	// of Windows rather than being an alternative to them. A blocked window
+	// takes the child off the internet in nftables by MAC; a restriction
+	// leaves them online and removes some domains, in AdGuard by IP.
+	Restrictions []Restriction `json:"dns_restrictions,omitempty"`
 	// Budget is this profile's daily time allowance. Every field in it is
 	// optional and an absent budget means UNLIMITED, which is what a parent, a
 	// printer and a camera all need. See internal/budget.
@@ -196,6 +202,28 @@ type Profiles struct {
 	// pull; daemon.conf is deployment settings that `curfew update`
 	// deliberately never touches.
 	Budget budget.Settings `json:"budget_settings,omitzero"`
+	// BlockLists are the household's own named domain lists, referenced by a
+	// profile's restrictions. They live HERE, in curfew's configuration,
+	// rather than in AdGuard, so they travel with push and pull and so that
+	// AdGuard's file is never the source of truth for something a parent
+	// authored (ADR 0010).
+	BlockLists map[string][]string `json:"block_lists,omitempty"`
+	// BlockDoHBootstrap stops a restricted profile resolving the well-known
+	// DNS-over-HTTPS endpoint hostnames, which is how a child's browser would
+	// otherwise route around every restriction here while looking untouched.
+	//
+	// A POINTER because absent must mean ON. A restriction that is trivially
+	// bypassable is not a restriction, so the safe default has to be the one
+	// you get by not writing anything, and `false` has to be a deliberate act.
+	// It applies only to profiles that already have restrictions configured,
+	// so parents and ungoverned devices are unaffected.
+	BlockDoHBootstrap *bool `json:"block_doh_bootstrap,omitempty"`
+}
+
+// DoHBootstrapBlocked reports whether restricted profiles should be stopped
+// from resolving well-known DoH endpoints. Absent means yes.
+func (ps *Profiles) DoHBootstrapBlocked() bool {
+	return ps.BlockDoHBootstrap == nil || *ps.BlockDoHBootstrap
 }
 
 // Find returns a profile by name.
@@ -254,6 +282,7 @@ func (ps *Profiles) Validate() error {
 			problems = append(problems, fmt.Sprintf("profile %q budget: %v", p.Name, err))
 		}
 	}
+	problems = append(problems, ps.validateRestrictions()...)
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))
 	}
@@ -363,6 +392,71 @@ func (w Window) Describe() string {
 	return fmt.Sprintf("%s to %s, %s%s", w.Start, w.End, d, overnight)
 }
 
+// sameLists compares the household's named domain lists, order-insensitively
+// within each list.
+func sameLists(a, b map[string][]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for name, da := range a {
+		db, ok := b[name]
+		if !ok || len(da) != len(db) {
+			return false
+		}
+		x := append([]string(nil), da...)
+		y := append([]string(nil), db...)
+		sort.Strings(x)
+		sort.Strings(y)
+		for i := range x {
+			if x[i] != y[i] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// sameRestrictions compares a profile's restrictions. Order IS significant,
+// as it is for windows, because the list is authored and its order is what a
+// person sees on the page.
+func sameRestrictions(a, b []Restriction) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name ||
+			!sameStrings(a[i].Services, b[i].Services) ||
+			!sameStrings(a[i].Lists, b[i].Lists) ||
+			len(a[i].Windows) != len(b[i].Windows) {
+			return false
+		}
+		for j := range a[i].Windows {
+			if a[i].Windows[j].Start != b[i].Windows[j].Start ||
+				a[i].Windows[j].End != b[i].Windows[j].End ||
+				!sameSet(a[i].Windows[j].Days, b[i].Windows[j].Days) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	x := append([]string(nil), a...)
+	y := append([]string(nil), b...)
+	sort.Strings(x)
+	sort.Strings(y)
+	for i := range x {
+		if x[i] != y[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func sameSet(a, b []Day) bool {
 	if len(a) != len(b) {
 		return false
@@ -385,17 +479,36 @@ func sameSet(a, b []Day) bool {
 func Equal(a, b *Profiles) bool {
 	ai, bi := map[string]Profile{}, map[string]Profile{}
 	var sa, sb budget.Settings
+	var la, lb map[string][]string
 	if a != nil {
 		sa = a.Budget
+		la = a.BlockLists
 		for _, p := range a.Profiles {
 			ai[p.Name] = p
 		}
 	}
 	if b != nil {
 		sb = b.Budget
+		lb = b.BlockLists
 		for _, p := range b.Profiles {
 			bi[p.Name] = p
 		}
+	}
+	// The household's own domain lists are configuration and must take part in
+	// the comparison, for the same reason the budget knobs do: a list edited on
+	// one side and invisible to the merge would be silently discarded by the
+	// other side's push.
+	if !sameLists(la, lb) {
+		return false
+	}
+	// Part of the comparison for the same reason the budget knobs are: a
+	// household that deliberately turned this OFF must not have it silently
+	// turned back on by the other side's push.
+	if (a == nil) != (b == nil) {
+		return false
+	}
+	if a != nil && b != nil && a.DoHBootstrapBlocked() != b.DoHBootstrapBlocked() {
+		return false
 	}
 	// The household budget knobs are part of the schedule for push and pull.
 	// Leaving them out would make a changed reset time invisible to the merge,
@@ -412,6 +525,9 @@ func Equal(a, b *Profiles) bool {
 			return false
 		}
 		if pa.Budget != pb.Budget {
+			return false
+		}
+		if !sameRestrictions(pa.Restrictions, pb.Restrictions) {
 			return false
 		}
 		for i := range pa.Windows {

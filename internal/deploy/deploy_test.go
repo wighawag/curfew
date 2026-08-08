@@ -18,12 +18,20 @@ type fakeRunner struct {
 	uploaded  map[string]string
 	zone      string
 	failOn    string
+	// out replays canned output for a command containing the key, so a test
+	// can present the router as holding a particular file.
+	out map[string]string
 }
 
 func (f *fakeRunner) Run(cmd string) (string, error) {
 	f.cmds = append(f.cmds, cmd)
 	if f.failOn != "" && strings.Contains(cmd, f.failOn) {
 		return "", errors.New("remote command failed")
+	}
+	for key, val := range f.out {
+		if strings.Contains(cmd, key) {
+			return val, nil
+		}
 	}
 	if strings.Contains(cmd, "uname -m") {
 		return "aarch64\n", nil
@@ -258,12 +266,22 @@ func TestInitScriptIsAStaticTemplateCarryingNoSettings(t *testing.T) {
 func TestDaemonConfQuotesAwkwardValues(t *testing.T) {
 	// A password can contain anything. A naive quote would either break the
 	// file the init script sources, or let the value execute.
-	c := daemonConf("br-lan", "pppoe-wan", ":8080", "parent", `it's $PWD; rm -rf /`, "Europe/London")
+	c := daemonConf(InstallOptions{
+		LAN: "br-lan", WAN: "pppoe-wan", Listen: ":8080", User: "parent",
+		Password:        `it's $PWD; rm -rf /`,
+		AdGuardPassword: `also 'quoted'`,
+	}, "Europe/London")
 	if !strings.Contains(c, `CURFEW_PASSWORD='it'\''s $PWD; rm -rf /'`) {
 		t.Errorf("password not safely quoted:\n%s", c)
 	}
 	if !strings.Contains(c, "CURFEW_WAN='pppoe-wan'") {
 		t.Errorf("settings missing:\n%s", c)
+	}
+	// The AdGuard password goes through the same file and the same shell, so
+	// it needs the same quoting. It is a second secret in one file and was
+	// added later, which is exactly when a quoting rule gets forgotten.
+	if !strings.Contains(c, `CURFEW_ADGUARD_PASSWORD='also '\''quoted'\'''`) {
+		t.Errorf("AdGuard password not safely quoted:\n%s", c)
 	}
 }
 
@@ -552,5 +570,37 @@ func TestUpdateLeavesTheBlockStateAlone(t *testing.T) {
 	}
 	if r.uploadedTo(RemoteState) {
 		t.Error("update must not overwrite the router's own block state")
+	}
+}
+
+// A router installed before per-profile DNS restrictions existed has a
+// daemon.conf with no AdGuard settings, and `update` must never rewrite that
+// file. So the only honest behaviour is to NOTICE and say so. Without this,
+// updating such a router ships a daemon whose DNS half can never start, with
+// nothing anywhere saying why.
+func TestUpdateNoticesSettingsThisBuildNeedsThatTheRouterPredates(t *testing.T) {
+	old := &fakeRunner{out: map[string]string{
+		"cat " + RemoteDaemonConf: "CURFEW_LAN='br-lan'\nCURFEW_WAN='pppoe-wan'\n",
+	}}
+	missing, err := MissingSettings(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) != 1 || missing[0] != AdGuardConfKey {
+		t.Errorf("want %s reported missing, got %v", AdGuardConfKey, missing)
+	}
+
+	// The control: a file written by THIS version must report nothing missing,
+	// or the warning would fire for ever and stop meaning anything.
+	conf := daemonConf(InstallOptions{
+		LAN: "br-lan", WAN: "pppoe-wan", AdGuardURL: "127.0.0.1:3000",
+	}, "Europe/London")
+	current := &fakeRunner{out: map[string]string{"cat " + RemoteDaemonConf: conf}}
+	missing, err = MissingSettings(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) != 0 {
+		t.Errorf("a freshly written settings file reports missing keys: %v", missing)
 	}
 }

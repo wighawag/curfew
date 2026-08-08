@@ -64,6 +64,7 @@ ssh root@192.168.1.1 "ifstatus wan | grep l3_device"
 | `curfew push <host>` | laptop | Send your local device list to the router |
 | `curfew pull <host>` | laptop | Merge the router's device list into yours |
 | `curfew probe <host>` | laptop | Check the router's kernel still supports tickets |
+| `curfew adopt-leases <host>` | laptop | Take over static DHCP leases written by something else |
 | `curfew version` | laptop | Print the version |
 | `curfew-daemon -version` | router | Print the version running on the router |
 
@@ -138,7 +139,48 @@ Passwords: `-password` sets both the device page and AdGuard, and `-curfew-passw
 
 curfew deliberately does **not** own `AdGuardHome.yaml`. AdGuard rewrites that file itself and drops anything it does not recognise, so everything else curfew does goes through the REST API. The reasoning and the measurements are in `docs/adr/0010-curfew-drives-adguard-through-its-api-and-owns-only-its-own-objects.md`.
 
-Guest passes and per-profile website blocking are designed but not built. The decisions behind them are recorded in `docs/adr/` so they land as decisions rather than guesses.
+Guest passes are designed but not built. The decisions behind them are recorded in `docs/adr/` so they land as decisions rather than guesses.
+
+### Per-profile website and service restrictions
+
+A profile can lose some of the internet without losing all of it. "Eli has internet from 08:00 to 22:00" is a schedule window, enforced in the firewall by MAC. "And no streaming between 08:00 and 10:00" is a **DNS restriction**, enforced in AdGuard, and the two layer rather than competing.
+
+A restriction draws on two sources, and both work:
+
+- **AdGuard's built-in service catalogue** (`youtube`, `tiktok`, `netflix`, `roblox`, `discord` and many more). Preferred, because it is maintained upstream and keeps working when a service adds new domains.
+- **Your own domain lists**, defined once in `profiles.json` under `block_lists` and referenced by name. They live in curfew's config, so they travel with `push` and `pull`.
+
+```json
+{
+  "block_lists": { "no_streaming": ["twitch.tv", "iplayer.bbc.co.uk"] },
+  "profiles": [{
+    "name": "eli",
+    "devices": ["14:e0:1d:6a:9c:6c"],
+    "dns_restrictions": [{
+      "name": "no streaming",
+      "services": ["youtube", "netflix"],
+      "lists": ["no_streaming"],
+      "windows": [{"days": ["mon","tue","wed","thu","fri"], "start": "08:00", "end": "10:00"}]
+    }]
+  }]
+}
+```
+
+If you are migrating from the shell scripts, they may have left static leases of their own. `curfew adopt-leases <host>` shows you every one whose MAC is a registered device and, with `-yes`, hands it to curfew at the same address, so the device does not move. Without it, curfew leaves such an entry strictly alone and reports it as a conflict on every pass. Entries for devices curfew does not know about are never offered and never touched.
+
+To make this possible curfew **pins a static DHCP lease** for each registered device, because AdGuard identifies a client by IP and cannot be keyed by MAC at all. It writes those as uci entries named `dhcp.curfew_<mac>`, and it owns **only** those: any host entry you or anything else created is left exactly as it was, which a test asserts against a real `/etc/config/dhcp`.
+
+**IPv6 matters here more than it looks.** On this household's router roughly half of all DNS queries arrive over IPv6, including a child's phone, so a rule keyed only to an IPv4 lease would look completely correct and do nothing for half the traffic. curfew therefore adds the device's current IPv6 addresses to the same AdGuard client, read from the router's neighbour table. The two families are treated differently on purpose: IPv4 comes only from the lease curfew pinned, because DHCP reissues addresses and a stale one would restrict the *wrong child*, while a rotating IPv6 privacy address is safe to follow because it is never reused. The reasoning and the measurements are in `docs/adr/0011-curfew-pins-ipv4-leases-and-follows-ipv6-to-identify-a-device-to-adguard.md`.
+
+If a device has no known address, its profile's restrictions **do not apply to it**, and the daemon says so in the log rather than pretending otherwise. Schedules, budgets and manual blocks are unaffected, because those are the firewall and never consult an IP address.
+
+**Encrypted DNS is partly closed.** A restriction is worthless if the child's browser can just ask somebody else, so curfew also blocks the well-known DNS-over-HTTPS endpoint hostnames (`cloudflare-dns.com`, `dns.google`, `quad9.net` and the rest) for any profile that has restrictions. Almost every browser and phone exposes that setting as a provider *name*, so the lookup goes through the router and fails. This applies around the clock rather than only inside the window, because a child sets an endpoint once and it persists. It applies only to profiles that have restrictions, so your own devices keep encrypted DNS, and you can turn it off with `"block_doh_bootstrap": false`.
+
+What it does **not** close: a DoH endpoint entered as a bare IP address, a hardcoded plain resolver like `8.8.8.8`, DNS-over-TLS on port 853, or a VPN. Those need firewall rules rather than DNS rules, and they are specified in `work/specs/proposed/force-dns-through-the-router.md` rather than quietly implied to be handled. Treat the current state as a speed bump against a curious child, not a control against a determined one.
+
+One more limit: a child who **copies a sibling's registered MAC** inherits that sibling's access and restrictions, which no MAC allowlist can see. (A child who *randomises* their MAC is already handled: an unknown MAC matches nothing and is dropped, so they lose the internet entirely.)
+
+This feature needs AdGuard credentials in the daemon's settings file. `curfew install` writes them; `curfew update` deliberately never rewrites that file, so on a router set up before this existed the feature stays off, and `update` tells you so and tells you that one `curfew install` turns it on.
 
 ## If something goes wrong
 

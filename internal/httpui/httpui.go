@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -92,6 +93,27 @@ type Server struct {
 	// implicit, because the system default on OpenWrt is UTC and a household
 	// bedtime evaluated in UTC is silently an hour out half the year.
 	loc *time.Location
+	// filterList supplies the AdGuard filter list curfew serves, or is nil when
+	// the AdGuard integration is off. See ServeFilterList.
+	filterList func() string
+	// filterPath is the single unauthenticated route, empty when unused.
+	filterPath string
+}
+
+// ServeFilterList makes this server publish curfew's AdGuard filter list at
+// path, WITHOUT authentication.
+//
+// The exemption is deliberate and is as narrow as it can be. AdGuard fetches a
+// subscribed list with no credentials and has nowhere to put any, so an
+// authenticated route could not be used at all. What is exposed is profile
+// names and blocked domains: the device addresses are not in the list, because
+// its rules reference the AdGuard client by NAME, so nothing here identifies a
+// device or grants access to anything. Every other route on this server stays
+// behind the password, which matters because this page can hand out internet
+// access and is reachable by the very devices being blocked.
+func (s *Server) ServeFilterList(path string, provider func() string) {
+	s.filterPath = path
+	s.filterList = provider
 }
 
 // New builds the server. An empty user or password disables authentication,
@@ -159,7 +181,31 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/devices/rename", s.handleRenameDevice)
 	mux.HandleFunc("/devices/remove", s.handleRemoveDevice)
 	mux.HandleFunc("/api/devices", s.handleAPIDevices)
-	return s.withAuth(s.withNoStore(mux))
+	if s.filterList == nil || s.filterPath == "" {
+		return s.withAuth(s.withNoStore(mux))
+	}
+	// One route outside the password, and only one. A more specific pattern
+	// wins in ServeMux, so "/" still routes everything else through withAuth.
+	outer := http.NewServeMux()
+	outer.Handle("/", s.withAuth(s.withNoStore(mux)))
+	outer.HandleFunc(s.filterPath, s.handleFilterList)
+	return outer
+}
+
+// handleFilterList serves the list AdGuard subscribes to.
+func (s *Server) handleFilterList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	// AdGuard must never serve a cached copy back to itself after a window
+	// boundary, which is the one moment the content has certainly changed.
+	w.Header().Set("Cache-Control", "no-store")
+	if _, err := io.WriteString(w, s.filterList()); err != nil {
+		s.log.Error("writing the AdGuard filter list", "error", err)
+	}
 }
 
 func (s *Server) withAuth(next http.Handler) http.Handler {
