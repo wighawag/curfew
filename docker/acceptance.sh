@@ -43,6 +43,13 @@ CGO_ENABLED=0 go test -c -o .acceptance/leases.test ./internal/leases
 # families, so it runs against the real AdGuard the image ships.
 CGO_ENABLED=0 go test -c -o .acceptance/dnspolicy.test ./internal/dnspolicy
 
+# internal/adguard edits AdGuard's own config and restarts it to change which
+# category blocklists a household carries. The claim is that the RESOLVER
+# answers differently afterwards and is still answering at all, which only a
+# real AdGuard, a real restart and a real query can settle. It also covers the
+# rollback, where a config AdGuard refuses must leave the household resolving.
+CGO_ENABLED=0 go test -c -o .acceptance/adguard.test ./internal/adguard
+
 # The kernel probe both measures a kernel and claims to be safe on a live
 # router. The second half is a packet-path assertion, so it belongs here.
 CGO_ENABLED=0 go test -c -o .acceptance/kernelprobe.test ./internal/kernelprobe

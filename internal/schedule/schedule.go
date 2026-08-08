@@ -21,6 +21,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wighawag/curfew/internal/adguard"
+
 	"github.com/wighawag/curfew/internal/budget"
 )
 
@@ -228,6 +230,37 @@ type Profiles struct {
 	// remain the household's space and curfew still never touches them; this
 	// is simply an exception list curfew can own and carry.
 	AllowedDomains []string `json:"allowed_domains,omitempty"`
+	// FilterCategories are the category blocklists AdGuard should subscribe
+	// to, by catalogue name.
+	//
+	// ABSENT means the default set, which is what every existing household
+	// has, so upgrading changes nothing. An EMPTY list means a household that
+	// deliberately wants no category filtering at all, which is a different
+	// thing and must stay different: that is why this is a pointer-free slice
+	// read through Categories() rather than compared against nil at each use.
+	//
+	// It lives here for the same reason AllowedDomains does. The set used to
+	// be compiled into the installer, so a household that deleted a list in
+	// AdGuard's UI got it back on the next `curfew install`, and the choice
+	// travelled with nothing. Measured cost of getting this wrong: the
+	// blocklistproject Malware list is 56 MB, more than half the rule text on
+	// a 1 GB router, and it blocks eth.limo and euc.li as false positives.
+	FilterCategories *[]string `json:"filter_categories,omitempty"`
+}
+
+// Categories are the category blocklists this household wants, with absent
+// meaning the default set.
+func (ps *Profiles) Categories() []string {
+	if ps.FilterCategories == nil {
+		return append([]string(nil), adguard.Categories...)
+	}
+	return append([]string(nil), *ps.FilterCategories...)
+}
+
+// SetCategories records the household's choice, including the empty one.
+func (ps *Profiles) SetCategories(names []string) {
+	out := append([]string(nil), names...)
+	ps.FilterCategories = &out
 }
 
 // DoHBootstrapBlocked reports whether restricted profiles should be stopped
@@ -297,6 +330,17 @@ func (ps *Profiles) Validate() error {
 		if strings.ContainsAny(d, " \t/^|$") {
 			problems = append(problems, fmt.Sprintf(
 				"allowed domain %q is not a plain domain name", d))
+		}
+	}
+	// A category curfew cannot install would save cleanly and then subscribe
+	// to nothing, which reads on the page as filtering that is on.
+	if ps.FilterCategories != nil {
+		for _, c := range *ps.FilterCategories {
+			if !adguard.KnownCategory(c) {
+				problems = append(problems, fmt.Sprintf(
+					"no filter category called %q; curfew knows %s", c,
+					strings.Join(adguard.Categories, ", ")))
+			}
 		}
 	}
 	if len(problems) > 0 {

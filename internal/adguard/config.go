@@ -22,6 +22,11 @@ type ConfigParams struct {
 	RouterIP string
 	// Upstreams are the resolvers AdGuard forwards to.
 	Upstreams []string
+	// Categories are the blocklists to subscribe to. Nil means the default
+	// set; an EMPTY non-nil slice means a household that wants none, which is
+	// a choice curfew must be able to reproduce on a reinstall rather than
+	// quietly overriding. See schedule.Profiles.FilterCategories.
+	Categories []string
 }
 
 // DefaultUpstreams are used when none are configured.
@@ -34,10 +39,16 @@ var Categories = []string{
 	"Gambling", "Porn", "Malware", "Phishing", "Ransomware", "Scam", "Fraud", "Ads",
 }
 
+// CategorySource is where category lists are fetched from.
+//
+// A variable rather than a constant so a test can point the catalogue at a
+// local server and exercise the REAL ownership rule instead of a special case
+// compiled in for tests. Nothing in production changes it.
+var CategorySource = "https://blocklistproject.github.io/Lists/adguard/"
+
 // CategoryURL is where a category's list comes from.
 func CategoryURL(name string) string {
-	return "https://blocklistproject.github.io/Lists/adguard/" +
-		strings.ToLower(name) + "-ags.txt"
+	return CategorySource + strings.ToLower(name) + "-ags.txt"
 }
 
 // InitialConfig renders AdGuard's config for a fresh install.
@@ -91,7 +102,11 @@ dns:
 schema_version: 34
 filters:
 `)
-	for i, name := range Categories {
+	cats := Categories
+	if p.Categories != nil {
+		cats = p.Categories
+	}
+	for i, name := range cats {
 		fmt.Fprintf(&b, "- enabled: true\n  url: %s\n  name: %s\n  id: %d\n",
 			CategoryURL(name), name, i+1)
 	}

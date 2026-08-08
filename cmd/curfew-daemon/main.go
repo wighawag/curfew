@@ -243,6 +243,14 @@ func run(args []string, stderr *os.File) int {
 		// So the settings page can offer AdGuard's own service catalogue
 		// instead of a list compiled into curfew that drifts from it.
 		ui.UseAdGuardServices(dns.Services)
+		// So the household owns which category blocklists AdGuard carries.
+		// This one STOPS AdGuard to apply the change: see
+		// internal/adguard/categories.go for why that is the safe path and
+		// the API is not, on a router this size.
+		ui.UseAdGuardCategories(func(wanted []string) (adguard.ApplyReport, error) {
+			return adguard.ApplyCategories(shellrun.Local{}, localResolver{},
+				adguard.ConfigPath, wanted, adguard.DefaultRestartTimeout)
+		})
 	}
 	srv := &http.Server{
 		Addr:              opt.listen,
@@ -459,4 +467,42 @@ func dnsLoop(ctx context.Context, log *slog.Logger, m *dnspolicy.Manager, every 
 			}
 		}
 	}
+}
+
+// localResolver answers whether this router is serving DNS again, by asking it
+// a real question.
+//
+// It probes the RESOLVER rather than AdGuard's admin API, because those are
+// not the same event: measured in the DNS-path tests, AdGuard serves its API
+// about two seconds after starting and binds port 53 up to forty-three seconds
+// later. Waiting for the API would report the house back online while it still
+// had no DNS at all.
+type localResolver struct{}
+
+// Serving reports whether something answers a query on 127.0.0.1:53.
+//
+// A NAME that exists is deliberately not required. Any answer at all, and even
+// an authoritative "no such name", proves a resolver is listening and
+// responding; requiring a successful lookup would make this depend on the
+// household's upstream being reachable, so a WAN outage would look like a
+// failed restart and trigger a rollback that fixes nothing.
+func (localResolver) Serving() bool {
+	res := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 2 * time.Second}
+			return d.DialContext(ctx, "udp", "127.0.0.1:53")
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := res.LookupHost(ctx, "curfew-restart-probe.invalid")
+	if err == nil {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && !dnsErr.IsTimeout && !dnsErr.IsTemporary {
+		return true // it answered, and the answer was "no such host"
+	}
+	return false
 }

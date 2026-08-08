@@ -34,6 +34,11 @@ type AdGuardOptions struct {
 	// RouterIP is the address the admin page will be reached on, used for the
 	// API and for what gets printed at the end.
 	RouterIP string
+	// Categories are the blocklists a fresh install subscribes to, taken from
+	// the household's own profiles rather than compiled in, so a reinstall
+	// reproduces the choice instead of resurrecting a list somebody removed.
+	// Nil means the default set.
+	Categories []string
 	// DNSTimeout bounds how long to wait for AdGuard to take over port 53.
 	// Zero means DefaultDNSTimeout. It is a field rather than a constant
 	// because AdGuard loads its blocklists before binding (43 seconds on the
@@ -339,6 +344,7 @@ func installAdGuard(r Runner, opt AdGuardOptions) (AdGuardReport, error) {
 
 	conf := adguard.InitialConfig(adguard.ConfigParams{
 		User: opt.User, PasswordHash: hash, RouterIP: opt.RouterIP,
+		Categories: opt.Categories,
 	})
 	if err := uploadString(r, conf, adguard.ConfigPath, "AdGuard config"); err != nil {
 		return report, err

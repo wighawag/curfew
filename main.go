@@ -334,8 +334,17 @@ func cmdInstall(args []string) error {
 	// allowlist and the schedules; if AdGuard setup fails, the household still
 	// ends up with working parental control and a clear message about the DNS
 	// half, rather than neither.
+	// The category blocklists come from the household's own profiles, so a
+	// reinstall reproduces a list somebody deliberately removed rather than
+	// putting it back. A profiles file that cannot be read falls back to the
+	// defaults: an install must not be blocked by it.
+	var categories []string
+	if ps, err := schedule.Load(profilesPath(*regPath)); err == nil {
+		categories = ps.Categories()
+	}
 	agh, aghErr := deploy.SetupAdGuard(runner, deploy.AdGuardOptions{
 		Enabled: !*noAdGuard, User: *adguardUser, Password: adguardPass, RouterIP: routerIP,
+		Categories: categories,
 	})
 	if aghErr != nil {
 		fmt.Fprintf(os.Stderr, "\ncurfew: AdGuard setup FAILED: %v\n", aghErr)

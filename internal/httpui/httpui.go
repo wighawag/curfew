@@ -118,6 +118,9 @@ type Server struct {
 	// AdGuard actually knows about instead of a list that silently drifts
 	// from it.
 	services func() ([]string, error)
+	// applyCategories applies a category-blocklist change to the running
+	// AdGuard, or is nil when nothing wired one up. See categories.go.
+	applyCategories CategoryApplier
 }
 
 // UseAdGuardServices lets the settings page offer AdGuard's built-in service
@@ -208,6 +211,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/settings/blocklist/delete", s.handleBlockListDelete)
 	mux.HandleFunc("/settings/dns", s.handleDNSSettings)
 	mux.HandleFunc("/settings/allowed", s.handleAllowedDomains)
+	mux.HandleFunc("/settings/categories", s.handleCategories)
 	mux.HandleFunc("/profiles/block", s.handleProfileBlock)
 	mux.HandleFunc("/profiles/unblock", s.handleProfileUnblock)
 	mux.HandleFunc("/profiles/block-in", s.handleProfileBlockIn)

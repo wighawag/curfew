@@ -91,6 +91,11 @@ type settingsData struct {
 	BlockDoH bool
 	// Allowed is the household's exception list, one domain per line.
 	Allowed string
+	// Categories are the category blocklists, ticked as this household has
+	// them. CategoriesOff means no AdGuard is wired up here, so the section
+	// says so rather than offering a control that would change nothing.
+	Categories    []CategoryView
+	CategoriesOff bool
 	// ServicesUnavailable is true when AdGuard is configured but its catalogue
 	// could not be read, so the page can say why the service list is empty
 	// rather than implying this AdGuard has no services.
@@ -225,6 +230,8 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		Allowed:             strings.Join(ps.AllowedDomains, "\n"),
 		BlockLists:          lists,
 		ListNames:           names,
+		Categories:          categoryViews(ps),
+		CategoriesOff:       s.applyCategories == nil,
 		Services:            services,
 		DNSOff:              s.services == nil,
 		ServicesUnavailable: servicesUnavailable,
@@ -585,6 +592,29 @@ var settingsTemplate = template.Must(template.New("settings").Parse(`<!DOCTYPE h
   {{end}}
   {{else}}
   <p class="muted">No lists yet.</p>
+  {{end}}
+  <h3 style="font-size:.9rem">Category filter lists</h3>
+  {{if .CategoriesOff}}
+  <p class="muted">AdGuard is not configured here, so curfew cannot change which
+  lists it subscribes to.</p>
+  {{else}}
+  <form method="POST" action="/settings/categories">
+    {{range .Categories}}
+    <div class="row">
+      <label><input type="checkbox" name="categories" value="{{.Name}}"
+                    {{if .Selected}}checked{{end}}> {{.Name}}</label>
+      {{if .Note}}<span class="muted">{{.Note}}</span>{{end}}
+    </div>
+    {{end}}
+    <div class="row"><button type="submit">apply filter lists</button></div>
+    <div class="muted">Your choice lives in curfew's config, so it survives a
+    reinstall and travels with push and pull. Applying it RESTARTS AdGuard:
+    the whole house has no DNS for up to a minute. That is deliberate. Every
+    other way of changing a subscribed list makes AdGuard rebuild its filtering
+    engine while the old one is still in memory, which on this router took it
+    from 555 MB to 883 MB of 1010 MB, got it killed, and cost 88 seconds of DNS
+    with no warning at all.</div>
+  </form>
   {{end}}
   <h3 style="font-size:.9rem">Always allow these sites</h3>
   <form method="POST" action="/settings/allowed">
