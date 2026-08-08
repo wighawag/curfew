@@ -188,6 +188,12 @@ func (m *memState) Load() (*blockstate.State, error) {
 			cp.Budget[k] = v
 		}
 	}
+	if m.st.PendingBlock != nil {
+		cp.PendingBlock = map[string]time.Time{}
+		for k, v := range m.st.PendingBlock {
+			cp.PendingBlock[k] = v
+		}
+	}
 	return cp, nil
 }
 
@@ -203,6 +209,12 @@ func (m *memState) Save(s *blockstate.State) error {
 		cp.Budget = map[string]budget.State{}
 		for k, v := range s.Budget {
 			cp.Budget[k] = v
+		}
+	}
+	if s.PendingBlock != nil {
+		cp.PendingBlock = map[string]time.Time{}
+		for k, v := range s.PendingBlock {
+			cp.PendingBlock[k] = v
 		}
 	}
 	m.st = cp

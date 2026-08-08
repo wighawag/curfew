@@ -219,3 +219,82 @@ func allDay(t *testing.T, schedPath string) {
 		t.Fatalf("saving schedule: %v", err)
 	}
 }
+
+// A delayed block, on the packet path and across a reboot.
+//
+// Two claims a unit test cannot make honestly. Before the deadline the child is
+// genuinely still online, with real packets, so "it changed nothing yet" is not
+// merely a statement about a struct. And a router that reboots during the
+// countdown still applies it, because a decision on disk is the only kind that
+// survives a power cut: a timer in memory would hand the child the rest of
+// their evening.
+func TestPacketPathADelayedBlockSurvivesARebootAndLandsOnTime(t *testing.T) {
+	net := netnstest.Require(t)
+	regPath, schedPath, statePath := onDisk(t, eliMAC, dadMAC)
+
+	core := boot(t, regPath, schedPath, statePath)
+	core.now = func() time.Time { return time.Date(2026, 3, 4, 19, 0, 0, 0, time.UTC) }
+	if err := core.Reconcile(); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	net.SetClientMAC(eliMAC)
+	if !net.Reaches() {
+		t.Fatal("baseline: a registered device with no block must reach the internet")
+	}
+
+	if err := core.BlockIn("eli", 30*time.Minute); err != nil {
+		t.Fatalf("BlockIn: %v", err)
+	}
+	if err := core.Reconcile(); err != nil {
+		t.Fatalf("Reconcile after arming: %v", err)
+	}
+	// The point of the feature: nothing happens yet, to real packets.
+	if !net.Reaches() {
+		t.Fatal("arming a delayed block cut the child off immediately")
+	}
+
+	// The reboot, mid-countdown: tables gone, fresh process, same files. The
+	// clock is set past the deadline, which is also what a router that was off
+	// over the deadline looks like from here.
+	net.DeleteTable()
+	if !net.Reaches() {
+		t.Fatal("with the table gone everything should flow, or the assertion below proves nothing")
+	}
+	rebooted := boot(t, regPath, schedPath, statePath)
+	rebooted.now = func() time.Time { return time.Date(2026, 3, 4, 19, 30, 0, 0, time.UTC) }
+	if err := rebooted.Reconcile(); err != nil {
+		t.Fatalf("Reconcile after reboot: %v", err)
+	}
+	if net.Reaches() {
+		t.Error("a delayed block armed before a reboot never landed, so the countdown died " +
+			"with the router")
+	}
+
+	// It is off until LIFTED: what landed is an ordinary manual block, so it
+	// must survive the NEXT reboot too, exactly as one made by hand does.
+	net.DeleteTable()
+	again := boot(t, regPath, schedPath, statePath)
+	again.now = func() time.Time { return time.Date(2026, 3, 4, 21, 0, 0, 0, time.UTC) }
+	if err := again.Reconcile(); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if net.Reaches() {
+		t.Error("the block that landed did not survive a reboot, so it was not a real manual block")
+	}
+
+	// CONTROL: the other profile is online throughout, which rules out "the
+	// reboot blocked everyone" passing as success.
+	net.SetClientMAC(dadMAC)
+	if !net.Reaches() {
+		t.Error("a profile with no countdown was blocked too")
+	}
+
+	// And a parent can lift it, which is the only way it ends.
+	net.SetClientMAC(eliMAC)
+	if err := again.Unblock("eli"); err != nil {
+		t.Fatalf("Unblock: %v", err)
+	}
+	if !net.Reaches() {
+		t.Error("lifting the block that landed did not put the child back online")
+	}
+}

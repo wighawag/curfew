@@ -148,8 +148,31 @@ var homeTemplate = template.Must(template.New("home").Parse(`<!DOCTYPE html>
       </form>
     {{end}}
   </div>
+  {{if not .ManuallyBlocked}}
+  <div class="tickets">
+    <span class="muted">block in:</span>
+    {{range $.BlockIns}}
+    <form method="POST" action="/profiles/block-in">
+      <input type="hidden" name="name" value="{{$p.Name}}">
+      <input type="hidden" name="minutes" value="{{.Minutes}}">
+      <button type="submit">{{.Label}}</button>
+    </form>
+    {{end}}
+    <form method="POST" action="/profiles/block-in" class="custom">
+      <input type="hidden" name="name" value="{{$p.Name}}">
+      <input type="number" name="minutes" min="1"
+             placeholder="min" aria-label="minutes until {{$p.Name}} is blocked" required>
+      <button type="submit">then off</button>
+    </form>
+  </div>
+  {{end}}
   {{if .Timing}}<div class="sub">{{.Timing}}</div>{{end}}
   {{if .TicketLeft}}<div class="sub">ticket: {{.TicketLeft}} left; tapping again adds a fresh one</div>{{end}}
+  {{if .PendingBlock}}<div class="sub">blocks in {{.PendingBlock}}, and stays off until you lift it
+    <form method="POST" action="/profiles/block-in/cancel" style="display:inline">
+      <input type="hidden" name="name" value="{{.Name}}">
+      <button type="submit">call it off</button>
+    </form></div>{{end}}
 </div>
 {{else}}
 <p class="muted">No profiles yet. Create one in <a href="/settings">settings</a>.

@@ -277,6 +277,11 @@ func (c *Core) account() error {
 	if st.ForgetBudget(known) {
 		changed = true
 	}
+	// Same reason, for the same class of ghost: a countdown left behind by a
+	// deleted profile would fire against whoever reused the name.
+	if st.ForgetPending(known) {
+		changed = true
+	}
 
 	obs, elapsed, ok := c.sampler.Sample(now, c.accountant.Generation(), counters)
 	if ok {
@@ -321,6 +326,11 @@ func (c *Core) Reconcile() error {
 // across their whole read-decide-write-enforce sequence rather than releasing
 // it in the middle.
 func (c *Core) reconcile() error {
+	// Delayed blocks land HERE, before the desired state is computed, so that
+	// every path that reconciles applies them: the minute tick, and any button
+	// press in between. A deadline is therefore never waited for, only noticed,
+	// which is what makes a missed one impossible.
+	c.landDueBlocks()
 	d, err := c.Desired()
 	if err != nil {
 		return err
@@ -329,6 +339,158 @@ func (c *Core) reconcile() error {
 		return fmt.Errorf("applying ruleset: %w", err)
 	}
 	return nil
+}
+
+// landDueBlocks turns every delayed block whose moment has come into an
+// ordinary manual block.
+//
+// It reports nothing and fails softly on purpose. A state file that cannot be
+// written must NOT leave the firewall enforcing a decision nothing recorded,
+// because a reboot would then silently hand the child their evening back and
+// the page would have said they were blocked; so a failed save leaves the
+// countdown armed, to be retried on the next pass, and the rest of the
+// reconcile carries on enforcing bedtime and the budget. Loud in the log,
+// harmless in the firewall.
+func (c *Core) landDueBlocks() {
+	st, err := c.state.Load()
+	if err != nil {
+		c.log.Error("reading block state, so no delayed block could land this pass",
+			"error", err)
+		return
+	}
+	if len(st.PendingBlock) == 0 {
+		return
+	}
+	ps, err := c.schedule.Load()
+	if err != nil {
+		c.log.Error("reading the schedule, so no delayed block could land this pass",
+			"error", err)
+		return
+	}
+	known := map[string]bool{}
+	for _, p := range ps.Profiles {
+		known[p.Name] = true
+	}
+
+	// A countdown for a profile that no longer exists is DROPPED, on every
+	// pass rather than only on the pass that would have fired it. Waiting for
+	// the deadline would leave a stale countdown alive in the file, and a
+	// profile recreated under the same name before it fell due would inherit a
+	// stranger's bedtime.
+	var gone []string
+	for name := range st.PendingBlock {
+		if !known[name] {
+			gone = append(gone, name)
+		}
+	}
+	sort.Strings(gone)
+	for _, name := range gone {
+		st.CancelBlock(name)
+	}
+
+	due := st.DueBlocks(c.now().In(c.loc))
+	for _, name := range due {
+		st.Block(name) // Block also disarms the countdown it is landing.
+	}
+	if len(due) == 0 && len(gone) == 0 {
+		return
+	}
+	if err := c.state.Save(st); err != nil {
+		c.log.Error("a delayed block arrived but could NOT be recorded, so it was not "+
+			"applied; it will be retried", "profiles", due, "error", err)
+		return
+	}
+	if len(gone) > 0 {
+		c.log.Warn("a delayed block was armed for a profile that no longer exists, "+
+			"so it was dropped rather than applied", "profiles", gone)
+	}
+	if len(due) == 0 {
+		return
+	}
+	// Manual outranks a ticket (ADR 0006), so landing must cancel one exactly
+	// as Block does. Without this a child with twenty minutes of ticket left
+	// rides straight through the block a parent set for bedtime.
+	for _, name := range due {
+		p, ok := ps.Find(name)
+		if !ok || len(p.Devices) == 0 {
+			continue
+		}
+		if err := c.firewall.CancelTickets(p.Devices); err != nil {
+			c.log.Error("a delayed block landed but a live ticket could not be cancelled",
+				"profile", name, "error", err)
+		}
+	}
+	c.log.Info("delayed block landed", "profiles", due)
+}
+
+// BlockIn arms a block that lands after d, and changes nothing until then.
+//
+// It exists because "off you go, now" is not how a parent wants to end an
+// evening: the point of the delay is the warning, so the child is told rather
+// than cut off mid-sentence. What lands is an ORDINARY manual block, off until
+// a parent lifts it, so nothing here can expire on its own.
+//
+// Tapping again replaces the deadline: last tap wins.
+func (c *Core) BlockIn(name string, d time.Duration) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if d <= 0 {
+		return fmt.Errorf("a delayed block needs a delay, got %s; to block now, use block", d)
+	}
+	if _, err := c.profile(name); err != nil {
+		return err
+	}
+	st, err := c.state.Load()
+	if err != nil {
+		return fmt.Errorf("reading block state: %w", err)
+	}
+	// Refused rather than accepted quietly. A countdown armed behind a block
+	// that is already in force would fire later, against an unblock the parent
+	// makes in between, and nothing on the page would explain it.
+	if st.IsBlocked(name) {
+		return fmt.Errorf("%s is already blocked; unblock them first if you meant to "+
+			"give them %s more", name, d)
+	}
+	if st.ArmBlock(name, c.now().In(c.loc).Add(d)) {
+		if err := c.state.Save(st); err != nil {
+			return fmt.Errorf("saving block state: %w", err)
+		}
+	}
+	c.log.Info("delayed block armed", "profile", name, "in", d)
+	return nil
+}
+
+// CancelBlockIn disarms a delayed block, and touches nothing else.
+func (c *Core) CancelBlockIn(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, err := c.profile(name); err != nil {
+		return err
+	}
+	st, err := c.state.Load()
+	if err != nil {
+		return fmt.Errorf("reading block state: %w", err)
+	}
+	if st.CancelBlock(name) {
+		if err := c.state.Save(st); err != nil {
+			return fmt.Errorf("saving block state: %w", err)
+		}
+	}
+	c.log.Info("delayed block cancelled", "profile", name)
+	return nil
+}
+
+// PendingBlocks is when each armed delayed block lands, for the page.
+func (c *Core) PendingBlocks() (map[string]time.Time, error) {
+	st, err := c.state.Load()
+	if err != nil {
+		return nil, fmt.Errorf("reading block state: %w", err)
+	}
+	out := make(map[string]time.Time, len(st.PendingBlock))
+	for name, at := range st.PendingBlock {
+		out[name] = at
+	}
+	return out, nil
 }
 
 // profile finds a profile by name, or explains that it does not exist.

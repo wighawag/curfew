@@ -294,3 +294,146 @@ func TestEffectiveDayRefusesToAddressAnEarlierDay(t *testing.T) {
 		t.Errorf("with no stored day the clock decides, got %q", got)
 	}
 }
+
+// ---- delayed blocks ----
+
+// A delayed block is a DECISION with a deadline, so it belongs on disk for
+// exactly the reason a manual block does: a reboot must not cancel it. This is
+// the round trip that proves the deadline itself survives, not just its
+// existence.
+func TestADelayedBlockSurvivesARoundTripToDisk(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	due := time.Date(2026, 3, 4, 20, 30, 0, 0, time.UTC)
+	s := &State{}
+	if !s.ArmBlock("eli", due) {
+		t.Error("arming a delayed block must report a change")
+	}
+	if err := Save(path, s); err != nil {
+		t.Fatal(err)
+	}
+	back, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, armed := back.PendingBlockAt("eli")
+	if !armed {
+		t.Fatal("the delayed block did not survive the round trip, so a reboot cancels it")
+	}
+	if !got.Equal(due) {
+		t.Errorf("the deadline changed across the round trip: want %s, got %s", due, got)
+	}
+}
+
+// Last tap wins, which is what a parent means by tapping again.
+func TestArmingAgainReplacesTheDeadline(t *testing.T) {
+	first := time.Date(2026, 3, 4, 20, 30, 0, 0, time.UTC)
+	second := first.Add(-20 * time.Minute)
+	s := &State{}
+	s.ArmBlock("eli", first)
+	if !s.ArmBlock("eli", second) {
+		t.Error("re-arming to a different deadline must report a change")
+	}
+	if got, _ := s.PendingBlockAt("eli"); !got.Equal(second) {
+		t.Errorf("the second tap did not win: want %s, got %s", second, got)
+	}
+	if s.ArmBlock("eli", second) {
+		t.Error("re-arming to the SAME deadline must report no change, so nothing is rewritten")
+	}
+}
+
+// Due is a DERIVATION from the clock, so a daemon that was down across the
+// deadline still finds the block waiting for it rather than having missed it.
+func TestDueReportsEveryDeadlineThatHasPassedHoweverLongAgo(t *testing.T) {
+	now := time.Date(2026, 3, 4, 20, 30, 0, 0, time.UTC)
+	s := &State{}
+	s.ArmBlock("eli", now.Add(-3*time.Hour)) // the daemon was down all evening
+	s.ArmBlock("tia", now.Add(time.Minute))  // not yet
+	due := s.DueBlocks(now)
+	if len(due) != 1 || due[0] != "eli" {
+		t.Fatalf("a deadline that passed while the daemon was down was missed: %v", due)
+	}
+	// Exactly at the deadline counts, or a block can fall through the gap
+	// between two ticks.
+	if due := s.DueBlocks(now.Add(time.Minute)); len(due) != 2 {
+		t.Errorf("a deadline exactly reached is not due: %v", due)
+	}
+}
+
+func TestCancellingADelayedBlockLeavesEveryOtherProfileArmed(t *testing.T) {
+	at := time.Date(2026, 3, 4, 20, 30, 0, 0, time.UTC)
+	s := &State{}
+	s.ArmBlock("eli", at)
+	s.ArmBlock("tia", at)
+	if !s.CancelBlock("eli") {
+		t.Error("cancelling must report a change")
+	}
+	if _, armed := s.PendingBlockAt("eli"); armed {
+		t.Error("eli is still armed")
+	}
+	if _, armed := s.PendingBlockAt("tia"); !armed {
+		t.Error("cancelling eli disarmed tia")
+	}
+	if s.CancelBlock("nobody") {
+		t.Error("cancelling nothing must report no change")
+	}
+}
+
+// Blocking now makes a pending block meaningless, and leaving it armed would
+// fire it later against a profile a parent may have unblocked in between.
+func TestBlockingNowDisarmsAPendingBlock(t *testing.T) {
+	s := &State{}
+	s.ArmBlock("eli", time.Date(2026, 3, 4, 20, 30, 0, 0, time.UTC))
+	if !s.Block("eli") {
+		t.Fatal("blocking must report a change")
+	}
+	if _, armed := s.PendingBlockAt("eli"); armed {
+		t.Error("a pending block survived an immediate block, so it will fire again later")
+	}
+}
+
+// Unblock must NOT disarm a pending block. It removes exactly the one reason
+// it owns (ADR 0006), and a parent lifting an unrelated grounding at 19:00
+// must not silently cancel the countdown they set for 20:00.
+func TestUnblockLeavesAPendingBlockArmed(t *testing.T) {
+	s := &State{}
+	s.Block("eli")
+	s.ArmBlock("eli", time.Date(2026, 3, 4, 20, 30, 0, 0, time.UTC))
+	s.Unblock("eli")
+	if _, armed := s.PendingBlockAt("eli"); !armed {
+		t.Error("unblocking silently cancelled a delayed block")
+	}
+}
+
+func TestForgetPendingDropsProfilesThatNoLongerExist(t *testing.T) {
+	at := time.Date(2026, 3, 4, 20, 30, 0, 0, time.UTC)
+	s := &State{}
+	s.ArmBlock("eli", at)
+	s.ArmBlock("gone", at)
+	if !s.ForgetPending(map[string]bool{"eli": true}) {
+		t.Error("dropping a deleted profile must report a change")
+	}
+	if _, armed := s.PendingBlockAt("gone"); armed {
+		t.Error("a deleted profile's countdown can still fire under a reused name")
+	}
+	if _, armed := s.PendingBlockAt("eli"); !armed {
+		t.Error("a live profile was forgotten too")
+	}
+}
+
+// A state file written by an older curfew has no pending_block key at all.
+func TestAStateFileFromBeforeDelayedBlocksStillLoads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte(`{"manual_blocked":["eli"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.IsBlocked("eli") {
+		t.Error("upgrading lost a manual block")
+	}
+	if _, armed := s.PendingBlockAt("eli"); armed {
+		t.Error("a file with no pending_block key produced one")
+	}
+}

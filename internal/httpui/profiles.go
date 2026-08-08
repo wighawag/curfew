@@ -20,6 +20,13 @@ var ticketDurations = []time.Duration{
 	15 * time.Minute, 30 * time.Minute, time.Hour, 2 * time.Hour,
 }
 
+// blockInDelays are the taps for a block that lands LATER. The mirror image of
+// a ticket, and the reason it exists is the warning: "off in ten minutes" is
+// how an evening ends without a row, where the block button ends it mid-video.
+var blockInDelays = []time.Duration{
+	5 * time.Minute, 10 * time.Minute, 30 * time.Minute,
+}
+
 // ScheduleStore loads and saves profiles and their windows.
 type ScheduleStore interface {
 	Load() (*schedule.Profiles, error)
@@ -60,6 +67,11 @@ type ProfileView struct {
 	// when there is none. Nothing here tracks a parallel clock, which is why
 	// it cannot drift and why an expiring ticket needs no bookkeeping.
 	TicketLeft string
+	// PendingBlock is how long until a delayed block lands, empty when none is
+	// armed. Derived from the stored deadline against the clock on each
+	// render, for the same reason Timing is: a countdown computed once and
+	// stored would be wrong by the time anybody read it.
+	PendingBlock string
 	// NeedsDevices flags a profile with no devices. It is a warning rather
 	// than a neutral state because a schedule with nothing to apply it to
 	// enforces nothing while looking configured, which is the shape of every
@@ -129,6 +141,10 @@ func (s *Server) profileViews(now time.Time) ([]ProfileView, error) {
 	if err != nil {
 		return nil, err
 	}
+	pending, err := s.core.PendingBlocks()
+	if err != nil {
+		return nil, err
+	}
 	budgets, err := s.core.BudgetStatus()
 	if err != nil {
 		return nil, err
@@ -148,6 +164,16 @@ func (s *Server) profileViews(now time.Time) ([]ProfileView, error) {
 		left, hasTicket := fw.ticketLeft(p.Devices)
 		if hasTicket {
 			v.TicketLeft = humanDuration(left)
+		}
+		// Only while it is still ahead. Once the deadline has passed the block
+		// itself is the truth, and a card still counting down to something that
+		// has already happened would be the reassuring half-truth this page
+		// exists to remove.
+		if at, armed := pending[p.Name]; armed && at.After(now) {
+			// Rounded UP to the minute. A parent who taps "30" and reads "29m"
+			// on the page that renders a half second later has been told their
+			// tap did something other than what it said.
+			v.PendingBlock = humanDuration(at.Sub(now).Truncate(time.Minute) + time.Minute)
 		}
 		windowActive := p.BlockedAt(now)
 		overBudget := budgets[p.Name].Blocked
@@ -300,6 +326,7 @@ func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
 		Zone:             s.loc.String(),
 		Error:            r.URL.Query().Get("error"),
 		Tickets:          ticketChoices(),
+		BlockIns:         blockInChoices(),
 		MaxTicketMinutes: int(s.core.MaxTicket().Minutes()),
 	}
 	s.render(w, homeTemplate, data, "home")
@@ -373,6 +400,35 @@ func (s *Server) handleProfileUnblock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	redirectHome(w, r, s.core.Unblock(name))
+}
+
+// handleProfileBlockIn arms a block for later, so a child can be TOLD rather
+// than cut off mid-sentence.
+//
+// It is the one control here that changes nothing at the moment it is used,
+// which is exactly its point, so the card has to say what is now coming: see
+// ProfileView.PendingBlock.
+func (s *Server) handleProfileBlockIn(w http.ResponseWriter, r *http.Request) {
+	name, ok := s.postedProfile(w, r)
+	if !ok {
+		return
+	}
+	minutes, err := strconv.Atoi(strings.TrimSpace(r.FormValue("minutes")))
+	if err != nil || minutes <= 0 {
+		redirectHome(w, r, fmt.Errorf("a delayed block needs a delay in whole minutes, got %q",
+			r.FormValue("minutes")))
+		return
+	}
+	redirectHome(w, r, s.core.BlockIn(name, time.Duration(minutes)*time.Minute))
+}
+
+// handleProfileBlockInCancel calls off a block that has not landed yet.
+func (s *Server) handleProfileBlockInCancel(w http.ResponseWriter, r *http.Request) {
+	name, ok := s.postedProfile(w, r)
+	if !ok {
+		return
+	}
+	redirectHome(w, r, s.core.CancelBlockIn(name))
 }
 
 // handleProfileTicket grants a time-limited pass.
@@ -585,6 +641,8 @@ type homeData struct {
 	Zone     string
 	Error    string
 	Tickets  []ticketChoice
+	// BlockIns are the delays offered for a block that lands later.
+	BlockIns []ticketChoice
 	// MaxTicketMinutes bounds the custom-duration box, so the commonest way to
 	// get the error is prevented by the form rather than explained after the
 	// fact. The core enforces the same cap regardless; this is a courtesy, not
@@ -601,6 +659,17 @@ type homeData struct {
 type ticketChoice struct {
 	Minutes int
 	Label   string
+}
+
+// blockInChoices are the delays offered for a block that lands later. Kept
+// shorter than the ticket choices: the point of the delay is the warning, and
+// a parent who means "in three hours" means a schedule window instead.
+func blockInChoices() []ticketChoice {
+	out := make([]ticketChoice, 0, len(blockInDelays))
+	for _, d := range blockInDelays {
+		out = append(out, ticketChoice{Minutes: int(d.Minutes()), Label: humanDuration(d)})
+	}
+	return out
 }
 
 func ticketChoices() []ticketChoice {

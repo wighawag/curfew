@@ -116,6 +116,12 @@ func copyState(s *blockstate.State) *blockstate.State {
 			cp.Budget[k] = v
 		}
 	}
+	if s.PendingBlock != nil {
+		cp.PendingBlock = map[string]time.Time{}
+		for k, v := range s.PendingBlock {
+			cp.PendingBlock[k] = v
+		}
+	}
 	return cp
 }
 
@@ -501,5 +507,275 @@ func TestConcurrentBlocksDoNotLoseADecision(t *testing.T) {
 		if !st.st.IsBlocked(name) {
 			t.Errorf("a simultaneous block was lost: %q is not blocked, state is %+v", name, st.st)
 		}
+	}
+}
+
+// ---- delayed blocks ----
+
+// THE test for the feature: armed, nothing changes yet; deadline passes, every
+// device goes into the manual tier; and it stays there until a parent lifts it.
+func TestADelayedBlockLandsAtItsDeadlineAndStaysUntilLifted(t *testing.T) {
+	c, fw, st := household(t)
+	at(c, "19:00")
+	if err := c.BlockIn("eli", 30*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	// BASELINE: arming changes nothing about what the firewall is doing.
+	// Without this, a test that only checked the end state would pass against
+	// an implementation that blocked immediately.
+	if has(fw.last.Manual, eliPhone) {
+		t.Fatalf("arming a delayed block cut the child off at once: %+v", fw.last)
+	}
+	if err := c.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if has(fw.last.Manual, eliPhone) {
+		t.Fatalf("a tick before the deadline applied the block early: %+v", fw.last)
+	}
+
+	// The deadline arrives.
+	at(c, "19:30")
+	if err := c.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if !has(fw.last.Manual, eliPhone) || !has(fw.last.Manual, eliLaptop) {
+		t.Errorf("the delayed block did not land on every device: %+v", fw.last)
+	}
+	// It became the ordinary manual block, which is what makes it survive a
+	// reboot and outlast a ticket.
+	if !st.st.IsBlocked("eli") {
+		t.Error("the block that landed was not recorded as a manual block")
+	}
+	if _, armed := st.st.PendingBlockAt("eli"); armed {
+		t.Error("the countdown is still armed, so it will fire again after an unblock")
+	}
+	// CONTROL: the other profile is untouched.
+	if has(fw.last.Manual, dadPhone) {
+		t.Errorf("a delayed block for eli blocked dad too: %+v", fw.last)
+	}
+
+	// It is off until LIFTED, not until the next tick.
+	at(c, "20:30")
+	if err := c.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if !has(fw.last.Manual, eliPhone) {
+		t.Errorf("the block lifted itself: %+v", fw.last)
+	}
+	if err := c.Unblock("eli"); err != nil {
+		t.Fatal(err)
+	}
+	if has(fw.last.Manual, eliPhone) {
+		t.Errorf("unblocking did not lift it: %+v", fw.last)
+	}
+}
+
+// A deadline that passed while the daemon was down must still land. This is
+// the difference between deriving the block from the clock and firing it from
+// a timer, and a timer is what an OpenWrt router with no RTC punishes.
+func TestADeadlineThatPassedWhileTheDaemonWasDownStillLands(t *testing.T) {
+	c, fw, _ := household(t)
+	at(c, "19:00")
+	if err := c.BlockIn("eli", 30*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	// Three hours later, the daemon's first pass since.
+	at(c, "22:15")
+	if err := c.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if !has(fw.last.Manual, eliPhone) {
+		t.Errorf("a deadline missed by an outage was lost: %+v", fw.last)
+	}
+}
+
+// A router with no RTC boots at the epoch. The block must land LATE rather
+// than never, and it must not land EARLY on every profile at once.
+func TestAClockThatBootsAtTheEpochDelaysTheBlockRatherThanLosingIt(t *testing.T) {
+	c, fw, _ := household(t)
+	at(c, "19:00")
+	if err := c.BlockIn("eli", 30*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	c.now = func() time.Time { return time.Unix(0, 0).UTC() }
+	if err := c.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if has(fw.last.Manual, eliPhone) {
+		t.Errorf("a router that booted at the epoch fired the block anyway: %+v", fw.last)
+	}
+	// And once the clock is right, it lands.
+	at(c, "19:30")
+	if err := c.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if !has(fw.last.Manual, eliPhone) {
+		t.Errorf("the block never landed after the clock was corrected: %+v", fw.last)
+	}
+}
+
+// Manual outranks a ticket (ADR 0006), so a delayed block that lands must
+// cancel one, exactly as an immediate block does. Otherwise a child with
+// twenty minutes of ticket left rides straight through their bedtime.
+func TestADelayedBlockThatLandsCancelsALiveTicket(t *testing.T) {
+	c, fw, _ := household(t)
+	at(c, "19:00")
+	if err := c.GrantTicket("eli", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.BlockIn("eli", 30*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if fw.cancels != 0 {
+		t.Fatalf("baseline: arming must not cancel the ticket it is not yet overriding")
+	}
+	at(c, "19:30")
+	if err := c.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if fw.cancels == 0 {
+		t.Error("the delayed block landed on top of a live ticket without cancelling it")
+	}
+}
+
+// Last tap wins, which is the rule the page promises.
+func TestArmingAgainReplacesTheEarlierDeadline(t *testing.T) {
+	c, fw, _ := household(t)
+	at(c, "19:00")
+	if err := c.BlockIn("eli", 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.BlockIn("eli", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	at(c, "19:15")
+	if err := c.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if has(fw.last.Manual, eliPhone) {
+		t.Errorf("the replaced ten-minute deadline fired anyway: %+v", fw.last)
+	}
+	at(c, "20:00")
+	if err := c.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if !has(fw.last.Manual, eliPhone) {
+		t.Errorf("the deadline that replaced it never fired: %+v", fw.last)
+	}
+}
+
+func TestCancellingADelayedBlockStopsItLanding(t *testing.T) {
+	c, fw, _ := household(t)
+	at(c, "19:00")
+	if err := c.BlockIn("eli", 30*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CancelBlockIn("eli"); err != nil {
+		t.Fatal(err)
+	}
+	at(c, "19:30")
+	if err := c.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if has(fw.last.Manual, eliPhone) {
+		t.Errorf("a cancelled countdown fired anyway: %+v", fw.last)
+	}
+}
+
+func TestADelayedBlockIsRefusedWhereItWouldDoNothing(t *testing.T) {
+	c, _, _ := household(t)
+	at(c, "19:00")
+	if err := c.BlockIn("nobody", 30*time.Minute); err == nil {
+		t.Error("arming a block for a profile that does not exist must fail loudly")
+	}
+	if err := c.BlockIn("eli", 0); err == nil {
+		t.Error("a delay of zero is not a delayed block; it must be refused")
+	}
+	if err := c.BlockIn("eli", -time.Minute); err == nil {
+		t.Error("a negative delay must be refused")
+	}
+	if err := c.BlockIn("dad", 30*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Block("dad"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.BlockIn("dad", 30*time.Minute); err == nil {
+		t.Error("arming a countdown for a profile that is ALREADY blocked must be refused, " +
+			"or it would fire against an unblock the parent makes in between")
+	}
+}
+
+// A state write that fails must not leave the firewall enforcing a block
+// nothing recorded, and must not take the rest of enforcement down with it.
+func TestAPendingBlockThatCannotBePersistedIsNotEnforcedAndDoesNotStopTheRest(t *testing.T) {
+	c, fw, st := household(t)
+	at(c, "19:00")
+	if err := c.BlockIn("eli", 30*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	st.saveErr = errors.New("read-only filesystem")
+	at(c, "23:30") // inside eli's bedtime window, so there IS other work to do
+	if err := c.Tick(); err != nil {
+		t.Fatalf("a state write failure must not fail the whole pass: %v", err)
+	}
+	if has(fw.last.Manual, eliPhone) {
+		t.Error("a block was enforced that could not be recorded, so a reboot would lose it")
+	}
+	if !has(fw.last.Blocked, eliPhone) {
+		t.Errorf("the bedtime window stopped being enforced because of it: %+v", fw.last)
+	}
+}
+
+func TestPendingBlocksAreReportedForThePage(t *testing.T) {
+	c, _, _ := household(t)
+	at(c, "19:00")
+	if err := c.BlockIn("eli", 30*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := c.PendingBlocks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, 3, 4, 19, 30, 0, 0, time.UTC)
+	if got, armed := pending["eli"]; !armed || !got.Equal(want) {
+		t.Errorf("the page cannot see the countdown: %v", pending)
+	}
+	if _, armed := pending["dad"]; armed {
+		t.Error("a profile with no countdown was reported as having one")
+	}
+}
+
+// A deleted profile's countdown must not fire against whoever reuses the name.
+func TestADeletedProfilesCountdownIsForgotten(t *testing.T) {
+	reg := memRegistry{reg: &registry.Registry{Devices: []registry.Device{
+		{MAC: eliPhone, Name: "eli phone"},
+	}}}
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{
+		{Name: "eli", Devices: []string{eliPhone}},
+	}}
+	st := &memState{}
+	fw := &fakeFirewall{}
+	c := New(reg, memSchedule{ps: ps}, st, fw, time.UTC, nil)
+	at(c, "19:00")
+	if err := c.BlockIn("eli", 30*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	// The profile is deleted, and later somebody creates one with the same
+	// name for a different child.
+	ps.Profiles = nil
+	at(c, "19:10")
+	if err := c.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	ps.Profiles = []schedule.Profile{{Name: "eli", Devices: []string{eliPhone}}}
+	at(c, "19:30")
+	if err := c.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if has(fw.last.Manual, eliPhone) {
+		t.Errorf("a deleted profile's countdown fired against its replacement: %+v", fw.last)
 	}
 }

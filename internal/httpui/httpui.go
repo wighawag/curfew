@@ -58,6 +58,14 @@ type Core interface {
 	Block(profile string) error
 	// Unblock lifts that decision, and nothing else.
 	Unblock(profile string) error
+	// BlockIn arms a block that lands after d and changes nothing until then.
+	// What lands is an ordinary manual block, off until a parent lifts it.
+	BlockIn(profile string, d time.Duration) error
+	// CancelBlockIn disarms one, and touches nothing else.
+	CancelBlockIn(profile string) error
+	// PendingBlocks is when each armed delayed block lands, so the card can
+	// count down to it from the clock rather than from a stored countdown.
+	PendingBlocks() (map[string]time.Time, error)
 	// GrantTicket gives a profile access for d.
 	GrantTicket(profile string, d time.Duration) error
 	// ManuallyBlocked reports the parent's INTENT, against which what the
@@ -202,6 +210,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/settings/allowed", s.handleAllowedDomains)
 	mux.HandleFunc("/profiles/block", s.handleProfileBlock)
 	mux.HandleFunc("/profiles/unblock", s.handleProfileUnblock)
+	mux.HandleFunc("/profiles/block-in", s.handleProfileBlockIn)
+	mux.HandleFunc("/profiles/block-in/cancel", s.handleProfileBlockInCancel)
 	mux.HandleFunc("/profiles/ticket", s.handleProfileTicket)
 	mux.HandleFunc("/devices", s.handleAddDevice)
 	mux.HandleFunc("/devices/rename", s.handleRenameDevice)

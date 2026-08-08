@@ -29,6 +29,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/wighawag/curfew/internal/budget"
 )
@@ -49,6 +50,7 @@ const DefaultPath = "/etc/config/curfew/state.json"
 // The members, and why each one cannot be derived:
 //
 //  1. ManualBlocked — a DECISION, with nothing to recompute it from.
+//     1a. PendingBlock — a DECISION not yet in force, likewise underivable.
 //  2. BudgetDay — which budget day the counters below belong to. Without it a
 //     reboot looks like a new day and hands back a spent allowance.
 //  3. Budget[profile].Usage — how much of today has been used.
@@ -77,6 +79,21 @@ type State struct {
 	// whole profile and must keep applying to a device added to that profile
 	// afterwards.
 	ManualBlocked []string `json:"manual_blocked"`
+
+	// PendingBlock names the profiles a parent has armed a DELAYED block for,
+	// against the moment it takes effect. "Off in thirty minutes", tapped so a
+	// child can be told rather than cut off mid-sentence.
+	//
+	// It is on disk for exactly the reason ManualBlocked is: nothing can
+	// recompute a decision, so a reboot in the half hour before bedtime would
+	// otherwise quietly cancel it, which is the reboot-grants-internet failure
+	// this file exists to prevent, arriving through a new door.
+	//
+	// The deadline is ABSOLUTE, and that is the safe choice on a router with no
+	// RTC. A box that boots into 1970 sees every deadline as still ahead of it,
+	// so the block lands LATE rather than never; a duration counted from boot
+	// would land never. See DueBlocks.
+	PendingBlock map[string]time.Time `json:"pending_block,omitempty"`
 
 	// BudgetDay is the budget day the counters below belong to, as
 	// budget.DayFormat. It is GLOBAL because the reset time is global (ADR
@@ -198,13 +215,89 @@ func (s *State) IsBlocked(profile string) bool {
 // changed. Blocking a profile that is already blocked is a no-op rather than
 // an error: the parent's intent is already recorded, and re-tapping a button
 // should not fail.
+//
+// It also DISARMS any delayed block for that profile. A countdown left running
+// behind an immediate block would fire later, against a profile the parent may
+// have unblocked in between, and nothing on the page would explain why.
 func (s *State) Block(profile string) bool {
+	changed := s.CancelBlock(profile)
 	if s.IsBlocked(profile) {
-		return false
+		return changed
 	}
 	s.ManualBlocked = append(s.ManualBlocked, profile)
 	sort.Strings(s.ManualBlocked)
 	return true
+}
+
+// ArmBlock records that this profile goes off at at, reporting whether
+// anything changed.
+//
+// Last tap wins. A parent who said thirty minutes and then says ten means ten,
+// and a rule that kept the earliest or the latest would need explaining on the
+// page; this one does not.
+func (s *State) ArmBlock(profile string, at time.Time) bool {
+	if cur, armed := s.PendingBlockAt(profile); armed && cur.Equal(at) {
+		return false
+	}
+	if s.PendingBlock == nil {
+		s.PendingBlock = map[string]time.Time{}
+	}
+	s.PendingBlock[profile] = at
+	return true
+}
+
+// PendingBlockAt reports when this profile's delayed block lands, if one is
+// armed.
+func (s *State) PendingBlockAt(profile string) (time.Time, bool) {
+	at, ok := s.PendingBlock[profile]
+	return at, ok
+}
+
+// CancelBlock disarms a delayed block, reporting whether anything changed.
+func (s *State) CancelBlock(profile string) bool {
+	if _, armed := s.PendingBlock[profile]; !armed {
+		return false
+	}
+	delete(s.PendingBlock, profile)
+	if len(s.PendingBlock) == 0 {
+		s.PendingBlock = nil
+	}
+	return true
+}
+
+// DueBlocks names every profile whose delayed block has arrived, sorted.
+//
+// It is a DERIVATION from the clock and holds no notion of having observed the
+// moment, which is what makes a missed deadline impossible: a daemon that was
+// down for three hours finds the block still waiting on its next pass, exactly
+// as a schedule window is recomputed rather than remembered. A deadline
+// exactly reached counts, or a block could fall through the gap between two
+// ticks.
+func (s *State) DueBlocks(now time.Time) []string {
+	var due []string
+	for profile, at := range s.PendingBlock {
+		if !now.Before(at) {
+			due = append(due, profile)
+		}
+	}
+	sort.Strings(due)
+	return due
+}
+
+// ForgetPending drops delayed blocks for profiles that no longer exist, so a
+// deleted profile's countdown cannot fire under a reused name.
+func (s *State) ForgetPending(known map[string]bool) bool {
+	changed := false
+	for name := range s.PendingBlock {
+		if !known[name] {
+			delete(s.PendingBlock, name)
+			changed = true
+		}
+	}
+	if len(s.PendingBlock) == 0 {
+		s.PendingBlock = nil
+	}
+	return changed
 }
 
 // Unblock removes the manual reason for a profile, reporting whether anything
