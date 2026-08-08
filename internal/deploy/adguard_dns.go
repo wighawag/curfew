@@ -82,23 +82,71 @@ func portFiftyThreeHolder(r Runner) (string, error) {
 	return last, nil
 }
 
-// moveDnsmasqTo54 frees port 53 for AdGuard and points DHCP at the router for
-// DNS, which is the arrangement ADR 0002 describes. dnsmasq keeps DHCP.
-func moveDnsmasqTo54(r Runner, routerIP string) error {
-	for _, cmd := range []string{
-		"uci set dhcp.@dnsmasq[0].port=54",
-		// Deleting an option that is not set exits non-zero, which is not a
-		// failure and must not abort the move half-done.
-		"uci -q delete dhcp.lan.dhcp_option || true",
-		fmt.Sprintf("uci add_list dhcp.lan.dhcp_option='6,%s'", routerIP),
-		"uci commit dhcp",
-		"/etc/init.d/dnsmasq restart",
-	} {
-		if _, err := r.Run(cmd); err != nil {
-			return fmt.Errorf("moving dnsmasq to port 54 (%s): %w", cmd, err)
+// dhcpOptions reads the LAN's DHCP options as a list.
+func dhcpOptions(r Runner) ([]string, error) {
+	out, err := r.Run("uci -q get dhcp.lan.dhcp_option 2>/dev/null || true")
+	if err != nil {
+		return nil, err
+	}
+	return strings.Fields(strings.TrimSpace(out)), nil
+}
+
+// withDNSOption replaces the DNS option (number 6) and KEEPS every other one.
+//
+// This exists because deleting the whole list was destroying configuration
+// that has nothing to do with DNS. `uci delete dhcp.lan.dhcp_option` removes
+// ALL options, so a household with an NTP server (option 42), a domain
+// (option 15) or anything else lost it silently the moment curfew took port
+// 53. The legacy script did the same, which is not a defence.
+func withDNSOption(existing []string, routerIP string) []string {
+	out := make([]string, 0, len(existing)+1)
+	for _, opt := range existing {
+		if strings.HasPrefix(opt, "6,") {
+			continue
+		}
+		out = append(out, opt)
+	}
+	if routerIP != "" {
+		out = append(out, "6,"+routerIP)
+	}
+	return out
+}
+
+// setDHCPOptions writes the option list back, replacing whatever is there.
+func setDHCPOptions(r Runner, options []string) error {
+	if _, err := r.Run("uci -q delete dhcp.lan.dhcp_option || true"); err != nil {
+		return err
+	}
+	for _, opt := range options {
+		if _, err := r.Run(fmt.Sprintf("uci add_list dhcp.lan.dhcp_option='%s'", opt)); err != nil {
+			return fmt.Errorf("setting DHCP option %q: %w", opt, err)
 		}
 	}
 	return nil
+}
+
+// moveDnsmasqTo54 frees port 53 for AdGuard and points DHCP at the router for
+// DNS, which is the arrangement ADR 0002 describes. dnsmasq keeps DHCP.
+//
+// It returns the DHCP options as they were, so a rollback can put them back
+// exactly rather than approximately.
+func moveDnsmasqTo54(r Runner, routerIP string) ([]string, error) {
+	before, err := dhcpOptions(r)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := r.Run("uci set dhcp.@dnsmasq[0].port=54"); err != nil {
+		return before, fmt.Errorf("moving dnsmasq to port 54: %w", err)
+	}
+	if err := setDHCPOptions(r, withDNSOption(before, routerIP)); err != nil {
+		return before, err
+	}
+	for _, cmd := range []string{"uci commit dhcp", "/etc/init.d/dnsmasq restart"} {
+		if _, err := r.Run(cmd); err != nil {
+			return before, fmt.Errorf("moving dnsmasq to port 54 (%s): %w", cmd, err)
+		}
+	}
+	return before, nil
 }
 
 // restoreDnsmasqTo53 is the ROLLBACK, and it is why taking port 53 is safe to
@@ -107,14 +155,16 @@ func moveDnsmasqTo54(r Runner, routerIP string) error {
 // If AdGuard cannot serve DNS after dnsmasq has stepped aside, the household
 // has no resolver at all, which is a real outage rather than a degraded
 // feature. So every failure path after the move calls this, and the house ends
-// up where it started: dnsmasq answering, nothing filtered.
-func restoreDnsmasqTo53(r Runner) error {
-	for _, cmd := range []string{
-		"uci set dhcp.@dnsmasq[0].port=53",
-		"uci -q delete dhcp.lan.dhcp_option || true",
-		"uci commit dhcp",
-		"/etc/init.d/dnsmasq restart",
-	} {
+// up where it started: dnsmasq answering, nothing filtered, and its DHCP
+// options exactly as they were.
+func restoreDnsmasqTo53(r Runner, options []string) error {
+	if _, err := r.Run("uci set dhcp.@dnsmasq[0].port=53"); err != nil {
+		return fmt.Errorf("restoring dnsmasq to port 53: %w", err)
+	}
+	if err := setDHCPOptions(r, options); err != nil {
+		return err
+	}
+	for _, cmd := range []string{"uci commit dhcp", "/etc/init.d/dnsmasq restart"} {
 		if _, err := r.Run(cmd); err != nil {
 			return fmt.Errorf("restoring dnsmasq to port 53 (%s): %w", cmd, err)
 		}
@@ -288,8 +338,10 @@ func takeOverDNS(r Runner, opt AdGuardOptions, report *AdGuardReport, forceResta
 	}
 	if inTheWay {
 		report.MovedDnsmasq = true
-		if err := moveDnsmasqTo54(r, opt.RouterIP); err != nil {
-			return err
+		before, err := moveDnsmasqTo54(r, opt.RouterIP)
+		report.dhcpOptionsBefore = before
+		if err != nil {
+			return rollback(r, report, err)
 		}
 	}
 
@@ -316,7 +368,7 @@ func rollback(r Runner, report *AdGuardReport, cause error) error {
 	if !report.MovedDnsmasq {
 		return cause
 	}
-	if err := restoreDnsmasqTo53(r); err != nil {
+	if err := restoreDnsmasqTo53(r, report.dhcpOptionsBefore); err != nil {
 		return fmt.Errorf("%w.\n       WORSE: rolling dnsmasq back to port 53 also failed: %v.\n"+
 			"       The household may have NO working DNS. Fix by hand: "+
 			"uci set dhcp.@dnsmasq[0].port=53; uci commit dhcp; /etc/init.d/dnsmasq restart",

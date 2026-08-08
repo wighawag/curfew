@@ -356,3 +356,59 @@ func TestAdoptionFreesPortFiftyThreeBeforeVerifyingAnything(t *testing.T) {
 		t.Errorf("adoption failed without restoring DNS for the household:\n%v", r.ran)
 	}
 }
+
+// Taking port 53 must not destroy DHCP configuration that has nothing to do
+// with DNS.
+//
+// `uci delete dhcp.lan.dhcp_option` removes ALL options, so an earlier version
+// of this code silently discarded a household's NTP server, domain and any
+// other option the moment AdGuard took over. The legacy shell script did the
+// same, which is why it went unnoticed.
+func TestTakingPortFiftyThreeKeepsUnrelatedDHCPOptions(t *testing.T) {
+	got := withDNSOption([]string{"42,192.168.1.1", "15,lan", "6,10.0.0.1"}, "192.168.1.1")
+	want := []string{"42,192.168.1.1", "15,lan", "6,192.168.1.1"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("got %v, want %v", got, want)
+			break
+		}
+	}
+	// An empty list gains only the DNS option.
+	if only := withDNSOption(nil, "192.168.1.1"); len(only) != 1 || only[0] != "6,192.168.1.1" {
+		t.Errorf("got %v, want just the DNS option", only)
+	}
+	// Several stale DNS options are all replaced by the one.
+	multi := withDNSOption([]string{"6,1.1.1.1", "6,8.8.8.8", "3,192.168.1.1"}, "192.168.1.1")
+	if len(multi) != 2 || multi[0] != "3,192.168.1.1" || multi[1] != "6,192.168.1.1" {
+		t.Errorf("got %v, want the gateway option kept and one DNS option", multi)
+	}
+}
+
+// And the rollback must put the options back EXACTLY, including the DNS one
+// that was there before, rather than leaving curfew's behind.
+func TestRollbackRestoresTheOriginalDHCPOptions(t *testing.T) {
+	r := &scriptedRunner{answers: map[string]string{
+		"pgrep AdGuardHome":               "no\n",
+		"uci get dhcp.@dnsmasq[0].port":   "53\n",
+		"uci -q get dhcp.lan.dhcp_option": "42,192.168.1.1 6,10.0.0.1\n",
+		"netstat":                         "tcp 0 0 192.168.1.1:53 0.0.0.0:* LISTEN 3872/dnsmasq\n",
+	}}
+	var report AdGuardReport
+	if err := takeOverDNS(r, AdGuardOptions{RouterIP: "192.168.1.1",
+		DNSTimeout: 50 * time.Millisecond}, &report, false); err == nil {
+		t.Fatal("the double never lets AdGuard take the port, so this must fail")
+	}
+	if !report.RolledBack {
+		t.Fatal("want a rollback")
+	}
+	// Both original options must be re-added, and curfew's must not survive.
+	if !r.didRun("uci add_list dhcp.lan.dhcp_option='42,192.168.1.1'") {
+		t.Errorf("the unrelated DHCP option was not restored:\n%v", r.ran)
+	}
+	if !r.didRun("uci add_list dhcp.lan.dhcp_option='6,10.0.0.1'") {
+		t.Errorf("the household's original DNS option was not restored:\n%v", r.ran)
+	}
+}

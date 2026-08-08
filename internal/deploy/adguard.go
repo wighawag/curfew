@@ -85,6 +85,10 @@ type AdGuardReport struct {
 	// started. A crash-looped AdGuard that procd has given up on presents
 	// exactly like a stopped one, and both must be recoverable.
 	StartedAdGuard bool
+	// dhcpOptionsBefore is the LAN's DHCP option list as it was before the
+	// move, kept so a rollback restores it exactly. Unexported: it is
+	// bookkeeping for the rollback, not something to report.
+	dhcpOptionsBefore []string
 }
 
 // Summary renders the report for a terminal.
