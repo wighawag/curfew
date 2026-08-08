@@ -538,23 +538,19 @@ func TestDoHEndpointsAreUnresolvableForARestrictedChild(t *testing.T) {
 	mustBlock(t, "DoH stays blocked after the window", v6EliA, v6Server, "cloudflare-dns.com")
 }
 
-// AdGuard REFUSES a filter list that contains no rules.
+// A household with NO restrictions must not get a filter list at all.
 //
-// Found on the live router, not here: with no profile carrying a restriction,
-// curfew served a list of nothing but comments, and every single pass logged
-// `add_url ... HTTP 400: Filter with URL "..." is invalid (maybe it points to
-// blank page?)`. It retried once a minute, for ever, and the DNS half of the
-// system never started at all.
-//
-// The unit tests missed it because they drive a fake API, which cannot have an
-// opinion about the body. Only a real AdGuard rejects this, which is precisely
-// the argument for these tests existing.
-func TestAnEmptyFilterListIsStillAcceptedByAdGuard(t *testing.T) {
+// Two live faults sit behind this. AdGuard REFUSES a list containing no rules
+// ("invalid (maybe it points to blank page?)"), so curfew logged a failure
+// every minute for hours and the DNS half never started. And registering a
+// list at all forces AdGuard to rebuild its whole filtering engine, which on
+// the real router took it from 555 MB to 883 MB on a 1010 MB box with no swap
+// and got it OOM-killed, taking the household's DNS with it. A list that says
+// nothing is not worth either.
+func TestAHouseholdWithNoRestrictionsGetsNoFilterListAtAll(t *testing.T) {
 	requireAdGuard(t)
 	startAdGuard(t)
 
-	// A household with NO restrictions at all: the state the live router was
-	// in, and the state every household is in before it configures anything.
 	m, _ := newManagerUnderTest(t)
 	m.schedule = memSchedule{&schedule.Profiles{Profiles: []schedule.Profile{
 		{Name: "eli", Devices: []string{macEliPhone}},
@@ -562,12 +558,31 @@ func TestAnEmptyFilterListIsStillAcceptedByAdGuard(t *testing.T) {
 	m.now = func() time.Time { return atClock("09:00") }
 
 	if err := m.Tick(); err != nil {
-		t.Fatalf("a household with no restrictions must still reconcile cleanly: %v", err)
+		t.Fatalf("a household with no restrictions must reconcile cleanly: %v", err)
+	}
+	if err := m.Tick(); err != nil {
+		t.Fatalf("the second pass failed: %v", err)
 	}
 
-	// And AdGuard must actually hold the list, not merely have not errored.
 	api := adguard.NewClient(aghAPI, "parent", aghPwd)
 	filters, err := api.Filters()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range filters {
+		if strings.HasSuffix(f.URL, FilterListPath) {
+			t.Errorf("curfew registered a filter list with nothing in it, "+
+				"forcing a filter-engine rebuild for no reason: %+v", f)
+		}
+	}
+
+	// THE CONTROL: give the household a restriction and the list IS
+	// registered, so this is not passing because registration is broken.
+	m.schedule = memSchedule{eliAndTia()}
+	if err := m.Tick(); err != nil {
+		t.Fatalf("Tick with a restriction: %v", err)
+	}
+	filters, err = api.Filters()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -578,13 +593,7 @@ func TestAnEmptyFilterListIsStillAcceptedByAdGuard(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("curfew's filter list was never registered: %+v", filters)
-	}
-
-	// A second pass must also be clean, since the live symptom was an error
-	// EVERY minute rather than once.
-	if err := m.Tick(); err != nil {
-		t.Errorf("the second pass failed: %v", err)
+		t.Errorf("a household that DOES have restrictions never got its list: %+v", filters)
 	}
 }
 

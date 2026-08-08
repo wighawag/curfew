@@ -438,3 +438,40 @@ func (f *fakeAPI) Services() ([]string, error) {
 	f.calls = append(f.calls, "services")
 	return []string{"youtube", "netflix", "tiktok"}, nil
 }
+
+// Registration is gated on having something to say, because registering a list
+// forces AdGuard to rebuild its whole filtering engine, which OOM-killed it on
+// the real router.
+func TestNoFilterListIsRegisteredWhenThereIsNothingToPublish(t *testing.T) {
+	ps := &schedule.Profiles{Profiles: []schedule.Profile{
+		{Name: "ronan", Devices: []string{"14:e0:1d:6a:9c:6c"}},
+	}}
+	d := Compute(ps, eliPinned, eliAddrs, at("09:00"))
+	if d.HasRules {
+		t.Fatalf("baseline: this household has nothing to publish, got %q", d.FilterList)
+	}
+	api := &fakeAPI{}
+	report, err := Reconcile(api, d, "http://192.168.1.1:8080/curfew.txt", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.ListRegistered {
+		t.Error("a list with no rules was registered anyway")
+	}
+	for _, c := range api.calls {
+		if strings.HasPrefix(c, "add_url") {
+			t.Errorf("add_url was called with nothing to publish: %v", api.calls)
+		}
+	}
+
+	// The control: a household that HAS a restriction does get one.
+	d = Compute(eliProfiles(), eliPinned, eliAddrs, at("09:00"))
+	if !d.HasRules {
+		t.Fatal("a restricted household must have rules to publish")
+	}
+	api = &fakeAPI{}
+	report, _ = Reconcile(api, d, "http://192.168.1.1:8080/curfew.txt", false)
+	if !report.ListRegistered {
+		t.Errorf("a household with restrictions never got its list: %v", api.calls)
+	}
+}

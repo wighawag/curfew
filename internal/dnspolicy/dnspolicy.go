@@ -45,6 +45,18 @@ type Desired struct {
 	Clients map[string]adguard.ClientObject
 	// FilterList is the text curfew-daemon should be serving right now.
 	FilterList string
+	// HasRules is true when the list carries at least one REAL rule, as
+	// opposed to only its header and the inert anchor.
+	//
+	// It gates REGISTRATION, and that is a memory decision rather than a
+	// tidiness one. AdGuard rebuilds its whole filtering engine whenever its
+	// rule set changes, holding the old and new engines at once: measured, a
+	// 22 MB list makes a rebuild spike about 180 MB. On the live router
+	// AdGuard settles at 555 MB of 1010 MB with 107 MB of blocklists and no
+	// swap, so one rebuild took it to 883 MB and the kernel killed it, leaving
+	// the household with no DNS until procd respawned it. Registering a list
+	// that says nothing costs exactly that rebuild for exactly no benefit.
+	HasRules bool
 	// Unresolved names profiles that have restrictions but no device address
 	// to attach them to, so the restriction cannot apply. This is the
 	// fail-open case and it must be REPORTED rather than left silent.
@@ -157,6 +169,7 @@ func Compute(ps *schedule.Profiles, pinned map[string]string,
 	}
 
 	sort.Strings(rules)
+	d.HasRules = len(rules) > 0
 	d.FilterList = renderList(rules)
 	sort.Strings(d.Unresolved)
 	sort.Strings(d.PartiallyResolved)
@@ -327,6 +340,12 @@ func Reconcile(api API, d Desired, listURL string, listChanged bool) (Report, er
 		}
 	}
 	if !registered {
+		if !d.HasRules {
+			// Nothing to publish, so nothing is registered. Every household
+			// starts here, and one that never uses a custom domain list stays
+			// here for ever, paying nothing.
+			return report, nil
+		}
 		if err := api.AddFilterURL(adguard.FilterListName, listURL); err != nil {
 			return report, err
 		}
