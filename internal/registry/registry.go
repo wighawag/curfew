@@ -52,6 +52,35 @@ func NormaliseMAC(s string) (string, error) {
 	return hw.String(), nil
 }
 
+// LocallyAdministered reports whether a MAC was made up by the device rather
+// than assigned from a vendor OUI.
+//
+// It is EVIDENCE, not proof, and the difference matters wherever this is
+// shown. A phone using a private Wi-Fi address sets this bit, so on a
+// household LAN it almost always means "randomised"; but a hand-set address,
+// a virtual machine's bridge and a container all set it too. So it is worth
+// saying out loud next to a device an admin is about to enrol, and it is not
+// worth deciding anything by.
+//
+// Why it is worth saying at all: per
+// work/notes/findings/wifi-mac-randomisation-is-per-network-and-persistent.md
+// a randomised address is stable per network until its owner erases the
+// device, resets its network settings or forgets the network. So an enrolment
+// against one of these addresses works for months and then, one day, does
+// not. An admin who was told at enrolment time is looking at a device that
+// needs approving again; one who was not is looking at a stranger.
+//
+// An unparseable address is reported false: nothing is known about it, and
+// claiming a property of an address that does not exist would be worse than
+// saying nothing.
+func LocallyAdministered(mac string) bool {
+	hw, err := net.ParseMAC(strings.TrimSpace(mac))
+	if err != nil || len(hw) == 0 {
+		return false
+	}
+	return hw[0]&0x02 != 0
+}
+
 // Add registers a device. The MAC is canonicalised first. Adding a MAC that is
 // already registered updates its name rather than creating a duplicate, so the
 // operation is idempotent and the file can never hold the same MAC twice.

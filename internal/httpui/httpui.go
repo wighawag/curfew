@@ -17,10 +17,12 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sort"
 	"time"
 
 	"github.com/wighawag/curfew/internal/budget"
+	"github.com/wighawag/curfew/internal/lanhosts"
 	"github.com/wighawag/curfew/internal/registry"
 )
 
@@ -98,6 +100,10 @@ type Server struct {
 	filterList func() string
 	// filterPath is the single unauthenticated route, empty when unused.
 	filterPath string
+	// sightings reads what the router has seen on the LAN, or is nil when
+	// nothing wired it up. See internal/httpui/pending.go for why absent and
+	// empty are rendered differently.
+	sightings func() (map[string]lanhosts.Sighting, error)
 	// services reads AdGuard's built-in service catalogue, or is nil when the
 	// AdGuard integration is not configured. Asked of the RUNNING AdGuard
 	// rather than compiled in, so the page offers what this household's
@@ -342,7 +348,14 @@ func (s *Server) handleDevicesPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	data := pageData{Devices: devices, Error: r.URL.Query().Get("error")}
+	data := pageData{
+		Devices:     devices,
+		Error:       r.URL.Query().Get("error"),
+		Pending:     s.pendingDevices(),
+		ShowPending: s.sightings != nil,
+		Profiles:    s.profileChoices(),
+		NoProfile:   noProfileChoice,
+	}
 	s.render(w, indexTemplate, data, "devices")
 }
 
@@ -357,6 +370,20 @@ func (s *Server) handleDevicesPage(w http.ResponseWriter, r *http.Request) {
 // It reconciles the WHOLE desired state rather than pushing the new allowlist
 // on its own. Pushing one tier is what this used to do, and it silently
 // emptied every block set for as long as it took the next tick to arrive.
+//
+// # Why the profile is written BEFORE the registry
+//
+// Enrolment is two writes to two files, so it can be interrupted between
+// them, and the two orders fail in opposite directions. Registry first leaves
+// a device that is registered and in no profile: an UNGOVERNED device with
+// permanently unrestricted access (docs/adr/0003), which is strictly more
+// internet than anyone asked for. Profile first leaves a profile naming a MAC
+// that is not in the registry, so the MAC never reaches allowed_macs and the
+// device gets nothing at all.
+//
+// Fail closed on the control. The half-state costs a child their internet
+// until someone finishes the job, and the page says so loudly; the other order
+// costs a household its bedtime and says nothing.
 func (s *Server) handleAddDevice(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
@@ -370,9 +397,43 @@ func (s *Server) handleAddDevice(w http.ResponseWriter, r *http.Request) {
 	mac := r.FormValue("mac")
 	name := r.FormValue("name")
 
-	if _, err := registry.NormaliseMAC(mac); err != nil {
+	canonical, err := registry.NormaliseMAC(mac)
+	if err != nil {
 		http.Redirect(w, r, "/devices/?error="+template.URLQueryEscaper(err.Error()), http.StatusSeeOther)
 		return
+	}
+	profile, err := parseProfileChoice(r.FormValue("profile"))
+	if err != nil {
+		http.Redirect(w, r, "/devices/?error="+template.URLQueryEscaper(err.Error()), http.StatusSeeOther)
+		return
+	}
+
+	// The profile is resolved and written first, and a profile that does not
+	// exist refuses the WHOLE enrolment rather than falling back to registering
+	// the device on its own: the fallback is the ungoverned device, which is
+	// the permissive outcome.
+	if profile != "" {
+		ps, err := s.schedule.Load()
+		if err != nil {
+			s.log.Error("loading profiles", "error", err)
+			http.Error(w, "failed to read the profiles", http.StatusInternalServerError)
+			return
+		}
+		p, ok := ps.Find(profile)
+		if !ok {
+			http.Redirect(w, r, "/devices/?error="+template.URLQueryEscaper(
+				fmt.Sprintf("no profile called %q", profile)), http.StatusSeeOther)
+			return
+		}
+		if !slices.Contains(p.Devices, canonical) {
+			p.Devices = append(p.Devices, canonical)
+			sort.Strings(p.Devices)
+		}
+		if err := s.schedule.Save(ps); err != nil {
+			s.log.Error("saving profiles", "error", err)
+			http.Error(w, "failed to save the profiles", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	reg, err := s.store.Load()
@@ -398,7 +459,14 @@ func (s *Server) handleAddDevice(w http.ResponseWriter, r *http.Request) {
 			http.StatusInternalServerError)
 		return
 	}
-	s.log.Info("device registered", "mac", mac, "name", name)
+	if profile == "" {
+		// Said out loud, because it is the permissive outcome and the only
+		// record of it otherwise is a count on the home page.
+		s.log.Info("device registered with NO profile, so it is allowed always and "+
+			"restricted by nothing", "mac", canonical, "name", name)
+	} else {
+		s.log.Info("device registered", "mac", canonical, "name", name, "profile", profile)
+	}
 	http.Redirect(w, r, "/devices/", http.StatusSeeOther)
 }
 
@@ -487,6 +555,14 @@ func (s *Server) handleRemoveDevice(w http.ResponseWriter, r *http.Request) {
 type pageData struct {
 	Devices []DeviceView
 	Error   string
+	// Pending is what the router has seen and the registry does not know.
+	Pending []PendingDevice
+	// ShowPending distinguishes "looked and found nothing" from "not looking".
+	ShowPending bool
+	Profiles    []profileChoice
+	// NoProfile is the select value that means "govern it by nothing", passed
+	// in rather than spelled out in the template as well as in the parser.
+	NoProfile string
 }
 
 var indexTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
@@ -514,6 +590,12 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
  button { padding: .7rem; font-size: 1rem; }
  .err { background: #fdecea; color: #b00020; padding: .6rem; margin-bottom: 1rem; }
  .muted { color: #666; font-size: .85rem; }
+ form.enrol { display: flex; gap: .3rem; margin: 0; flex-wrap: wrap; align-items: center; }
+ form.enrol input, form.enrol select { padding: .4rem; font-size: .9rem; width: auto; }
+ form.enrol input.name { min-width: 7rem; }
+ .tag { display: inline-block; font-size: .75rem; padding: .05rem .35rem; border-radius: .25rem;
+        background: #eef2f7; color: #33506e; border: 1px solid #c9d6e4; margin-left: .3rem; }
+ .claimed { color: #333; }
 </style>
 </head>
 <body>
@@ -550,10 +632,56 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
 <tr><td colspan="4" class="muted">No devices registered. Nothing can reach the internet.</td></tr>
 {{end}}
 </table>
-<h2 style="font-size:1.05rem">Add a device</h2>
+{{if .ShowPending}}
+<h2 style="font-size:1.05rem">Seen on the network, not yet allowed</h2>
+{{if .Pending}}
+<table>
+<tr><th>Calls itself</th><th>Address</th><th>Allow it</th></tr>
+{{range .Pending}}
+<tr>
+  <td>
+    {{if .Hostname}}<span class="claimed">{{.Hostname}}</span>{{else}}<span class="muted">no name given</span>{{end}}
+    {{if .Randomised}}<span class="tag" title="a locally administered address: usually a private/randomised Wi-Fi address">randomised</span>{{end}}
+    {{if not .Leased}}<span class="tag" title="seen on the network but the router never gave it an address">no DHCP lease</span>{{end}}
+    <div class="muted"><code>{{.MAC}}</code></div>
+  </td>
+  <td>{{if .IPv4}}<code>{{.IPv4}}</code>{{else}}<span class="muted">unknown</span>{{end}}</td>
+  <td>
+    <form method="POST" action="/devices" class="enrol">
+      <input type="hidden" name="mac" value="{{.MAC}}">
+      <input class="name" name="name" placeholder="name it" autocomplete="off"
+             aria-label="name for {{.MAC}}" value="{{.Hostname}}">
+      <select name="profile" required aria-label="profile for {{.MAC}}">
+        <option value="" disabled selected>whose is it?</option>
+        {{range $.Profiles}}<option value="{{.Value}}">{{.Label}}</option>{{end}}
+        <option value="{{$.NoProfile}}">nobody &mdash; always allowed</option>
+      </select>
+      <button type="submit">Allow</button>
+    </form>
+  </td>
+</tr>
+{{end}}
+</table>
+<p class="muted">&ldquo;Calls itself&rdquo; is the name the device claims over DHCP. It is a hint, not
+evidence: name the device yourself. A <strong>randomised</strong> address is a private Wi-Fi
+address; it is stable on this network, but it changes if the device is reset or made to forget
+this network, and then it will need allowing again.</p>
+<p class="muted">Choosing <strong>nobody</strong> allows the device permanently, with no schedule,
+no budget and no website rules. That is right for a printer and wrong for a child.</p>
+{{else}}
+<p class="muted">Nothing unknown on the network right now.</p>
+{{end}}
+{{end}}
+
+<h2 style="font-size:1.05rem">Add a device by hand</h2>
 <form method="POST" action="/devices">
   <input name="mac" placeholder="aa:bb:cc:dd:ee:01" required autocapitalize="none" autocomplete="off">
   <input name="name" placeholder="name (optional)" autocomplete="off">
+  <select name="profile" required aria-label="profile for the new device">
+    <option value="" disabled selected>whose is it?</option>
+    {{range .Profiles}}<option value="{{.Value}}">{{.Label}}</option>{{end}}
+    <option value="{{.NoProfile}}">nobody &mdash; always allowed</option>
+  </select>
   <button type="submit">Allow this device</button>
 </form>
 <p class="muted">Edit a name and press Save. Names are labels only: the allowlist

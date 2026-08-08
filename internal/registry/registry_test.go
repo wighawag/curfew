@@ -218,3 +218,41 @@ func TestRenameToEmptyIsAllowed(t *testing.T) {
 		t.Errorf("want the name cleared, got %q", r.Devices[0].Name)
 	}
 }
+
+func TestLocallyAdministeredSpotsARandomisedAddress(t *testing.T) {
+	cases := []struct {
+		mac  string
+		want bool
+		why  string
+	}{
+		// The second-least-significant bit of the first octet. Android's own
+		// documentation says randomisation sets exactly this bit (and clears
+		// the multicast bit), so these four second hex digits are what a
+		// randomised phone address looks like.
+		{"a2:bb:cc:dd:ee:01", true, "0x02 set"},
+		{"a6:bb:cc:dd:ee:01", true, "0x06 set"},
+		{"aa:bb:cc:dd:ee:01", true, "0x0a set"},
+		{"ae:bb:cc:dd:ee:01", true, "0x0e set"},
+		// A real vendor address has the bit clear: it was assigned from an
+		// OUI rather than made up by the device.
+		{"f8:25:51:09:38:38", false, "vendor OUI"},
+		{"00:11:22:33:44:55", false, "vendor OUI"},
+		{"", false, "not an address at all"},
+		{"nonsense", false, "not an address at all"},
+	}
+	for _, c := range cases {
+		if got := LocallyAdministered(c.mac); got != c.want {
+			t.Errorf("LocallyAdministered(%q) = %v, want %v (%s)", c.mac, got, c.want, c.why)
+		}
+	}
+}
+
+func TestLocallyAdministeredAcceptsAnySpelling(t *testing.T) {
+	// It is asked about addresses that came from the router's own tables and
+	// from a form, so it must not depend on having been canonicalised first.
+	for _, spelling := range []string{"AA:BB:CC:DD:EE:01", "aa-bb-cc-dd-ee-01", "aabb.ccdd.ee01"} {
+		if !LocallyAdministered(spelling) {
+			t.Errorf("%q should read as locally administered", spelling)
+		}
+	}
+}

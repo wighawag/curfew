@@ -34,6 +34,7 @@ import (
 	"github.com/wighawag/curfew/internal/enforce"
 	"github.com/wighawag/curfew/internal/httpui"
 	"github.com/wighawag/curfew/internal/kernelprobe"
+	"github.com/wighawag/curfew/internal/lanhosts"
 	"github.com/wighawag/curfew/internal/policy"
 	"github.com/wighawag/curfew/internal/registry"
 	"github.com/wighawag/curfew/internal/schedule"
@@ -229,6 +230,14 @@ func run(args []string, stderr *os.File) int {
 	dns := setUpDNSRestrictions(opt, sched, store, loc, log)
 
 	ui := httpui.New(store, sched, fw, core, log, opt.user, opt.password, loc)
+	// So the device page can list what the router has SEEN but does not know,
+	// instead of asking a parent to read a MAC address off another screen and
+	// type it in. Wired unconditionally: it reads the lease file and the
+	// neighbour table, both of which exist whether or not AdGuard does, and it
+	// fails soft to an empty list on a machine that has neither.
+	ui.UseLANSightings(func() (map[string]lanhosts.Sighting, error) {
+		return lanhosts.ObserveSightings(shellrun.Local{}, dnspolicy.DefaultLeasePath, opt.lan)
+	})
 	if dns != nil {
 		ui.ServeFilterList(dnspolicy.FilterListPath, dns.FilterList)
 		// So the settings page can offer AdGuard's own service catalogue
