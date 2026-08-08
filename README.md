@@ -150,6 +150,8 @@ A restriction draws on two sources, and both work:
 - **AdGuard's built-in service catalogue** (`youtube`, `tiktok`, `netflix`, `roblox`, `discord` and many more). Preferred, because it is maintained upstream and keeps working when a service adds new domains.
 - **Your own domain lists**, defined once in `profiles.json` under `block_lists` and referenced by name. They live in curfew's config, so they travel with `push` and `pull`.
 
+Both are set up from the **settings page**, not by hand. Under each profile, *website restrictions* takes the same days-and-times controls as a blocked window, plus tick boxes for your lists and for AdGuard's services. Your own domain lists are managed at the bottom of the same page, and a list still used by a restriction refuses to be deleted rather than leaving that restriction blocking nothing. The underlying file looks like this:
+
 ```json
 {
   "block_lists": { "no_streaming": ["twitch.tv", "iplayer.bbc.co.uk"] },
@@ -174,7 +176,7 @@ To make this possible curfew **pins a static DHCP lease** for each registered de
 
 If a device has no known address, its profile's restrictions **do not apply to it**, and the daemon says so in the log rather than pretending otherwise. Schedules, budgets and manual blocks are unaffected, because those are the firewall and never consult an IP address.
 
-**Encrypted DNS is partly closed.** A restriction is worthless if the child's browser can just ask somebody else, so curfew also blocks the well-known DNS-over-HTTPS endpoint hostnames (`cloudflare-dns.com`, `dns.google`, `quad9.net` and the rest) for any profile that has restrictions. Almost every browser and phone exposes that setting as a provider *name*, so the lookup goes through the router and fails. This applies around the clock rather than only inside the window, because a child sets an endpoint once and it persists. It applies only to profiles that have restrictions, so your own devices keep encrypted DNS, and you can turn it off with `"block_doh_bootstrap": false`.
+**Encrypted DNS is partly closed.** A restriction is worthless if the child's browser can just ask somebody else, so curfew also blocks the well-known DNS-over-HTTPS endpoint hostnames (`cloudflare-dns.com`, `dns.google`, `quad9.net` and the rest) for any profile that has restrictions. Almost every browser and phone exposes that setting as a provider *name*, so the lookup goes through the router and fails. This applies around the clock rather than only inside the window, because a child sets an endpoint once and it persists. It applies only to profiles that have restrictions, so your own devices keep encrypted DNS, and there is a tick box for it on the settings page.
 
 What it does **not** close: a DoH endpoint entered as a bare IP address, a hardcoded plain resolver like `8.8.8.8`, DNS-over-TLS on port 853, or a VPN. Those need firewall rules rather than DNS rules, and they are specified in `work/specs/proposed/force-dns-through-the-router.md` rather than quietly implied to be handled. Treat the current state as a speed bump against a curious child, not a control against a determined one.
 

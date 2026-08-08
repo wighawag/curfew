@@ -41,7 +41,11 @@ type SettingsProfile struct {
 	Name    string
 	Devices []DeviceView
 	Windows []string
-	Budget  budgetFields
+	// Restrictions are the DNS restrictions: same window shape, plus what
+	// they remove. Kept separate from Windows on the page because they are a
+	// different KIND of control, not a variant of one (see restrictions.go).
+	Restrictions []RestrictionView
+	Budget       budgetFields
 	// Observed is what this profile's devices actually sent in the last
 	// accounting interval. It sits on THIS page, next to the threshold field,
 	// because that is the only place the number is actionable: it exists so
@@ -71,9 +75,27 @@ type settingsData struct {
 	// AccountingOff is true when no accountant is wired up, in which case no
 	// observed figure exists and saying nothing beats showing zeros.
 	AccountingOff bool
+	// BlockLists are the household's own named domain lists.
+	BlockLists []blockListView
+	// ListNames is just their names, for the restriction form's checkboxes.
+	ListNames []string
+	// Services is AdGuard's built-in catalogue, read from the running AdGuard
+	// rather than compiled in, so the page offers what THIS AdGuard actually
+	// knows about instead of a list that drifts from it.
+	Services []string
+	// DNSOff is true when the AdGuard integration is not configured, in which
+	// case a restriction would be saved and never applied. Saying so beats
+	// offering a control that silently does nothing.
+	DNSOff bool
+	// BlockDoH is the household's DoH-bootstrap setting, on unless turned off.
+	BlockDoH bool
+	// ServicesUnavailable is true when AdGuard is configured but its catalogue
+	// could not be read, so the page can say why the service list is empty
+	// rather than implying this AdGuard has no services.
+	ServicesUnavailable bool
 }
 
-func (s *Server) settingsProfiles() ([]SettingsProfile, error) {
+func (s *Server) settingsProfiles(now time.Time) ([]SettingsProfile, error) {
 	ps, err := s.schedule.Load()
 	if err != nil {
 		return nil, err
@@ -102,6 +124,16 @@ func (s *Server) settingsProfiles() ([]SettingsProfile, error) {
 		for _, w := range p.Windows {
 			v.Windows = append(v.Windows, w.Describe())
 		}
+		for _, r := range p.Restrictions {
+			rv := RestrictionView{Blocks: describeRestriction(r), Active: r.ActiveAt(now)}
+			for _, w := range r.Windows {
+				rv.When = append(rv.When, w.Describe())
+			}
+			if len(rv.When) == 0 {
+				rv.When = []string{"always"}
+			}
+			v.Restrictions = append(v.Restrictions, rv)
+		}
 		for _, m := range p.Devices {
 			v.Devices = append(v.Devices, DeviceView{MAC: m, Name: name[m]})
 		}
@@ -121,7 +153,8 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	profiles, err := s.settingsProfiles()
+	now := time.Now().In(s.loc)
+	profiles, err := s.settingsProfiles(now)
 	if err != nil {
 		s.log.Error("rendering settings", "error", err)
 		http.Error(w, "failed to read state", http.StatusInternalServerError)
@@ -140,11 +173,43 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	interval := s.core.AccountingInterval()
+
+	// The household's own domain lists, with who uses each, so deleting one
+	// is an informed decision.
+	names := make([]string, 0, len(ps.BlockLists))
+	for name := range ps.BlockLists {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	lists := make([]blockListView, 0, len(names))
+	for _, name := range names {
+		domains := ps.BlockLists[name]
+		lists = append(lists, blockListView{
+			Name: name, Domains: strings.Join(domains, "\n"),
+			Count: len(domains), UsedBy: listUsers(ps, name),
+		})
+	}
+
+	// AdGuard's catalogue, asked of the running AdGuard. When it cannot be
+	// read the page says so, because an empty list of services is otherwise
+	// indistinguishable from an AdGuard that offers none.
+	var services []string
+	var servicesUnavailable bool
+	if s.services != nil {
+		var svcErr error
+		services, svcErr = s.services()
+		if svcErr != nil {
+			servicesUnavailable = true
+			s.log.Warn("could not read AdGuard's service catalogue for the settings page",
+				"error", svcErr)
+		}
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	s.render(w, settingsTemplate, settingsData{
 		Profiles:           profiles,
 		Unassigned:         unassigned,
-		Now:                time.Now().In(s.loc).Format("Mon 15:04 MST"),
+		Now:                now.Format("Mon 15:04 MST"),
 		Zone:               s.loc.String(),
 		Error:              r.URL.Query().Get("error"),
 		Saved:              r.URL.Query().Get("saved"),
@@ -153,6 +218,13 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		ThresholdKB:        strconv.FormatUint(ps.Budget.Threshold()/1024, 10),
 		ThresholdIsDefault: ps.Budget.ActivityThresholdBytesPerMinute == 0,
 		AccountingOff:      interval == 0,
+
+		BlockDoH:            ps.DoHBootstrapBlocked(),
+		BlockLists:          lists,
+		ListNames:           names,
+		Services:            services,
+		DNSOff:              s.services == nil,
+		ServicesUnavailable: servicesUnavailable,
 	}, "settings")
 }
 
@@ -271,6 +343,10 @@ var settingsTemplate = template.Must(template.New("settings").Parse(`<!DOCTYPE h
  .field input[type=text] { width: 6rem; }
  .ok { background: #e7f6ec; color: #0a7d28; padding: .6rem; margin-bottom: 1rem;
        border-radius: .3rem; font-size: .9rem; }
+ .warn-box { background: #fff4e5; padding: .6rem; margin-bottom: .6rem; font-size: .85rem; }
+ textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace;
+            font-size: .85rem; padding: .4rem; }
+ .days.scroll { max-height: 9rem; overflow-y: auto; border: 1px solid #ddd; padding: .3rem; }
  .guess { background: #fff4e5; color: #8a5300; border: 1px solid #f0c48a;
           border-radius: .3rem; padding: .5rem .6rem; margin-top: .5rem; font-size: .85rem; }
 </style>
@@ -351,6 +427,66 @@ var settingsTemplate = template.Must(template.New("settings").Parse(`<!DOCTYPE h
   </details>
 
   <details>
+    <summary>website restrictions ({{len .Restrictions}})</summary>
+    <p class="muted">These leave the child ONLINE and take some sites away, using DNS.
+    Unlike a blocked window they are a softer control: they only affect name lookups,
+    and a determined child can get around them. Bedtime and budgets are enforced in the
+    firewall and cannot be.</p>
+    {{if $.DNSOff}}<div class="warn-box">AdGuard is not configured on this router, so
+    anything set here will be saved and <strong>never applied</strong>. Re-run
+    <code>curfew install</code> from your laptop to turn it on.</div>{{end}}
+    <ul>
+    {{range $i, $r := .Restrictions}}
+      <li>
+        {{range $r.When}}<div>{{.}}</div>{{end}}
+        <div>blocks <strong>{{$r.Blocks}}</strong>
+          {{if $r.Active}}<span class="yes">in force now</span>{{else}}<span class="muted">not right now</span>{{end}}
+        </div>
+        <form method="POST" action="/profiles/restriction/remove" style="display:inline">
+          <input type="hidden" name="name" value="{{$p.Name}}">
+          <input type="hidden" name="index" value="{{$i}}">
+          <button type="submit" class="danger">remove</button>
+        </form>
+      </li>
+    {{else}}
+      <li class="muted">no website restrictions</li>
+    {{end}}
+    </ul>
+    <form method="POST" action="/profiles/restriction/add">
+      <input type="hidden" name="name" value="{{.Name}}">
+      <div class="row days">
+        {{range $.AllDays}}<label><input type="checkbox" name="day" value="{{.}}" checked>{{.}}</label>{{end}}
+      </div>
+      <div class="row">
+        from <input type="time" name="start" value="08:00" required>
+        to <input type="time" name="end" value="10:00" required>
+      </div>
+      {{if $.ListNames}}
+      <div class="row"><span class="muted">your lists</span></div>
+      <div class="row days">
+        {{range $.ListNames}}<label><input type="checkbox" name="list" value="{{.}}">{{.}}</label>{{end}}
+      </div>
+      {{else}}
+      <div class="muted">You have no domain lists yet. Add one under &ldquo;your domain
+      lists&rdquo; at the bottom of this page, or tick a service below.</div>
+      {{end}}
+      {{if $.Services}}
+      <div class="row"><span class="muted">services (kept up to date by AdGuard, and the better
+      choice where one fits: a hand-written list of domains goes stale as a service adds new ones)</span></div>
+      <div class="row days scroll">
+        {{range $.Services}}<label><input type="checkbox" name="service" value="{{.}}">{{.}}</label>{{end}}
+      </div>
+      {{else if $.ServicesUnavailable}}
+      <div class="muted">AdGuard&rsquo;s service list could not be read just now, so only your
+      own domain lists are offered.</div>
+      {{end}}
+      <div class="row"><button type="submit">add restriction</button></div>
+      <div class="muted">Tick at least one list or service: a restriction that blocks nothing
+      is refused rather than saved as one that looks set up.</div>
+    </form>
+  </details>
+
+  <details>
     <summary>devices in this profile ({{len .Devices}})</summary>
     <form method="POST" action="/profiles/devices">
       <input type="hidden" name="name" value="{{.Name}}">
@@ -418,6 +554,61 @@ var settingsTemplate = template.Must(template.New("settings").Parse(`<!DOCTYPE h
       cannot be attributed to a device at this point in the network. Upstream is roughly
       1.4% of what is downloaded, so the numbers are smaller than you expect.</div>
     <div class="row"><button type="submit">save</button></div>
+  </form>
+</div>
+
+<div class="profile">
+  <h2 style="font-size:.95rem">Your domain lists</h2>
+  <p class="muted">Named lists of sites you write yourself, to use in a website restriction
+  above. They live in curfew&rsquo;s own configuration, so they travel with push and pull.
+  Where AdGuard has a service for what you want (YouTube, TikTok, Netflix, Roblox), prefer
+  that: it is kept up to date, and a hand-written list goes stale as a service adds domains.</p>
+  {{range .BlockLists}}
+  <form method="POST" action="/settings/blocklist">
+    <input type="hidden" name="list" value="{{.Name}}">
+    <div class="row"><strong>{{.Name}}</strong> <span class="muted">{{.Count}} domain(s)</span></div>
+    <textarea name="domains" rows="4" aria-label="domains in {{.Name}}">{{.Domains}}</textarea>
+    <div class="row">
+      <button type="submit">save</button>
+      {{if .UsedBy}}<span class="muted">used by {{range $i, $u := .UsedBy}}{{if $i}}, {{end}}{{$u}}{{end}}</span>{{end}}
+    </div>
+  </form>
+  {{if not .UsedBy}}
+  <form method="POST" action="/settings/blocklist/delete"
+        onsubmit="return confirm('Delete the list {{.Name}}?')">
+    <input type="hidden" name="list" value="{{.Name}}">
+    <div class="row"><button type="submit" class="danger">delete {{.Name}}</button></div>
+  </form>
+  {{end}}
+  {{else}}
+  <p class="muted">No lists yet.</p>
+  {{end}}
+  <form method="POST" action="/settings/dns">
+    <div class="row">
+      <label><input type="checkbox" name="block_doh" value="1" {{if .BlockDoH}}checked{{end}}>
+      stop restricted children reaching other DNS providers</label>
+      <button type="submit">save</button>
+    </div>
+    <div class="muted">Blocks the well-known encrypted-DNS endpoints for any profile that has
+    a website restriction, so a child cannot switch their browser to another resolver and
+    walk around it. Applies around the clock, not only inside the window, because the setting
+    persists once made. Your own devices are unaffected. It stops clients that look their
+    provider up by name, which is how every browser and phone offers it; it does not stop one
+    configured with a bare IP address, or a VPN.</div>
+  </form>
+
+  <h3 style="font-size:.9rem">New list</h3>
+  <form method="POST" action="/settings/blocklist">
+    <div class="row">
+      <input type="text" name="list" placeholder="no_streaming" required
+             autocapitalize="none" autocomplete="off">
+    </div>
+    <textarea name="domains" rows="4" placeholder="twitch.tv&#10;iplayer.bbc.co.uk"
+              aria-label="domains for the new list"></textarea>
+    <div class="row"><button type="submit">create list</button></div>
+    <div class="muted">One domain per line. Subdomains are covered automatically, so
+    <code>twitch.tv</code> also blocks <code>www.twitch.tv</code>. No name may contain a
+    space or a comma.</div>
   </form>
 </div>
 </body>

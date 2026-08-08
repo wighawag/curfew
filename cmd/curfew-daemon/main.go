@@ -231,6 +231,9 @@ func run(args []string, stderr *os.File) int {
 	ui := httpui.New(store, sched, fw, core, log, opt.user, opt.password, loc)
 	if dns != nil {
 		ui.ServeFilterList(dnspolicy.FilterListPath, dns.FilterList)
+		// So the settings page can offer AdGuard's own service catalogue
+		// instead of a list compiled into curfew that drifts from it.
+		ui.UseAdGuardServices(dns.Services)
 	}
 	srv := &http.Server{
 		Addr:              opt.listen,

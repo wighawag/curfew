@@ -3,6 +3,7 @@ package httpui
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"html/template"
 	"io"
 	"log/slog"
@@ -35,18 +36,44 @@ type fakeSchedule struct{ ps *schedule.Profiles }
 // with an opinion: it would make a budget setting that never reaches the
 // policy layer look like one that works.
 func (f *fakeSchedule) Load() (*schedule.Profiles, error) {
-	if f.ps == nil {
-		return &schedule.Profiles{Profiles: []schedule.Profile{}}, nil
-	}
-	cp := *f.ps
-	cp.Profiles = append([]schedule.Profile(nil), f.ps.Profiles...)
-	return &cp, nil
+	return copyProfiles(f.ps), nil
 }
 func (f *fakeSchedule) Save(ps *schedule.Profiles) error {
+	// The REAL store refuses to save an unusable schedule
+	// (schedule.Save -> Validate), so this one must too. A double that accepts
+	// what the real store rejects is not a dumb double, it is a permissive
+	// one: it let a handler write a domain carrying AdGuard rule syntax and
+	// the test passed, because only the real store would have stopped it.
+	if err := ps.Validate(); err != nil {
+		return fmt.Errorf("refusing to save an unusable schedule: %w", err)
+	}
+	f.ps = copyProfiles(ps)
+	return nil
+}
+
+// copyProfiles deep-copies far enough that a handler mutating what it loaded
+// cannot reach the stored copy without calling Save.
+//
+// The map matters as much as the slice, and was originally shared: with a
+// shared BlockLists, a handler that edited a list and forgot to Save would
+// still appear to work, so the test would pass with the save deleted. A double
+// that quietly shares a field is not a dumb double, it is one with an opinion.
+func copyProfiles(ps *schedule.Profiles) *schedule.Profiles {
+	if ps == nil {
+		return &schedule.Profiles{Profiles: []schedule.Profile{}}
+	}
 	cp := *ps
 	cp.Profiles = append([]schedule.Profile(nil), ps.Profiles...)
-	f.ps = &cp
-	return nil
+	for i := range cp.Profiles {
+		cp.Profiles[i].Restrictions = append([]schedule.Restriction(nil), ps.Profiles[i].Restrictions...)
+	}
+	if ps.BlockLists != nil {
+		cp.BlockLists = make(map[string][]string, len(ps.BlockLists))
+		for k, v := range ps.BlockLists {
+			cp.BlockLists[k] = append([]string(nil), v...)
+		}
+	}
+	return &cp
 }
 
 // fakeFirewall is an in-memory stand-in for nftables: four sets and a ticket
@@ -1165,9 +1192,41 @@ func TestAddWindowFormDefaultsToEveryDayTicked(t *testing.T) {
 			t.Errorf("%s should be ticked by default", d)
 		}
 	}
-	if got := strings.Count(body, `name="day"`); got != len(schedule.AllDays) {
-		t.Errorf("want %d day checkboxes, got %d", len(schedule.AllDays), got)
+	// Scoped to the blocked-window form rather than counted across the page.
+	// Counting the whole page silently measured "every day-picker on the
+	// settings page at once", so adding a second form that also picks days
+	// broke it for no reason a reader could see.
+	form := formAction(t, body, "/profiles/window/add")
+	if got := strings.Count(form, `name="day"`); got != len(schedule.AllDays) {
+		t.Errorf("want %d day checkboxes in the add-window form, got %d", len(schedule.AllDays), got)
 	}
+	for _, d := range schedule.AllDays {
+		if !strings.Contains(form, `value="`+string(d)+`" checked`) {
+			t.Errorf("%s should be ticked by default in the add-window form", d)
+		}
+	}
+}
+
+// formAction returns just the <form> whose action is the given path, so a test
+// can assert on ONE form instead of on the whole document. Asserting against
+// the page as a whole is how a substring check comes to mean something other
+// than what it says.
+func formAction(t *testing.T, body, action string) string {
+	t.Helper()
+	marker := `action="` + action + `"`
+	i := strings.Index(body, marker)
+	if i < 0 {
+		t.Fatalf("no form with action %q on the page", action)
+	}
+	start := strings.LastIndex(body[:i], "<form")
+	if start < 0 {
+		t.Fatalf("malformed page: found %q outside a form", action)
+	}
+	end := strings.Index(body[start:], "</form>")
+	if end < 0 {
+		t.Fatalf("unclosed form for %q", action)
+	}
+	return body[start : start+end]
 }
 
 // And unticking them all is still refused, with a message that says what to do.

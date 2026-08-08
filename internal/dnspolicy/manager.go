@@ -47,6 +47,8 @@ type Manager struct {
 	served string
 	// lastReport is what the most recent pass did, for the page and the log.
 	lastReport Report
+	// services caches AdGuard's built-in catalogue for the settings page.
+	services []string
 }
 
 // RegistryStore loads the device registry.
@@ -230,3 +232,27 @@ func (m *Manager) Tick() error {
 type discard struct{}
 
 func (discard) Write(p []byte) (int, error) { return len(p), nil }
+
+// Services reports AdGuard's built-in service catalogue, cached.
+//
+// Cached because the settings page asks for it on every render and the answer
+// changes only when AdGuard is upgraded. A failure is NOT cached: the common
+// reason to fail is that AdGuard is momentarily unreachable, and remembering
+// that for the life of the daemon would leave the page permanently claiming
+// there are no services.
+func (m *Manager) Services() ([]string, error) {
+	m.mu.Lock()
+	cached := m.services
+	m.mu.Unlock()
+	if len(cached) > 0 {
+		return cached, nil
+	}
+	got, err := m.api.Services()
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	m.services = got
+	m.mu.Unlock()
+	return got, nil
+}

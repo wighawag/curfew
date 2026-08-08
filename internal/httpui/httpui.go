@@ -98,6 +98,20 @@ type Server struct {
 	filterList func() string
 	// filterPath is the single unauthenticated route, empty when unused.
 	filterPath string
+	// services reads AdGuard's built-in service catalogue, or is nil when the
+	// AdGuard integration is not configured. Asked of the RUNNING AdGuard
+	// rather than compiled in, so the page offers what this household's
+	// AdGuard actually knows about instead of a list that silently drifts
+	// from it.
+	services func() ([]string, error)
+}
+
+// UseAdGuardServices lets the settings page offer AdGuard's built-in service
+// catalogue. Leaving it unset marks the DNS-restriction controls as
+// unavailable, which is honest: without AdGuard credentials a restriction
+// would be saved and never applied.
+func (s *Server) UseAdGuardServices(provider func() ([]string, error)) {
+	s.services = provider
 }
 
 // ServeFilterList makes this server publish curfew's AdGuard filter list at
@@ -174,6 +188,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/profiles/devices", s.handleProfileDevices)
 	mux.HandleFunc("/profiles/window/add", s.handleWindowAdd)
 	mux.HandleFunc("/profiles/window/remove", s.handleWindowRemove)
+	mux.HandleFunc("/profiles/restriction/add", s.handleRestrictionAdd)
+	mux.HandleFunc("/profiles/restriction/remove", s.handleRestrictionRemove)
+	mux.HandleFunc("/settings/blocklist", s.handleBlockListSave)
+	mux.HandleFunc("/settings/blocklist/delete", s.handleBlockListDelete)
+	mux.HandleFunc("/settings/dns", s.handleDNSSettings)
 	mux.HandleFunc("/profiles/block", s.handleProfileBlock)
 	mux.HandleFunc("/profiles/unblock", s.handleProfileUnblock)
 	mux.HandleFunc("/profiles/ticket", s.handleProfileTicket)

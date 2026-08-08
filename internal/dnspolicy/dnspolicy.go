@@ -209,6 +209,10 @@ type API interface {
 	Filters() ([]adguard.FilterList, error)
 	AddFilterURL(name, url string) error
 	RefreshFilters() error
+	// Services is AdGuard's built-in catalogue, so a UI can offer what THIS
+	// AdGuard knows about rather than a list compiled into curfew that drifts
+	// from it.
+	Services() ([]string, error)
 }
 
 // Reconcile makes AdGuard hold the desired state, writing only on a difference.

@@ -433,3 +433,8 @@ func TestDoHBootstrapCanBeTurnedOffAndNeverTouchesUnrestrictedProfiles(t *testin
 		t.Errorf("an unrestricted profile had DoH blocked:\n%s", d.FilterList)
 	}
 }
+
+func (f *fakeAPI) Services() ([]string, error) {
+	f.calls = append(f.calls, "services")
+	return []string{"youtube", "netflix", "tiktok"}, nil
+}
