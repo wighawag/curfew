@@ -81,6 +81,10 @@ type AdGuardReport struct {
 	// EnabledService records that AdGuard had no boot-time symlink and now
 	// does.
 	EnabledService bool
+	// StartedAdGuard records that AdGuard was not running at all and was
+	// started. A crash-looped AdGuard that procd has given up on presents
+	// exactly like a stopped one, and both must be recoverable.
+	StartedAdGuard bool
 }
 
 // Summary renders the report for a terminal.
@@ -160,6 +164,7 @@ func adoptAdGuard(r Runner, opt AdGuardOptions) (AdGuardReport, error) {
 			"so curfew will not guess at it. Finish AdGuard's own setup first", adguard.ConfigPath)
 	}
 
+	configChanged := false
 	switch adguard.InspectUsers([]byte(config)) {
 	case adguard.UsersPresent:
 		report.AlreadySecured = true
@@ -187,9 +192,7 @@ func adoptAdGuard(r Runner, opt AdGuardOptions) (AdGuardReport, error) {
 		if err := uploadString(r, string(edited), adguard.ConfigPath, "AdGuard config"); err != nil {
 			return report, err
 		}
-		if _, err := r.Run(restartAdGuard()); err != nil {
-			return report, fmt.Errorf("restarting AdGuard: %w", err)
-		}
+		configChanged = true
 		report.SecuredNow = true
 	}
 
@@ -202,18 +205,20 @@ func adoptAdGuard(r Runner, opt AdGuardOptions) (AdGuardReport, error) {
 	}
 	report.EnabledService = enabled
 
-	// Verify against the RUNNING server, not the file. A config with a user in
-	// it that AdGuard has not reloaded is still an open API, and what a child
-	// on the LAN meets is the server.
-	if err := verifyAdGuard(r, opt, &report); err != nil {
+	// Get it RUNNING and owning DNS first. Verifying the admin API before
+	// port 53 is free is doomed on a router where dnsmasq holds it: AdGuard
+	// serves its API for about 43 seconds and then exits on the failed bind,
+	// so the check would pass and the process would die. This also covers an
+	// AdGuard that is simply stopped, which is what a crash loop procd has
+	// given up on looks like.
+	if err := takeOverDNS(r, opt, &report, configChanged); err != nil {
 		return report, err
 	}
 
-	// And make it actually FILTER. Everything above is about the admin API;
-	// an AdGuard that is authenticated, running and not on port 53 is
-	// filtering precisely nothing while looking healthy, which is the state
-	// this router was found in.
-	if err := takeOverDNS(r, opt, &report); err != nil {
+	// Only now verify against the RUNNING server. A config with a user in it
+	// that AdGuard has not reloaded is still an open API, and what a child on
+	// the LAN meets is the server, not the file.
+	if err := verifyAdGuard(r, opt, &report); err != nil {
 		return report, err
 	}
 	return report, nil
@@ -244,9 +249,13 @@ func verifyAdGuard(_ Runner, opt AdGuardOptions, report *AdGuardReport) error {
 	}
 	client := adguard.NewClient(fmt.Sprintf("%s:%d", addr, adguard.DefaultPort), opt.User, opt.Password)
 
-	// Wait briefly: a restart takes a moment to bind.
+	// Wait briefly: a restart takes a moment to bind. Bounded by a DEADLINE
+	// rather than by an attempt count, because each attempt carries its own
+	// HTTP timeout and the two multiply: thirty attempts of ten seconds is
+	// five minutes of apparent hang, which is what this loop did at first.
 	var reachable bool
-	for range 30 {
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
 		if client.Reachable() {
 			reachable = true
 			break
@@ -352,10 +361,10 @@ func installAdGuard(r Runner, opt AdGuardOptions) (AdGuardReport, error) {
 		return report, err
 	}
 	report.EnabledService = enabled
-	if err := verifyAdGuard(r, opt, &report); err != nil {
+	if err := takeOverDNS(r, opt, &report, true); err != nil {
 		return report, err
 	}
-	if err := takeOverDNS(r, opt, &report); err != nil {
+	if err := verifyAdGuard(r, opt, &report); err != nil {
 		return report, err
 	}
 	return report, nil

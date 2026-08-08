@@ -96,8 +96,20 @@ func requireAdGuard(t *testing.T) {
 // placeConfig puts a config where the router keeps it and starts AdGuard on it.
 func placeConfig(t *testing.T, config string) {
 	t.Helper()
-	_, _ = exec.Command("sh", "-c", "killall AdGuardHome 2>/dev/null").CombinedOutput()
+	_, _ = exec.Command("sh", "-c", "killall AdGuardHome dnsmasq 2>/dev/null").CombinedOutput()
 	time.Sleep(300 * time.Millisecond)
+	// A fixture upstream on 5454, so AdGuard can actually resolve something.
+	// Offline on purpose, exactly as legacy/test/adguard.bats argues: against a
+	// real upstream a reserved or unreachable name returns NXDOMAIN anyway, so
+	// a broken resolver would read the same as a working one.
+	if out, err := exec.Command("sh", "-c",
+		"dnsmasq --port=5454 --no-hosts --bind-interfaces --listen-address=127.0.0.1 "+
+			"--address=/example.com/10.9.9.9").CombinedOutput(); err != nil {
+		t.Fatalf("fixture upstream: %s %v", out, err)
+	}
+	t.Cleanup(func() {
+		_, _ = exec.Command("sh", "-c", "killall dnsmasq 2>/dev/null").CombinedOutput()
+	})
 	if err := os.MkdirAll("/opt/AdGuardHome", 0o755); err != nil {
 		t.Fatal(err)
 	}

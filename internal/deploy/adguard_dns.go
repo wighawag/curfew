@@ -25,18 +25,43 @@ import (
 // process that was already doomed. So verification here waits for DNS itself,
 // and asks who actually holds port 53.
 
-// dnsmasqPort reads the port dnsmasq is configured to use.
-func dnsmasqPort(r Runner) (string, error) {
-	out, err := r.Run("uci get dhcp.@dnsmasq[0].port 2>/dev/null || echo 53")
+// dnsmasqPort reports the port dnsmasq is CONFIGURED to use, and whether that
+// could be established at all.
+//
+// "uci could not answer" is not "dnsmasq is on 53". An earlier version
+// conflated them and tried to reconfigure a dnsmasq that was not there. Where
+// uci is silent, the decision is made from what is actually LISTENING on port
+// 53 instead, which is evidence rather than inference.
+func dnsmasqPort(r Runner) (port string, known bool, err error) {
+	out, err := r.Run("uci get dhcp.@dnsmasq[0].port 2>/dev/null || true")
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	port := strings.TrimSpace(out)
-	if port == "" {
-		// An unset port means dnsmasq's default, which is 53.
-		port = "53"
+	if p := strings.TrimSpace(out); p != "" {
+		return p, true, nil
 	}
-	return port, nil
+	return "", false, nil
+}
+
+// dnsmasqIsInTheWay reports whether dnsmasq needs moving off port 53.
+//
+// Two independent pieces of evidence, and either is enough. It is LISTENING on
+// 53 right now, which is the state that stops AdGuard binding; or uci says 53,
+// which is the state that would take the port back at the next restart even if
+// AdGuard has it today.
+func dnsmasqIsInTheWay(r Runner) (bool, error) {
+	holder, err := portFiftyThreeHolder(r)
+	if err != nil {
+		return false, err
+	}
+	if strings.Contains(holder, "dnsmasq") {
+		return true, nil
+	}
+	port, known, err := dnsmasqPort(r)
+	if err != nil {
+		return false, err
+	}
+	return known && port == "53", nil
 }
 
 // portFiftyThreeHolder reports which process is listening on port 53, so a
@@ -62,7 +87,9 @@ func portFiftyThreeHolder(r Runner) (string, error) {
 func moveDnsmasqTo54(r Runner, routerIP string) error {
 	for _, cmd := range []string{
 		"uci set dhcp.@dnsmasq[0].port=54",
-		"uci -q delete dhcp.lan.dhcp_option",
+		// Deleting an option that is not set exits non-zero, which is not a
+		// failure and must not abort the move half-done.
+		"uci -q delete dhcp.lan.dhcp_option || true",
 		fmt.Sprintf("uci add_list dhcp.lan.dhcp_option='6,%s'", routerIP),
 		"uci commit dhcp",
 		"/etc/init.d/dnsmasq restart",
@@ -84,7 +111,7 @@ func moveDnsmasqTo54(r Runner, routerIP string) error {
 func restoreDnsmasqTo53(r Runner) error {
 	for _, cmd := range []string{
 		"uci set dhcp.@dnsmasq[0].port=53",
-		"uci -q delete dhcp.lan.dhcp_option",
+		"uci -q delete dhcp.lan.dhcp_option || true",
 		"uci commit dhcp",
 		"/etc/init.d/dnsmasq restart",
 	} {
@@ -183,65 +210,98 @@ func waitForAdGuardDNS(r Runner, timeout time.Duration) error {
 	return fmt.Errorf("%s", msg)
 }
 
-// takeOverDNS makes AdGuard the household's resolver, and puts everything back
-// if it cannot.
-func takeOverDNS(r Runner, opt AdGuardOptions, report *AdGuardReport) error {
+// adGuardRunning reports whether the process exists at all.
+//
+// Needed because "not serving DNS" has two very different causes: AdGuard is
+// still starting, which deserves patience, or AdGuard is not running, which
+// deserves a start. Waiting two minutes for a process that does not exist is
+// how the previous version wasted the whole timeout and then reported failure.
+func adGuardRunning(r Runner) (bool, error) {
+	out, err := r.Run("pgrep AdGuardHome >/dev/null 2>&1 && echo yes || echo no")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) == "yes", nil
+}
+
+// takeOverDNS makes AdGuard running AND the household's resolver, and puts
+// everything back if it cannot.
+//
+// forceRestart is set when the config was just edited, because AdGuard will
+// not pick up a new admin account without one.
+//
+// The ORDER here is load-bearing and was wrong at first. Verifying the admin
+// API before freeing port 53 is doomed on a router where dnsmasq holds it:
+// AdGuard starts, serves its API for about forty-three seconds, then exits
+// when the DNS bind fails. So the port is freed and AdGuard is brought up
+// FIRST, and only then is anything verified.
+func takeOverDNS(r Runner, opt AdGuardOptions, report *AdGuardReport, forceRestart bool) error {
 	timeout := opt.DNSTimeout
 	if timeout <= 0 {
 		timeout = DefaultDNSTimeout
 	}
 
-	serving, err := adGuardServesDNS(r)
+	running, err := adGuardRunning(r)
 	if err != nil {
 		return err
 	}
-	if serving {
-		report.ServingDNS = true
-		return nil
+	if !forceRestart && running {
+		serving, err := adGuardServesDNS(r)
+		if err != nil {
+			return err
+		}
+		if serving {
+			report.ServingDNS = true
+			return nil
+		}
+		// Running but not on port 53 yet. It may still be loading blocklists,
+		// which took 43 seconds on the real router, so give it that chance
+		// before concluding anything and moving a working resolver aside.
+		if holder, err := portFiftyThreeHolder(r); err != nil {
+			return err
+		} else if holder == "" {
+			if err := waitForAdGuardDNS(r, timeout); err == nil {
+				report.ServingDNS = true
+				return nil
+			}
+		}
 	}
 
 	holder, err := portFiftyThreeHolder(r)
 	if err != nil {
 		return err
 	}
-	// Nothing is holding port 53 yet. AdGuard may simply still be starting: it
-	// loads its blocklists before binding, which took 43 seconds on the real
-	// router. Concluding "conflict" here and moving dnsmasq would be acting on
-	// a race rather than on a fact.
-	if holder == "" {
-		if err := waitForAdGuardDNS(r, timeout); err == nil {
-			report.ServingDNS = true
-			return nil
-		}
-		if holder, err = portFiftyThreeHolder(r); err != nil {
-			return err
-		}
-	}
-
-	port, err := dnsmasqPort(r)
-	if err != nil {
-		return err
-	}
-	if port != "53" && holder != "" && !strings.Contains(holder, "dnsmasq") {
+	if holder != "" && !strings.Contains(holder, "AdGuard") && !strings.Contains(holder, "dnsmasq") {
 		return fmt.Errorf("port 53 is held by %q, which is neither AdGuard nor dnsmasq, "+
 			"so curfew will not touch it. Free port 53 and re-run", holder)
 	}
 
-	if port == "53" {
+	// Free the port. dnsmasq keeps DHCP and moves to 54, per ADR 0002. This is
+	// checked against its CONFIGURED port as well as what is listening, since
+	// a dnsmasq that is merely stopped would otherwise grab 53 back at the
+	// next restart and knock AdGuard out again.
+	// Only move a dnsmasq that is actually in the way. On a router with no
+	// dnsmasq, or one already on another port, there is nothing to move.
+	inTheWay, err := dnsmasqIsInTheWay(r)
+	if err != nil {
+		return err
+	}
+	if inTheWay {
 		report.MovedDnsmasq = true
 		if err := moveDnsmasqTo54(r, opt.RouterIP); err != nil {
 			return err
 		}
 	}
+
 	if _, err := r.Run(restartAdGuard()); err != nil {
-		return rollback(r, report, fmt.Errorf("restarting AdGuard: %w", err))
+		return rollback(r, report, fmt.Errorf("starting AdGuard: %w", err))
 	}
+	report.StartedAdGuard = !running
 	if err := waitForAdGuardDNS(r, timeout); err != nil {
 		return rollback(r, report, err)
 	}
-	// Bound is not the same as working. Ask it to resolve something.
 	if opt.RouterIP != "" {
-		if err := resolvesThrough(opt.RouterIP, "example.com", 10*time.Second); err != nil {
+		if err := resolvesThrough(opt.RouterIP, "example.com", 15*time.Second); err != nil {
 			return rollback(r, report,
 				fmt.Errorf("AdGuard holds port 53 but cannot resolve a name: %w", err))
 		}

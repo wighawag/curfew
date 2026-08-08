@@ -81,7 +81,7 @@ func TestWhenAdGuardCannotTakePortFiftyThreeDnsmasqIsPutBack(t *testing.T) {
 	r.answers["logread"] = "[fatal] starting dns server: listen tcp 0.0.0.0:53: bind: address already in use\n"
 
 	var report AdGuardReport
-	err := takeOverDNS(r, AdGuardOptions{RouterIP: "192.168.1.1", DNSTimeout: 50 * time.Millisecond}, &report)
+	err := takeOverDNS(r, AdGuardOptions{RouterIP: "192.168.1.1", DNSTimeout: 50 * time.Millisecond}, &report, false)
 	if err == nil {
 		t.Fatal("AdGuard never took port 53, so this must fail rather than report success")
 	}
@@ -118,7 +118,7 @@ func TestAFailedRollbackSaysTheHouseholdMayHaveNoDNS(t *testing.T) {
 	r.fail = map[string]error{"uci set dhcp.@dnsmasq[0].port=53": errors.New("uci is broken")}
 
 	var report AdGuardReport
-	err := takeOverDNS(r, AdGuardOptions{RouterIP: "192.168.1.1", DNSTimeout: 50 * time.Millisecond}, &report)
+	err := takeOverDNS(r, AdGuardOptions{RouterIP: "192.168.1.1", DNSTimeout: 50 * time.Millisecond}, &report, false)
 	if err == nil {
 		t.Fatal("want an error")
 	}
@@ -139,10 +139,11 @@ func TestAFailedRollbackSaysTheHouseholdMayHaveNoDNS(t *testing.T) {
 // When AdGuard already owns port 53, nothing should be touched at all.
 func TestWhenAdGuardAlreadyServesDNSNothingIsChanged(t *testing.T) {
 	r := &scriptedRunner{answers: map[string]string{
-		"netstat": "udp 0 0 0.0.0.0:53 0.0.0.0:* 5466/AdGuardHome\n",
+		"pgrep AdGuardHome": "yes\n",
+		"netstat":           "udp 0 0 0.0.0.0:53 0.0.0.0:* 5466/AdGuardHome\n",
 	}}
 	var report AdGuardReport
-	if err := takeOverDNS(r, AdGuardOptions{RouterIP: "192.168.1.1", DNSTimeout: 50 * time.Millisecond}, &report); err != nil {
+	if err := takeOverDNS(r, AdGuardOptions{RouterIP: "192.168.1.1", DNSTimeout: 50 * time.Millisecond}, &report, false); err != nil {
 		t.Fatalf("takeOverDNS: %v", err)
 	}
 	if !report.ServingDNS {
@@ -165,7 +166,7 @@ func TestAThirdPartyOnPortFiftyThreeIsRefused(t *testing.T) {
 		"netstat":                       "udp 0 0 0.0.0.0:53 0.0.0.0:* 999/unbound\n",
 	}}
 	var report AdGuardReport
-	err := takeOverDNS(r, AdGuardOptions{RouterIP: "192.168.1.1", DNSTimeout: 50 * time.Millisecond}, &report)
+	err := takeOverDNS(r, AdGuardOptions{RouterIP: "192.168.1.1", DNSTimeout: 50 * time.Millisecond}, &report, false)
 	if err == nil {
 		t.Fatal("a third-party resolver on port 53 must be refused")
 	}
@@ -178,7 +179,9 @@ func TestAThirdPartyOnPortFiftyThreeIsRefused(t *testing.T) {
 	// Refusing means refusing BEFORE acting. Restarting somebody's AdGuard and
 	// then waiting out the timeout would disrupt a working router to reach the
 	// same answer.
-	if r.didRun("AdGuardHome") || r.didRun("adguardhome") {
+	// Checked against the restart COMMANDS rather than the binary name, since
+	// a liveness probe legitimately mentions the process.
+	if r.didRun("killall AdGuardHome") || r.didRun("init.d/adguardhome restart") {
 		t.Errorf("AdGuard was restarted despite the refusal:\n%v", r.ran)
 	}
 }
@@ -213,14 +216,38 @@ func TestAnUnenabledServiceIsEnabled(t *testing.T) {
 	}
 }
 
-func TestDnsmasqPortDefaultsTo53WhenUnset(t *testing.T) {
-	r := &scriptedRunner{answers: map[string]string{"uci get": "\n"}}
-	port, err := dnsmasqPort(r)
-	if err != nil {
-		t.Fatal(err)
+func TestDnsmasqIsOnlyMovedOnEvidence(t *testing.T) {
+	// Listening on 53 right now: in the way.
+	listening := &scriptedRunner{answers: map[string]string{
+		"uci get": "\n",
+		"netstat": "udp 0 0 192.168.1.1:53 0.0.0.0:* 3872/dnsmasq\n",
+	}}
+	if got, err := dnsmasqIsInTheWay(listening); err != nil || !got {
+		t.Errorf("a dnsmasq listening on 53 is in the way; got %v err=%v", got, err)
 	}
-	if port != "53" {
-		t.Errorf("an unset dnsmasq port means the default, 53; got %q", port)
+	// Configured for 53 but not currently listening: still in the way, because
+	// it would take the port back at the next restart.
+	configured := &scriptedRunner{answers: map[string]string{
+		"uci get": "53\n", "netstat": "\n",
+	}}
+	if got, err := dnsmasqIsInTheWay(configured); err != nil || !got {
+		t.Errorf("a dnsmasq configured for 53 is in the way; got %v err=%v", got, err)
+	}
+	// Running on another port, with uci silent: NOT in the way. This is the
+	// case an earlier heuristic got wrong, reconfiguring a dnsmasq that was
+	// deliberately somewhere else.
+	elsewhere := &scriptedRunner{answers: map[string]string{
+		"uci get": "\n", "netstat": "\n",
+	}}
+	if got, err := dnsmasqIsInTheWay(elsewhere); err != nil || got {
+		t.Errorf("a dnsmasq that is not on 53 must be left alone; got %v err=%v", got, err)
+	}
+	// AdGuard already holding 53, uci silent: nothing to move.
+	adguard := &scriptedRunner{answers: map[string]string{
+		"uci get": "\n", "netstat": "udp 0 0 0.0.0.0:53 0.0.0.0:* 5466/AdGuardHome\n",
+	}}
+	if got, err := dnsmasqIsInTheWay(adguard); err != nil || got {
+		t.Errorf("AdGuard already has the port; nothing to move. got %v err=%v", got, err)
 	}
 }
 
@@ -240,5 +267,92 @@ func TestTheSummaryNeverClaimsFilteringThatIsNotHappening(t *testing.T) {
 		ServingDNS: true, MovedDnsmasq: true}
 	if !strings.Contains(working.Summary(), "owns DNS on port 53") {
 		t.Errorf("a working run should say so:\n%s", working.Summary())
+	}
+}
+
+// The exact state the live router was in when this was found, and the one the
+// previous version could not recover from: AdGuard STOPPED (which is what a
+// crash loop procd has given up on looks like), dnsmasq holding port 53, and
+// the config already carrying an admin account so nothing prompts a restart.
+//
+// The old ordering verified the admin API first, found nothing listening, and
+// gave up before it ever freed the port or started anything.
+func TestAStoppedAdGuardBehindDnsmasqIsStartedNotGivenUpOn(t *testing.T) {
+	r := &scriptedRunner{answers: map[string]string{
+		"pgrep AdGuardHome":             "no\n",
+		"uci get dhcp.@dnsmasq[0].port": "53\n",
+		"netstat":                       "tcp 0 0 192.168.1.1:53 0.0.0.0:* LISTEN 3872/dnsmasq\n",
+	}}
+	var report AdGuardReport
+	// It still fails here, because this dumb double never reports AdGuard
+	// taking the port. What matters is WHAT IT TRIED before failing.
+	err := takeOverDNS(r, AdGuardOptions{RouterIP: "192.168.1.1",
+		DNSTimeout: 50 * time.Millisecond}, &report, false)
+	if err == nil {
+		t.Fatal("the double never lets AdGuard take port 53, so this must fail")
+	}
+	if !r.didRun("uci set dhcp.@dnsmasq[0].port=54") {
+		t.Errorf("port 53 was never freed for AdGuard:\n%v", r.ran)
+	}
+	if !r.didRun("adguardhome") && !r.didRun("AdGuardHome -c") {
+		t.Errorf("AdGuard was never started:\n%v", r.ran)
+	}
+	// And having failed, the household must still have a resolver.
+	if !r.didRun("uci set dhcp.@dnsmasq[0].port=53") {
+		t.Errorf("dnsmasq was not put back, so the LAN would have NO DNS:\n%v", r.ran)
+	}
+}
+
+// A stopped AdGuard with the port already free must simply be started, without
+// touching dnsmasq at all.
+func TestAStoppedAdGuardWithAFreePortIsJustStarted(t *testing.T) {
+	r := &scriptedRunner{answers: map[string]string{
+		"pgrep AdGuardHome":             "no\n",
+		"uci get dhcp.@dnsmasq[0].port": "54\n",
+		"netstat":                       "\n",
+	}}
+	var report AdGuardReport
+	_ = takeOverDNS(r, AdGuardOptions{RouterIP: "192.168.1.1",
+		DNSTimeout: 50 * time.Millisecond}, &report, false)
+	if r.didRun("uci set") {
+		t.Errorf("dnsmasq was reconfigured despite port 53 being free:\n%v", r.ran)
+	}
+	if !r.didRun("adguardhome") && !r.didRun("AdGuardHome -c") {
+		t.Errorf("AdGuard was never started:\n%v", r.ran)
+	}
+}
+
+// Sequencing test for adoption itself, not just for its parts.
+//
+// Without this, removing the DNS takeover from adoption entirely still passed
+// every test in this file, because they all drive takeOverDNS directly. The
+// packet-path tests would have caught it, but only in the container, and a
+// wiring mistake deserves to fail in seconds.
+func TestAdoptionFreesPortFiftyThreeBeforeVerifyingAnything(t *testing.T) {
+	r := &scriptedRunner{answers: map[string]string{
+		"cat /opt/AdGuardHome/adguardhome.yaml": "http:\n  address: 0.0.0.0:3000\n" +
+			"users:\n- name: someone\n  password: $2a$10$x\ndns:\n  port: 53\n",
+		"pgrep AdGuardHome":             "no\n",
+		"uci get dhcp.@dnsmasq[0].port": "53\n",
+		"netstat":                       "tcp 0 0 192.168.1.1:53 0.0.0.0:* LISTEN 3872/dnsmasq\n",
+		"ls /etc/rc.d":                  "\n",
+	}}
+	// Fails, because nothing real is listening for the verification step. The
+	// assertions are about the ORDER of what it attempted.
+	_, err := adoptAdGuard(r, AdGuardOptions{
+		Enabled: true, User: "someone", Password: "theirs",
+		RouterIP: "127.0.0.1", DNSTimeout: 50 * time.Millisecond,
+	})
+	if err == nil {
+		t.Fatal("want a failure: nothing is actually serving in this test")
+	}
+	if !r.didRun("uci set dhcp.@dnsmasq[0].port=54") {
+		t.Errorf("adoption never tried to free port 53 for AdGuard:\n%v", r.ran)
+	}
+	if !r.didRun("/etc/init.d/adguardhome enable") {
+		t.Errorf("adoption left AdGuard unable to start at boot:\n%v", r.ran)
+	}
+	if !r.didRun("uci set dhcp.@dnsmasq[0].port=53") {
+		t.Errorf("adoption failed without restoring DNS for the household:\n%v", r.ran)
 	}
 }
