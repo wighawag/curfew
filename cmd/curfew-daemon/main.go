@@ -399,6 +399,10 @@ func setUpDNSRestrictions(opt options, sched schedule.FileStore, store registry.
 	return dnspolicy.NewManager(dnspolicy.Config{
 		Registry: store, Schedule: sched, Runner: shellrun.Local{}, API: api,
 		ListURL: listURL, LANInterface: opt.lan, Location: loc, Log: log,
+		// The daemon runs on the router, so it can ask the kernel whether
+		// AdGuard can afford a filter-engine rebuild before causing one. It
+		// could not, once, and the house lost DNS for it.
+		Headroom: dnspolicy.RouterHeadroom(),
 	})
 }
 

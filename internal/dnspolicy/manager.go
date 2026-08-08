@@ -32,6 +32,7 @@ type Manager struct {
 	schedule ScheduleStore
 	runner   Runner
 	api      API
+	mem      Headroom
 	listURL  string
 	lan      string
 	leases   string
@@ -72,6 +73,10 @@ type Config struct {
 	Schedule ScheduleStore
 	Runner   Runner
 	API      API
+	// Headroom decides whether the router can afford the filter-engine
+	// rebuild a filter-list write causes. Nil means unmeasured, and unmeasured
+	// means the write goes ahead.
+	Headroom Headroom
 	// ListURL is where AdGuard will fetch curfew's filter list. It must be an
 	// address the ROUTER can reach, since AdGuard fetches it from there.
 	ListURL string
@@ -111,7 +116,7 @@ func NewManager(c Config) *Manager {
 		leasePath = DefaultLeasePath
 	}
 	return &Manager{
-		registry: c.Registry, schedule: c.Schedule, runner: c.Runner, api: c.API,
+		registry: c.Registry, schedule: c.Schedule, runner: c.Runner, api: c.API, mem: c.Headroom,
 		listURL: c.ListURL, lan: c.LANInterface, leases: leasePath,
 		loc: loc, log: log, now: time.Now,
 		// Start from something AdGuard can fetch even before the first pass,
@@ -201,7 +206,7 @@ func (m *Manager) Tick() error {
 	m.served = desired.FilterList
 	m.mu.Unlock()
 
-	report, err := Reconcile(m.api, desired, m.listURL, changed)
+	report, err := Reconcile(m.api, desired, m.listURL, changed, m.mem)
 	m.mu.Lock()
 	m.lastReport = report
 	m.mu.Unlock()
@@ -214,6 +219,13 @@ func (m *Manager) Tick() error {
 			"added", report.ClientsAdded, "updated", report.ClientsUpdated,
 			"removed", report.ClientsRemoved, "list_changed", report.ListChanged,
 			"list_registered", report.ListRegistered, "refreshed", report.Refreshed)
+	}
+	if report.Deferred != "" {
+		m.log.Warn("a DNS filter change was NOT applied to AdGuard",
+			"why", report.Deferred,
+			"effect", "always-allowed sites and DNS restriction windows are as curfew "+
+				"last managed to publish them; schedules, budgets and manual blocks are "+
+				"unaffected")
 	}
 	if len(report.Unresolved) > 0 {
 		m.log.Warn("profiles with DNS restrictions that CANNOT be applied",

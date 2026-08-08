@@ -234,6 +234,11 @@ type Report struct {
 	// a boundary prompt rather than eventual: without it AdGuard's own update
 	// interval is 24 hours.
 	Refreshed bool
+	// Deferred says why a filter-list write was NOT made. It is set when the
+	// router cannot afford the engine rebuild the write would cause, and it
+	// must be surfaced: the restriction or exception is real in curfew's
+	// config and not yet real in AdGuard.
+	Deferred string
 	Unresolved,
 	PartiallyResolved []string
 }
@@ -241,7 +246,7 @@ type Report struct {
 // Changed reports whether anything at all was written.
 func (r Report) Changed() bool {
 	return len(r.ClientsAdded)+len(r.ClientsUpdated)+len(r.ClientsRemoved) > 0 ||
-		r.ListChanged || r.ListRegistered
+		r.ListChanged || r.ListRegistered || r.Refreshed
 }
 
 // API is the slice of AdGuard's REST interface this package needs. It is an
@@ -254,7 +259,10 @@ type API interface {
 	DeleteClient(name string) error
 	Filters() ([]adguard.FilterList, error)
 	AddFilterURL(name, url string) error
-	RefreshFilters() error
+	// RefreshFilterURL re-fetches ONE list, curfew's own. Refreshing all of
+	// them re-downloads every blocklist the household subscribes to, which
+	// OOM-killed AdGuard on the live router; see adguard.RefreshFilterURL.
+	RefreshFilterURL(name, url string) error
 	// Services is AdGuard's built-in catalogue, so a UI can offer what THIS
 	// AdGuard knows about rather than a list compiled into curfew that drifts
 	// from it.
@@ -267,7 +275,11 @@ type API interface {
 // daemon is now serving, which the caller has already swapped in: the order
 // matters, because AdGuard fetches the URL during both add_url and refresh, so
 // the new content has to be in place before either is called.
-func Reconcile(api API, d Desired, listURL string, listChanged bool) (Report, error) {
+//
+// mem gates the two calls that make AdGuard rebuild its filtering engine. A
+// nil mem means the caller has no way to measure the router, and the writes go
+// ahead; see Headroom for why that is the right default.
+func Reconcile(api API, d Desired, listURL string, listChanged bool, mem Headroom) (Report, error) {
 	report := Report{
 		ListChanged:       listChanged,
 		Unresolved:        d.Unresolved,
@@ -332,13 +344,31 @@ func Reconcile(api API, d Desired, listURL string, listChanged bool) (Report, er
 	if err != nil {
 		return report, err
 	}
-	registered := false
+	registered, enabled := false, false
 	for _, f := range filters {
 		if f.URL == listURL {
-			registered = true
+			registered, enabled = true, f.Enabled
 			break
 		}
 	}
+
+	// A curfew list found DISABLED is curfew's own doing: RefreshFilterURL
+	// disables and re-enables to make AdGuard re-fetch one list instead of all
+	// of them, so a daemon that died between the two halves leaves it off, and
+	// nothing else would ever turn it back on.
+	needsRefresh := listChanged || (registered && !enabled)
+
+	// The one place a filter-list write is refused. Both branches below make
+	// AdGuard rebuild its whole filtering engine, which is what killed it on
+	// the live router, so the affordability question is asked once, here,
+	// before either.
+	if mem != nil && (!registered && d.HasRules || needsRefresh) {
+		if why := mem.Short(); why != "" {
+			report.Deferred = why
+			return report, nil
+		}
+	}
+
 	if !registered {
 		if !d.HasRules {
 			// Nothing to publish, so nothing is registered. Every household
@@ -353,8 +383,8 @@ func Reconcile(api API, d Desired, listURL string, listChanged bool) (Report, er
 		// add_url fetches as part of validating, so the content is already in.
 		return report, nil
 	}
-	if listChanged {
-		if err := api.RefreshFilters(); err != nil {
+	if needsRefresh {
+		if err := api.RefreshFilterURL(adguard.FilterListName, listURL); err != nil {
 			return report, err
 		}
 		report.Refreshed = true

@@ -197,9 +197,9 @@ func TestReconcileWritesNothingWhenAdGuardAlreadyAgrees(t *testing.T) {
 	d := Compute(eliProfiles(), eliPinned, eliAddrs, at("09:00"))
 	api := &fakeAPI{
 		clients: []adguard.ClientObject{d.Clients["curfew-eli"]},
-		filters: []adguard.FilterList{{URL: "http://192.168.1.1:8080/x.txt"}},
+		filters: []adguard.FilterList{{URL: "http://192.168.1.1:8080/x.txt", Enabled: true}},
 	}
-	report, err := Reconcile(api, d, "http://192.168.1.1:8080/x.txt", false)
+	report, err := Reconcile(api, d, "http://192.168.1.1:8080/x.txt", false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestAHouseholdsOwnAdGuardClientIsNeverTouched(t *testing.T) {
 		BlockedServices: []string{"facebook"}}
 	api := &fakeAPI{clients: []adguard.ClientObject{theirs}}
 
-	if _, err := Reconcile(api, d, "http://192.168.1.1:8080/x.txt", true); err != nil {
+	if _, err := Reconcile(api, d, "http://192.168.1.1:8080/x.txt", true, nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, c := range api.calls {
@@ -256,7 +256,7 @@ func TestAStaleCurfewClientIsRemoved(t *testing.T) {
 		d.Clients["curfew-eli"],
 		{Name: "curfew-deleted-profile", IDs: []string{"192.168.1.9"}},
 	}}
-	report, err := Reconcile(api, d, "http://192.168.1.1:8080/x.txt", false)
+	report, err := Reconcile(api, d, "http://192.168.1.1:8080/x.txt", false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +271,7 @@ func TestAStaleCurfewClientIsRemoved(t *testing.T) {
 func TestTheListIsRegisteredWhenAdGuardDoesNotHaveIt(t *testing.T) {
 	d := Compute(eliProfiles(), eliPinned, eliAddrs, at("09:00"))
 	api := &fakeAPI{}
-	report, err := Reconcile(api, d, "http://192.168.1.1:8080/curfew.txt", false)
+	report, err := Reconcile(api, d, "http://192.168.1.1:8080/curfew.txt", false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,23 +289,118 @@ func TestAWindowBoundaryRefreshesTheList(t *testing.T) {
 	d := Compute(eliProfiles(), eliPinned, eliAddrs, at("09:00"))
 	api := &fakeAPI{
 		clients: []adguard.ClientObject{d.Clients["curfew-eli"]},
-		filters: []adguard.FilterList{{URL: "http://192.168.1.1:8080/curfew.txt"}},
+		filters: []adguard.FilterList{{URL: "http://192.168.1.1:8080/curfew.txt", Enabled: true}},
 	}
-	report, err := Reconcile(api, d, "http://192.168.1.1:8080/curfew.txt", true)
+	report, err := Reconcile(api, d, "http://192.168.1.1:8080/curfew.txt", true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !report.Refreshed {
 		t.Error("a changed list must be refreshed, or AdGuard picks it up in up to 24 hours")
 	}
+	// And it must be refreshed BY URL. Refreshing everything is what took the
+	// household's DNS down: see adguard.RefreshFilterURL.
+	if !contains(api.calls, "refresh http://192.168.1.1:8080/curfew.txt") {
+		t.Errorf("curfew's own list was not the thing refreshed: %v", api.calls)
+	}
 }
+
+// Re-fetching one list means disabling and re-enabling it, so a daemon that
+// dies between the two halves leaves curfew's list switched off in AdGuard.
+// Nothing else would ever switch it back on, and every exception in it would
+// be silently gone.
+func TestACurfewListLeftDisabledIsSwitchedBackOn(t *testing.T) {
+	d := Compute(eliProfiles(), eliPinned, eliAddrs, at("09:00"))
+	api := &fakeAPI{
+		clients: []adguard.ClientObject{d.Clients["curfew-eli"]},
+		filters: []adguard.FilterList{{URL: "http://192.168.1.1:8080/curfew.txt", Enabled: false}},
+	}
+	// Nothing changed this pass: the list text is exactly what is being served.
+	report, err := Reconcile(api, d, "http://192.168.1.1:8080/curfew.txt", false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Refreshed {
+		t.Errorf("a disabled curfew list was left disabled: %v", api.calls)
+	}
+	if !report.Changed() {
+		t.Error("switching the list back on is a change and must be reported as one")
+	}
+}
+
+// The guard that stops curfew doing to the household what it did on
+// 2026-08-08: a filter-list write forces AdGuard to rebuild its whole
+// filtering engine, and on a router that cannot afford the second copy the
+// kernel kills it and everyone loses DNS.
+func TestNoFilterListIsWrittenWhenTheRouterCannotAffordTheRebuild(t *testing.T) {
+	d := Compute(eliProfiles(), eliPinned, eliAddrs, at("09:00"))
+
+	// Registration, which is the more expensive of the two.
+	api := &fakeAPI{}
+	report, err := Reconcile(api, d, "http://192.168.1.1:8080/curfew.txt", false, shortMemory{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.ListRegistered {
+		t.Errorf("a list was registered on a router with no memory to rebuild: %v", api.calls)
+	}
+	if report.Deferred == "" {
+		t.Error("skipping the write SILENTLY is the worst of both: it must be reported")
+	}
+
+	// And the refresh.
+	api = &fakeAPI{
+		clients: []adguard.ClientObject{d.Clients["curfew-eli"]},
+		filters: []adguard.FilterList{{URL: "http://192.168.1.1:8080/curfew.txt", Enabled: true}},
+	}
+	report, err = Reconcile(api, d, "http://192.168.1.1:8080/curfew.txt", true, shortMemory{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Refreshed {
+		t.Errorf("a refresh was issued on a router with no memory to rebuild: %v", api.calls)
+	}
+
+	// THE CONTROL: with memory to spare the same pass does write, so this is
+	// not passing because filter writes are broken.
+	api = &fakeAPI{}
+	report, err = Reconcile(api, d, "http://192.168.1.1:8080/curfew.txt", false, roomyMemory{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.ListRegistered || report.Deferred != "" {
+		t.Errorf("a router with memory to spare was blocked anyway: %+v %v", report, api.calls)
+	}
+}
+
+// The clients half must NOT be blocked by the memory guard: an AdGuard client
+// object is a small write that causes no engine rebuild, and it is what keeps
+// a rule pointing at the right child after a device changes address.
+func TestTheMemoryGuardStillLetsClientObjectsThrough(t *testing.T) {
+	d := Compute(eliProfiles(), eliPinned, eliAddrs, at("09:00"))
+	api := &fakeAPI{}
+	if _, err := Reconcile(api, d, "http://192.168.1.1:8080/curfew.txt", true, shortMemory{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.added) == 0 {
+		t.Errorf("the memory guard also stopped curfew keeping its clients correct: %v", api.calls)
+	}
+}
+
+type shortMemory struct{}
+
+func (shortMemory) Short() string { return "no memory to rebuild the filtering engine" }
+
+type roomyMemory struct{}
+
+func (roomyMemory) Short() string { return "" }
 
 // A failure to reach AdGuard must surface, not be swallowed into a report that
 // says everything is fine.
 func TestAnAPIFailureIsReportedRatherThanSwallowed(t *testing.T) {
 	d := Compute(eliProfiles(), eliPinned, eliAddrs, at("09:00"))
 	api := &fakeAPI{failList: true}
-	if _, err := Reconcile(api, d, "http://x/y.txt", false); err == nil {
+	if _, err := Reconcile(api, d, "http://x/y.txt", false, nil); err == nil {
 		t.Fatal("an unreachable AdGuard must be an error")
 	}
 }
@@ -374,8 +469,8 @@ func (f *fakeAPI) AddFilterURL(name, url string) error {
 	return nil
 }
 
-func (f *fakeAPI) RefreshFilters() error {
-	f.calls = append(f.calls, "refresh")
+func (f *fakeAPI) RefreshFilterURL(name, url string) error {
+	f.calls = append(f.calls, "refresh "+url)
 	return nil
 }
 
@@ -451,7 +546,7 @@ func TestNoFilterListIsRegisteredWhenThereIsNothingToPublish(t *testing.T) {
 		t.Fatalf("baseline: this household has nothing to publish, got %q", d.FilterList)
 	}
 	api := &fakeAPI{}
-	report, err := Reconcile(api, d, "http://192.168.1.1:8080/curfew.txt", false)
+	report, err := Reconcile(api, d, "http://192.168.1.1:8080/curfew.txt", false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -470,7 +565,7 @@ func TestNoFilterListIsRegisteredWhenThereIsNothingToPublish(t *testing.T) {
 		t.Fatal("a restricted household must have rules to publish")
 	}
 	api = &fakeAPI{}
-	report, _ = Reconcile(api, d, "http://192.168.1.1:8080/curfew.txt", false)
+	report, _ = Reconcile(api, d, "http://192.168.1.1:8080/curfew.txt", false, nil)
 	if !report.ListRegistered {
 		t.Errorf("a household with restrictions never got its list: %v", api.calls)
 	}

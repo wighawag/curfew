@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -478,6 +479,30 @@ func TestASecondTickWithNothingChangedWritesNothing(t *testing.T) {
 	}
 }
 
+// disableFilter switches a subscribed list off through AdGuard's own API,
+// without going through the code under test.
+func disableFilter(t *testing.T, url string) {
+	t.Helper()
+	body := fmt.Sprintf(`{"url":%q,"whitelist":false,"data":{"name":%q,"url":%q,"enabled":false}}`,
+		url, adguard.FilterListName, url)
+	req, err := http.NewRequest(http.MethodPost,
+		"http://"+aghAPI+"/control/filtering/set_url", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth("parent", aghPwd)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		out, _ := io.ReadAll(resp.Body)
+		t.Fatalf("disabling %s: HTTP %d: %s", url, resp.StatusCode, out)
+	}
+}
+
 func hasClient(clients []adguard.ClientObject, name string) bool {
 	for _, c := range clients {
 		if c.Name == name {
@@ -639,4 +664,116 @@ func TestAnAllowedDomainOverridesABlockFromAnotherList(t *testing.T) {
 	// The control: the exception must not switch filtering off wholesale. The
 	// child's own restriction is still in force.
 	mustBlock(t, "control: the restriction still applies", v6EliA, v6Server, "twitch.tv")
+}
+
+// Publishing a change to curfew's own list must not re-download the
+// household's blocklists.
+//
+// This is the assertion that would have prevented a measured outage. On
+// 2026-08-08 at 13:16 a parent saved two always-allowed sites; curfew changed
+// its own 63-byte list and called POST /control/filtering/refresh, which has
+// no per-list scope and re-fetched all eight subscribed lists, 108 MB of them,
+// into an engine rebuild. AdGuard reached 876 MB on a 1010 MB box with no
+// swap, the kernel killed it, and the LAN had no resolver from 13:16:22 until
+// 13:17:50.
+//
+// The evidence here is a household list that COUNTS its own fetches, because
+// the defect is invisible in every other way: the rule lands correctly either
+// route, and only the router's memory can tell the difference.
+func TestPublishingCurfewsListDoesNotRefetchTheHouseholdsLists(t *testing.T) {
+	requireAdGuard(t)
+	startAdGuard(t)
+	api := adguard.NewClient(aghAPI, "parent", aghPwd)
+
+	var fetches atomic.Int64
+	household := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetches.Add(1)
+		io.WriteString(w, "! Title: pretend category list\n||opensea.io^\n")
+	}))
+	defer household.Close()
+	if err := api.AddFilterURL("pretend category list", household.URL+"/list.txt"); err != nil {
+		t.Fatalf("setting up the household's list: %v", err)
+	}
+
+	// BASELINE: the counter works and the list is really in force. Without
+	// this, "it was not re-fetched" could mean the server was never asked for
+	// anything at all.
+	if n := fetches.Load(); n != 1 {
+		t.Fatalf("baseline: the household's list should have been fetched once on add_url, got %d", n)
+	}
+	if v := lookupVerdict(t, v6EliA, v6Server, "opensea.io"); v != "BLOCKED" {
+		t.Fatalf("baseline: the household's list is not in force, got %s", v)
+	}
+
+	m, _ := newManagerUnderTest(t)
+	ps := eliAndTia()
+	m.schedule = memSchedule{ps}
+	m.now = func() time.Time { return atClock("09:00") }
+	if err := m.Tick(); err != nil {
+		t.Fatalf("registering tick: %v", err)
+	}
+	registered := fetches.Load()
+
+	// Now the exact action that caused the outage: a parent saves an
+	// always-allowed site, which changes curfew's list and nothing else.
+	ps.AllowedDomains = []string{"opensea.io"}
+	if err := m.Tick(); err != nil {
+		t.Fatalf("publishing tick: %v", err)
+	}
+	if !m.LastReport().Refreshed {
+		t.Fatalf("baseline: the changed list was never published at all: %+v", m.LastReport())
+	}
+
+	// It really was published: the exception beats the household's block.
+	mustResolve(t, "the exception was published", v6EliA, v6Server, "opensea.io")
+
+	// THE ASSERTION: and the household's 108 MB were left alone while doing it.
+	if n := fetches.Load(); n != registered {
+		t.Errorf("publishing curfew's own list re-fetched the household's list %d time(s); "+
+			"on the live router that is 108 MB of re-download and an engine rebuild that "+
+			"OOM-killed AdGuard", n-registered)
+	}
+}
+
+// A curfew list found DISABLED must be switched back on.
+//
+// Publishing one list means disabling and re-enabling it, so a daemon that
+// dies in between leaves curfew's list off in AdGuard, and every exception in
+// it silently stops applying. Asserted on the DNS path, from the child's own
+// address, because that is the only place "the exception applies" is true.
+func TestACurfewListLeftDisabledInAdGuardIsSwitchedBackOn(t *testing.T) {
+	requireAdGuard(t)
+	startAdGuard(t)
+	api := adguard.NewClient(aghAPI, "parent", aghPwd)
+
+	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "! Title: pretend category list\n||opensea.io^\n")
+	}))
+	defer blocked.Close()
+	if err := api.AddFilterURL("pretend category list", blocked.URL+"/list.txt"); err != nil {
+		t.Fatalf("setting up the blocking list: %v", err)
+	}
+
+	m, list := newManagerUnderTest(t)
+	ps := eliAndTia()
+	ps.AllowedDomains = []string{"opensea.io"}
+	m.schedule = memSchedule{ps}
+	m.now = func() time.Time { return atClock("09:00") }
+	if err := m.Tick(); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	mustResolve(t, "baseline: the exception applies", v6EliA, v6Server, "opensea.io")
+
+	// Simulate the daemon dying half way through publishing.
+	disableFilter(t, list.URL+FilterListPath)
+	if v := lookupVerdict(t, v6EliA, v6Server, "opensea.io"); v != "BLOCKED" {
+		t.Fatalf("baseline: disabling curfew's list should have removed the exception, got %s", v)
+	}
+
+	// Nothing about the household's configuration changed, so only the
+	// disabled list can bring curfew back.
+	if err := m.Tick(); err != nil {
+		t.Fatalf("recovering tick: %v", err)
+	}
+	mustResolve(t, "after recovery", v6EliA, v6Server, "opensea.io")
 }

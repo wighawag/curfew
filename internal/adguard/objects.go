@@ -213,8 +213,8 @@ func (c *Client) Filters() ([]FilterList, error) {
 // why curfew-daemon registers its own list after its HTTP server is listening
 // rather than at install time from a laptop.
 func (c *Client) AddFilterURL(name, url string) error {
-	code, resp, err := c.do(http.MethodPost, "/control/filtering/add_url",
-		map[string]any{"name": name, "url": url, "whitelist": false}, true)
+	code, resp, err := c.doFilter(http.MethodPost, "/control/filtering/add_url",
+		map[string]any{"name": name, "url": url, "whitelist": false})
 	if err != nil {
 		return fmt.Errorf("subscribing AdGuard to %s: %w", url, err)
 	}
@@ -226,21 +226,60 @@ func (c *Client) AddFilterURL(name, url string) error {
 	return nil
 }
 
-// RefreshFilters makes AdGuard re-fetch its subscribed lists now.
+// RefreshFilterURL makes AdGuard re-fetch ONE list: the one at url.
 //
 // This is what turns a served-list change into an applied one at a window
-// boundary. Measured: it re-fetched on every consecutive call, with no rate
-// limiting, and the new rules took effect within a few milliseconds of the
-// fetch.
-func (c *Client) RefreshFilters() error {
-	code, resp, err := c.do(http.MethodPost, "/control/filtering/refresh",
-		map[string]any{"whitelist": false}, true)
+// boundary, and the fact that it is one list rather than all of them is the
+// whole point.
+//
+// # Why not POST /control/filtering/refresh
+//
+// Because that endpoint has no per-list scope: it re-downloads and re-parses
+// EVERY subscribed blocklist. It cost a household its DNS. Measured on the
+// live router at 13:16 on 2026-08-08, saving two always-allowed domains
+// changed curfew's own 63-byte list, which called refresh, which re-fetched
+// all eight subscribed lists (108 MB, one of them 58 MB) into a rebuild of
+// AdGuard's whole filtering engine. AdGuard reached 876 MB on a 1010 MB box
+// with no swap, the kernel OOM-killed it, and the LAN had no resolver at all
+// from 13:16:22 until 13:17:50.
+//
+// AdGuard offers no "refresh this one", so this uses the one path that does
+// re-download a single list. Read from the v0.107.78 source rather than
+// guessed: POST /control/filtering/set_url lands in filterSetProperties,
+// which restarts the engine when Enabled changes and, on the transition back
+// to enabled, calls update() on THAT filter alone. So disable, then enable.
+// update() issues a plain unconditional GET, so the content really is
+// re-fetched rather than served from AdGuard's cache.
+//
+// The list is left DISABLED if the second call fails, which is why the error
+// says so and why Reconcile re-enables a curfew list it finds disabled.
+func (c *Client) RefreshFilterURL(name, url string) error {
+	if err := c.setFilterEnabled(name, url, false); err != nil {
+		return err
+	}
+	if err := c.setFilterEnabled(name, url, true); err != nil {
+		return fmt.Errorf("%w\n       curfew's own filter list is now DISABLED in "+
+			"AdGuard; the next pass re-enables it", err)
+	}
+	return nil
+}
+
+// setFilterEnabled flips one subscribed list on or off by URL.
+func (c *Client) setFilterEnabled(name, url string, enabled bool) error {
+	code, resp, err := c.doFilter(http.MethodPost, "/control/filtering/set_url",
+		map[string]any{
+			"url":       url,
+			"whitelist": false,
+			"data": map[string]any{
+				"name": name, "url": url, "enabled": enabled,
+			},
+		})
 	if err != nil {
-		return fmt.Errorf("refreshing AdGuard's filter lists: %w", err)
+		return fmt.Errorf("re-fetching curfew's own filter list (enabled=%t): %w", enabled, err)
 	}
 	if code != http.StatusOK {
-		return fmt.Errorf("refreshing AdGuard's filter lists: HTTP %d: %s", code,
-			strings.TrimSpace(string(resp)))
+		return fmt.Errorf("re-fetching curfew's own filter list (enabled=%t): HTTP %d: %s",
+			enabled, code, strings.TrimSpace(string(resp)))
 	}
 	return nil
 }

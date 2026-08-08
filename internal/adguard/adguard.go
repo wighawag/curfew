@@ -184,6 +184,13 @@ type Client struct {
 	User     string
 	Password string
 	HTTP     *http.Client
+	// FilterHTTP is used for the calls that make AdGuard DOWNLOAD a list and
+	// rebuild its filtering engine, which are the slow ones. Measured on the
+	// live router: a filter refresh had not answered after 10 seconds, so the
+	// ordinary client timed out and curfew logged a failure for an operation
+	// that was still running and went on to succeed. A misreported success is
+	// worse than a slow call, so these get their own, far longer, budget.
+	FilterHTTP *http.Client
 }
 
 // NewClient builds a client for a router address such as "192.168.1.1:3000".
@@ -193,14 +200,29 @@ func NewClient(addr, user, password string) *Client {
 		base = "http://" + base
 	}
 	return &Client{
-		BaseURL:  strings.TrimRight(base, "/"),
-		User:     user,
-		Password: password,
-		HTTP:     &http.Client{Timeout: 10 * time.Second},
+		BaseURL:    strings.TrimRight(base, "/"),
+		User:       user,
+		Password:   password,
+		HTTP:       &http.Client{Timeout: 10 * time.Second},
+		FilterHTTP: &http.Client{Timeout: 3 * time.Minute},
 	}
 }
 
+// doFilter issues a filter-list call, which AdGuard answers only after the
+// download and the engine rebuild are done. See Client.FilterHTTP.
+func (c *Client) doFilter(method, path string, body any) (int, []byte, error) {
+	hc := c.FilterHTTP
+	if hc == nil {
+		hc = c.HTTP
+	}
+	return c.doWith(hc, method, path, body, true)
+}
+
 func (c *Client) do(method, path string, body any, authed bool) (int, []byte, error) {
+	return c.doWith(c.HTTP, method, path, body, authed)
+}
+
+func (c *Client) doWith(hc *http.Client, method, path string, body any, authed bool) (int, []byte, error) {
 	var r io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -219,7 +241,7 @@ func (c *Client) do(method, path string, body any, authed bool) (int, []byte, er
 	if authed && c.User != "" {
 		req.SetBasicAuth(c.User, c.Password)
 	}
-	resp, err := c.HTTP.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
