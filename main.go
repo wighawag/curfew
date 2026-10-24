@@ -39,6 +39,9 @@ Usage:
   curfew pull <host> [flags]      merge the router's device list into yours
   curfew probe <host>             check the router's KERNEL still supports tickets
   curfew adopt-leases <host>      take over static DHCP leases written by something else
+  curfew set-ip <mac|name> <ip>   give a device a fixed address in your local list
+  curfew set-ip <mac|name> --clear
+                                  remove it (the device keeps the address it has)
   curfew version
 
 The host is an ssh destination, for example root@192.168.1.1.
@@ -72,6 +75,8 @@ func run(args []string) int {
 		err = cmdProbe(rest)
 	case "adopt-leases":
 		err = cmdAdoptLeases(rest)
+	case "set-ip":
+		err = cmdSetIP(rest)
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 		return 0
@@ -558,6 +563,28 @@ func cmdPush(args []string) error {
 			"'curfew push %s --force' to overwrite the router anyway", host, host)
 	}
 
+	// Fixed addresses are checked against the ROUTER's own DHCP config before
+	// anything is written, because only the router knows its subnet, its other
+	// host entries and who holds an address now. A clash is a refusal: two
+	// reservations for one address stop dnsmasq starting at all.
+	var addressNotes []string
+	if anyFixed(local) || anyFixed(remote) {
+		if err := requireFixedAddressSupport(daemonSupports(runner, "fixed-address"), local, host); err != nil {
+			return err
+		}
+		survey, err := leases.ReadSurvey(runner, leases.DefaultLeaseFile)
+		if err != nil {
+			return fmt.Errorf("cannot check the fixed addresses against the router, so nothing "+
+				"was pushed: %w", err)
+		}
+		errs, notes := checkPushAddresses(survey, local, remote)
+		if len(errs) > 0 {
+			return fmt.Errorf("nothing was pushed, because a fixed address would clash on %s:\n  %s\n"+
+				"       Fix it with 'curfew set-ip', then push again", host, strings.Join(errs, "\n  "))
+		}
+		addressNotes = notes
+	}
+
 	if err := deploy.Push(runner, *path); err != nil {
 		return err
 	}
@@ -566,6 +593,12 @@ func cmdPush(args []string) error {
 	}
 	_ = os.Remove(conflictPath(*path))
 	fmt.Printf("pushed %d device(s) to %s\n", len(local.Devices), host)
+	for _, n := range addressNotes {
+		fmt.Println(n)
+	}
+	if len(addressNotes) > 0 {
+		fmt.Println("The router pins fixed addresses on its next pass, within a minute.")
+	}
 
 	msg, err := syncProfiles(runner, *path, false, *force)
 	if err != nil {

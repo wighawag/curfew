@@ -99,23 +99,64 @@ func TestOutsideTheWindowNothingIsRestricted(t *testing.T) {
 	}
 }
 
-// The safety property, asserted directly: IPv4 comes ONLY from the pinned
-// lease. An observed IPv4 must never reach AdGuard, because DHCP reissues
-// addresses and a stale one would restrict the WRONG CHILD.
-func TestObservedIPv4NeverBecomesAClientID(t *testing.T) {
+// The safety property, as amended by ADR 0012: an IPv4 address is attributed
+// to a device only when the DHCP server attests that THIS MAC holds it (the
+// lease file), or when it is the device's pin and no OTHER MAC holds it. DHCP
+// reissues addresses, and an address credited to the wrong MAC would restrict
+// the WRONG CHILD.
+func TestAnIPv4HeldByAnotherDeviceIsNeverAttributedToThePinnedOwner(t *testing.T) {
 	observed := map[string]lanhosts.Addresses{
-		// A device with an observed IPv4 that curfew has NOT pinned.
-		"14:e0:1d:6a:9c:6c": {IPv4: "192.168.1.99", IPv6: []string{"fd96::1"}},
+		"14:e0:1d:6a:9c:6c": {IPv6: []string{"fd96::1"}},
+		// Somebody else, in no profile, holds eli's pinned address right now
+		// (a lease that predates the pin, or a fixed address just moved).
+		"aa:bb:cc:dd:ee:ff": {IPv4: "192.168.1.123"},
 	}
-	d := Compute(eliProfiles(), map[string]string{}, observed, at("09:00"))
+	d := Compute(eliProfiles(), eliPinned, observed, at("09:00"))
 	c := d.Clients["curfew-eli"]
-	if contains(c.IDs, "192.168.1.99") {
-		t.Errorf("an observed, unpinned IPv4 address reached AdGuard: %v", c.IDs)
+	if contains(c.IDs, "192.168.1.123") {
+		t.Errorf("an address another MAC holds was attributed to eli: %v", c.IDs)
 	}
-	// The control: the IPv6 address from the same observation IS used, so this
-	// is a deliberate split rather than the observation being ignored wholesale.
+	// The control: the IPv6 address from the same observation IS used.
 	if !contains(c.IDs, "fd96::1") {
 		t.Errorf("the observed IPv6 address should still be used: %v", c.IDs)
+	}
+}
+
+// The move window (ADR 0012). A device given a new fixed address keeps its old
+// lease until it renews, which is up to half the lease time. Both addresses
+// are its own for that window, so both carry its restriction: otherwise
+// changing an address would be a way to escape one.
+func TestDuringAMoveBothTheOldLeaseAndTheNewPinCarryTheRestriction(t *testing.T) {
+	observed := map[string]lanhosts.Addresses{
+		"14:e0:1d:6a:9c:6c": {IPv4: "192.168.1.226"}, // still on the old lease
+	}
+	pinned := map[string]string{"14:e0:1d:6a:9c:6c": "192.168.1.150"}
+	c := Compute(eliProfiles(), pinned, observed, at("09:00")).Clients["curfew-eli"]
+	if !contains(c.IDs, "192.168.1.226") || !contains(c.IDs, "192.168.1.150") {
+		t.Errorf("want both the leased and the pinned address during the move, got %v", c.IDs)
+	}
+}
+
+// After the renewal the old address is no longer this MAC's, so it leaves the
+// client on the very next pass and cannot follow a stranger who is given it.
+func TestAfterTheMoveTheOldAddressIsDropped(t *testing.T) {
+	observed := map[string]lanhosts.Addresses{
+		"14:e0:1d:6a:9c:6c": {IPv4: "192.168.1.150"},
+		"aa:bb:cc:dd:ee:ff": {IPv4: "192.168.1.226"}, // a stranger got the old one
+	}
+	pinned := map[string]string{"14:e0:1d:6a:9c:6c": "192.168.1.150"}
+	c := Compute(eliProfiles(), pinned, observed, at("09:00")).Clients["curfew-eli"]
+	if contains(c.IDs, "192.168.1.226") {
+		t.Errorf("the old address followed the device after it moved: %v", c.IDs)
+	}
+	n := 0
+	for _, id := range c.IDs {
+		if id == "192.168.1.150" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("want the new address exactly once, got %v", c.IDs)
 	}
 }
 

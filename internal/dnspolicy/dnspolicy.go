@@ -68,13 +68,16 @@ type Desired struct {
 
 // Compute works out what AdGuard should hold at t.
 //
-// pinned is MAC to the IPv4 address curfew's own static leases fix, and it is
-// the ONLY source of IPv4 here. observed is what the LAN currently shows, and
-// only its IPv6 half is used. That split is the safety asymmetry made
-// structural: a stale IPv4 is dangerous because DHCP reissues addresses and a
-// rule would land on the WRONG CHILD, so IPv4 comes from configuration curfew
-// owns; a stale IPv6 privacy address is nearly harmless because its interface
-// identifier is 64 random bits, so it can come from observation.
+// pinned is MAC to the IPv4 address curfew's own static leases fix. observed
+// is what the LAN currently shows: IPv6 from the neighbour table, and IPv4
+// ONLY from the DHCP server's lease file, never from ARP. An IPv4 address is
+// credited to a device only when the lease file says that MAC holds it, or
+// when it is the device's pin and no other MAC holds it (docs/adr/0012,
+// amending 0011). That is the safety asymmetry made structural: a stale IPv4
+// is dangerous because DHCP reissues addresses and a rule would land on the
+// WRONG CHILD, so an IPv4 address is only ever attributed on the DHCP
+// server's say-so; a stale IPv6 privacy address is nearly harmless because its
+// interface identifier is 64 random bits, so it can come from observation.
 func Compute(ps *schedule.Profiles, pinned map[string]string,
 	observed map[string]lanhosts.Addresses, t time.Time) Desired {
 
@@ -96,6 +99,16 @@ func Compute(ps *schedule.Profiles, pinned map[string]string,
 		}
 	}
 
+	// Who the DHCP server says holds each IPv4 address right now. IPv4 comes
+	// only from the lease file (lanhosts.Observe never reads ARP), which is
+	// the server's own record and cannot name two MACs for one address.
+	holder := map[string]string{}
+	for mac, a := range observed {
+		if a.IPv4 != "" {
+			holder[a.IPv4] = strings.ToLower(mac)
+		}
+	}
+
 	profiles := append([]schedule.Profile(nil), ps.Profiles...)
 	sort.Slice(profiles, func(i, j int) bool { return profiles[i].Name < profiles[j].Name })
 
@@ -110,9 +123,23 @@ func Compute(ps *schedule.Profiles, pinned map[string]string,
 		for _, mac := range p.Devices {
 			mac = strings.ToLower(mac)
 			has := false
-			if ip := pinned[mac]; ip != "" {
-				ids = append(ids, ip)
+			// IPv4, per docs/adr/0012 (amending 0011): an address is this
+			// device's if the lease file says THIS MAC holds it, or if it is
+			// the device's pin and no OTHER MAC holds it. So while a device
+			// moves to a new fixed address both its old lease and its new pin
+			// carry the restriction, the old one leaves as soon as the lease
+			// does, and an address somebody else holds is never credited to
+			// the pinned owner: that would restrict the wrong child.
+			leased := observed[mac].IPv4
+			if leased != "" {
+				ids = append(ids, leased)
 				has = true
+			}
+			if ip := pinned[mac]; ip != "" && ip != leased {
+				if h, held := holder[ip]; !held || h == mac {
+					ids = append(ids, ip)
+					has = true
+				}
 			}
 			for _, v6 := range observed[mac].IPv6 {
 				ids = append(ids, v6)

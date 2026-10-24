@@ -173,15 +173,18 @@ func normaliseMAC(mac string) string {
 	return strings.ToLower(strings.TrimSpace(mac))
 }
 
-// Device is a registered device that should be pinned, with the IPv4 address
-// it currently holds.
+// Device is a registered device that should be pinned.
 type Device struct {
 	MAC  string
 	Name string
-	// IP is the address to pin. Empty means the device has no known address,
-	// in which case it is NOT pinned and is reported instead. Inventing one
-	// from a reserved range is deliberately not done: see Plan.
+	// IP is the IPv4 address the device holds right now, from the DHCP lease
+	// file. Empty means it has no lease this pass (it is off, it released, or
+	// the router rebooted and /tmp/dhcp.leases is empty), which is NOT a
+	// reason to drop a pin curfew already owns: see Reconcile.
 	IP string
+	// Fixed is the household's chosen address for the device (registry.Device
+	// IP), already screened against the LAN by ScreenFixed. Empty means none.
+	Fixed string
 }
 
 // Plan is what a reconcile decided to do, and why.
@@ -198,12 +201,19 @@ type Plan struct {
 	// YIELDS to these: it writes no competing entry (two static leases for one
 	// MAC is a broken dnsmasq config) and it removes nothing.
 	Conflicts []Conflict
-	// Unaddressed are registered devices with no known IP, so nothing could be
-	// pinned for them.
+	// Refused are addresses curfew would have pinned and did not, because
+	// another host entry or another device already has them, or because the
+	// address is not valid on this LAN. Two dhcp-host lines for one address
+	// stop dnsmasq starting at all (measured, dnsmasq 2.91), so a clash is
+	// always a refusal and never a write.
+	Refused []Refusal
+	// Unaddressed are registered devices with no known IP and no pin, so
+	// nothing could be pinned for them.
 	Unaddressed []string
 	// Pinned maps MAC to the IPv4 address curfew is confident about, INCLUDING
-	// addresses owned by a foreign entry. A foreign pin is still a pin, and
-	// using it costs nothing while refusing to would throw away a fact.
+	// addresses owned by a foreign entry and pins kept for a device that is
+	// offline. A foreign pin is still a pin, and using it costs nothing while
+	// refusing to would throw away a fact.
 	Pinned map[string]string
 }
 
@@ -214,18 +224,52 @@ type Conflict struct {
 	IP      string
 }
 
+// Refusal is an address curfew declined to pin for a device.
+type Refusal struct {
+	MAC    string
+	IP     string
+	Reason string
+}
+
 // Reconcile works out how to make the router's host entries match the devices,
 // preserving everything curfew does not own.
 //
-// The address pinned is the one the device ALREADY HOLDS, never one allocated
-// from a reserved range. That choice is made against the real lease data: all
-// 21 registered devices on this household's router currently sit inside the
-// DHCP pool (192.168.1.100-249), so a reserved block would move every one of
-// them and, with a 12 hour lease, would leave the household in a half-migrated
-// state for up to half a day with no way to tell which half a given device was
-// in. Pinning what a device already has converges instantly and disturbs
-// nothing. dnsmasq honours a static lease that falls inside its own pool, so
-// being in-pool is not an obstacle.
+// # Which address a device is pinned at
+//
+// In order of precedence: its FIXED ADDRESS when the household chose one; else
+// the address it holds right now; else the pin curfew already owns for it,
+// kept unchanged; else nothing, and it is reported as unaddressed.
+//
+// The observed address is pinned rather than one allocated from a reserved
+// range. That choice is made against the real lease data: all 21 registered
+// devices on this household's router sat inside the DHCP pool
+// (192.168.1.100-249), so a reserved block would move every one of them and,
+// with a 12 hour lease, would leave the household half-migrated for up to half
+// a day. Pinning what a device already has converges instantly and disturbs
+// nothing; dnsmasq honours a static lease inside its own pool.
+//
+// # A pin survives its device being away, and that is a scar
+//
+// This used to delete a pin as "stale" whenever the device had no lease this
+// pass. A router reboot empties /tmp/dhcp.leases and a lease also leaves it on
+// expiry or release, so every pin of every device not online at that moment
+// was swept, and the device was re-pinned wherever it next came back. That is
+// how shyrka lost 192.168.1.150 (the service bound to it went down) and how the
+// printer lost 192.168.1.10, and the live router showed 28 registered devices
+// with no pin at all. A pin is now removed ONLY when its device is
+// deregistered. See docs/adr/0012.
+//
+// # No address is ever reserved twice
+//
+// Measured with dnsmasq 2.91: two dhcp-host lines for one address are not a
+// skipped entry, they are `duplicate dhcp-host IP address` and dnsmasq refuses
+// to start, so the whole household loses DHCP. So an address another host
+// entry already has (a foreign one, or another device's pin even while that
+// device is offline) is refused rather than taken, and the device falls back
+// to the next address in its precedence. A fixed address never displaces
+// another device's pin: that would silently move the other device on its next
+// renewal. Two devices given the same fixed address are both refused, rather
+// than one winning by MAC order.
 //
 // # curfew writes NO hostname, and that is a scar rather than a preference
 //
@@ -244,11 +288,10 @@ type Conflict struct {
 // nice feature and is deliberately NOT smuggled in as part of a fix: it needs
 // its own collision rules and its own tests.
 //
-// A device with no known address is NOT given one. The alternative, allocating
-// from a reserved range, would hand out an address the device does not have
-// and cannot be told about until its next DHCP renewal, so the AdGuard rule
-// keyed to it would match nothing while looking entirely correct. Reporting is
-// strictly better than a rule that silently does not apply.
+// A device with no known address and no pin is NOT given one. Allocating from
+// a reserved range would hand out an address the device does not have and
+// cannot be told about until its next DHCP renewal, so the AdGuard rule keyed
+// to it would match nothing while looking entirely correct.
 func Reconcile(current []Host, devices []Device) Plan {
 	plan := Plan{Pinned: map[string]string{}}
 
@@ -269,41 +312,131 @@ func Reconcile(current []Host, devices []Device) Plan {
 		}
 	}
 
-	wanted := map[string]bool{}
-	sorted := append([]Device(nil), devices...)
+	sorted := make([]Device, 0, len(devices))
+	for _, d := range devices {
+		d.MAC = normaliseMAC(d.MAC)
+		d.IP = strings.TrimSpace(d.IP)
+		d.Fixed = strings.TrimSpace(d.Fixed)
+		if d.MAC != "" {
+			sorted = append(sorted, d)
+		}
+	}
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].MAC < sorted[j].MAC })
-
+	registered := map[string]bool{}
 	for _, d := range sorted {
-		mac := normaliseMAC(d.MAC)
-		if mac == "" {
+		registered[d.MAC] = true
+	}
+
+	// claims records who holds each address before anything moves: every
+	// foreign entry, and every pin curfew owns for a device still registered.
+	// A device may take an address that is unclaimed or claimed by itself.
+	type claim struct{ mac, by string }
+	claims := map[string]claim{}
+	for _, h := range current {
+		if h.MAC == "" || h.IP == "" {
 			continue
 		}
-		if f, clash := foreign[mac]; clash {
+		if h.Owned() && !registered[h.MAC] {
+			continue // about to be removed, so it holds nothing
+		}
+		if _, taken := claims[h.IP]; !taken {
+			by := "the host entry dhcp." + h.Section
+			if h.Owned() {
+				by = "the pin curfew owns for " + h.MAC
+			}
+			claims[h.IP] = claim{mac: h.MAC, by: by}
+		}
+	}
+	free := func(mac, ip string) (bool, string) {
+		c, taken := claims[ip]
+		if !taken || c.mac == mac {
+			return true, ""
+		}
+		return false, c.by
+	}
+	take := func(mac, ip, by string) { claims[ip] = claim{mac: mac, by: by} }
+
+	fixedCount := map[string]int{}
+	for _, d := range sorted {
+		if _, yields := foreign[d.MAC]; !yields && d.Fixed != "" {
+			fixedCount[d.Fixed]++
+		}
+	}
+
+	chosen := map[string]string{}
+	refuse := func(mac, ip, why string) {
+		plan.Refused = append(plan.Refused, Refusal{MAC: mac, IP: ip, Reason: why})
+	}
+
+	// Phase 1: fixed addresses claim first, so a device merely HOLDING
+	// somebody's fixed address in the lease file cannot be pinned there.
+	for _, d := range sorted {
+		if _, yields := foreign[d.MAC]; yields || d.Fixed == "" {
+			continue
+		}
+		if fixedCount[d.Fixed] > 1 {
+			refuse(d.MAC, d.Fixed, fmt.Sprintf("%s is the fixed address of more than one device", d.Fixed))
+			continue
+		}
+		if ok, by := free(d.MAC, d.Fixed); !ok {
+			refuse(d.MAC, d.Fixed, fmt.Sprintf("%s is already reserved by %s", d.Fixed, by))
+			continue
+		}
+		chosen[d.MAC] = d.Fixed
+		take(d.MAC, d.Fixed, "the fixed address of "+d.MAC)
+	}
+
+	// Phase 2: everything else, observed address first, then the pin it has.
+	for _, d := range sorted {
+		if f, clash := foreign[d.MAC]; clash {
 			// Somebody else already pins this MAC. Yield, report, and still
 			// USE the address: it is a fact about where this device is, and
 			// refusing to read it would only make the refinement worse.
-			plan.Conflicts = append(plan.Conflicts, Conflict{MAC: mac, Section: f.Section, IP: f.IP})
+			plan.Conflicts = append(plan.Conflicts, Conflict{MAC: d.MAC, Section: f.Section, IP: f.IP})
 			if f.IP != "" {
-				plan.Pinned[mac] = f.IP
+				plan.Pinned[d.MAC] = f.IP
 			}
 			continue
 		}
-		if strings.TrimSpace(d.IP) == "" {
-			plan.Unaddressed = append(plan.Unaddressed, mac)
+		if _, done := chosen[d.MAC]; done {
 			continue
 		}
-		section := SectionFor(mac)
-		wanted[section] = true
-		plan.Pinned[mac] = d.IP
+		if d.IP != "" {
+			if ok, by := free(d.MAC, d.IP); ok {
+				chosen[d.MAC] = d.IP
+				take(d.MAC, d.IP, "the pin curfew owns for "+d.MAC)
+				continue
+			} else if have, exists := owned[d.MAC]; !exists || have.IP != d.IP {
+				refuse(d.MAC, d.IP, fmt.Sprintf("%s is held in the lease file, but already reserved by %s", d.IP, by))
+			}
+		}
+		if have, exists := owned[d.MAC]; exists && have.IP != "" {
+			chosen[d.MAC] = have.IP // claimed by this MAC already, so free
+			continue
+		}
+		if d.IP == "" && d.Fixed == "" {
+			plan.Unaddressed = append(plan.Unaddressed, d.MAC)
+		}
+	}
 
-		have, exists := owned[mac]
-		if exists && have.Section == section && have.IP == d.IP && have.Name == "" {
+	wanted := map[string]bool{}
+	for _, d := range sorted {
+		ip, ok := chosen[d.MAC]
+		if !ok {
+			continue
+		}
+		section := SectionFor(d.MAC)
+		wanted[section] = true
+		plan.Pinned[d.MAC] = ip
+
+		have, exists := owned[d.MAC]
+		if exists && have.Section == section && have.IP == ip && have.Name == "" {
 			continue // already correct: emit nothing, so a re-run is a no-op
 		}
 		plan.Commands = append(plan.Commands,
 			fmt.Sprintf("uci set dhcp.%s=host", section),
-			fmt.Sprintf("uci set dhcp.%s.mac=%s", section, shellQuote(mac)),
-			fmt.Sprintf("uci set dhcp.%s.ip=%s", section, shellQuote(d.IP)),
+			fmt.Sprintf("uci set dhcp.%s.mac=%s", section, shellQuote(d.MAC)),
+			fmt.Sprintf("uci set dhcp.%s.ip=%s", section, shellQuote(ip)),
 			fmt.Sprintf("uci set dhcp.%s.%s=1", section, MarkerOption),
 			// NO name. See the comment on Reconcile: a device name is free
 			// text from a web form and dnsmasq requires a DNS hostname here,
@@ -317,8 +450,10 @@ func Reconcile(current []Host, devices []Device) Plan {
 		)
 	}
 
-	// Remove entries curfew owns that no longer correspond to a device: a
-	// deregistered device must not keep a reserved address for ever.
+	// Remove entries curfew owns that no longer correspond to a REGISTERED
+	// device: a deregistered device must not keep a reserved address for ever.
+	// A registered device that is merely offline keeps its pin (see above),
+	// and one that yields to a foreign entry loses curfew's competing one.
 	stale := make([]string, 0, len(owned))
 	for _, h := range owned {
 		if !wanted[h.Section] {
@@ -333,6 +468,7 @@ func Reconcile(current []Host, devices []Device) Plan {
 
 	sort.Strings(plan.Unaddressed)
 	sort.Slice(plan.Conflicts, func(i, j int) bool { return plan.Conflicts[i].MAC < plan.Conflicts[j].MAC })
+	sort.SliceStable(plan.Refused, func(i, j int) bool { return plan.Refused[i].MAC < plan.Refused[j].MAC })
 	return plan
 }
 

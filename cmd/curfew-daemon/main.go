@@ -35,6 +35,7 @@ import (
 	"github.com/wighawag/curfew/internal/httpui"
 	"github.com/wighawag/curfew/internal/kernelprobe"
 	"github.com/wighawag/curfew/internal/lanhosts"
+	"github.com/wighawag/curfew/internal/leases"
 	"github.com/wighawag/curfew/internal/policy"
 	"github.com/wighawag/curfew/internal/registry"
 	"github.com/wighawag/curfew/internal/schedule"
@@ -114,6 +115,10 @@ func run(args []string, stderr *os.File) int {
 	fs.StringVar(&opt.routerIP, "router-ip", envOr("CURFEW_ROUTER_IP", "127.0.0.1"),
 		"the address AdGuard should fetch curfew's filter list from")
 	showVersion := fs.Bool("version", false, "print the version and exit")
+	showFeatures := fs.Bool("features", false,
+		"print the registry features this daemon understands, one per line, and exit. "+
+			"'curfew push' asks, because an older daemon would drop a field it does not know "+
+			"the next time its page saved the device list")
 	probe := fs.Bool("probe", false,
 		"measure whether this KERNEL supports what tickets rely on, then exit. "+
 			"Safe on a live router: it works in its own table with no chain and no hook")
@@ -123,6 +128,13 @@ func run(args []string, stderr *os.File) int {
 
 	if *showVersion {
 		fmt.Println(version)
+		return 0
+	}
+
+	if *showFeatures {
+		for _, f := range features {
+			fmt.Println(f)
+		}
 		return 0
 	}
 
@@ -238,6 +250,11 @@ func run(args []string, stderr *os.File) int {
 	ui.UseLANSightings(func() (map[string]lanhosts.Sighting, error) {
 		return lanhosts.ObserveSightings(shellrun.Local{}, dnspolicy.DefaultLeasePath, opt.lan)
 	})
+	// So the devices page can set a fixed address with exactly the checks
+	// 'curfew push' runs, against this router's own uci and lease file.
+	ui.UseAddresses(func() (leases.Survey, error) {
+		return leases.ReadSurvey(shellrun.Local{}, dnspolicy.DefaultLeasePath)
+	})
 	if dns != nil {
 		ui.ServeFilterList(dnspolicy.FilterListPath, dns.FilterList)
 		// So the settings page can offer AdGuard's own service catalogue
@@ -263,7 +280,10 @@ func run(args []string, stderr *os.File) int {
 
 	go reconcileLoop(ctx, log, core, opt.reconcile)
 	if dns != nil {
+		// The DNS layer pins leases itself, because it needs the result.
 		go dnsLoop(ctx, log, dns, opt.reconcile)
+	} else {
+		go leaseLoop(ctx, log, store, opt.reconcile)
 	}
 
 	errCh := make(chan error, 1)
@@ -465,6 +485,48 @@ func dnsLoop(ctx context.Context, log *slog.Logger, m *dnspolicy.Manager, every 
 				log.Error("DNS restrictions could not be applied; the firewall is unaffected",
 					"error", err)
 			}
+		}
+	}
+}
+
+// features are the registry fields this daemon understands. 'curfew push'
+// refuses to send a fixed address to a daemon that does not list
+// "fixed-address", because that daemon's page would drop the field on its next
+// save and the next pull would read that as the household clearing it.
+var features = []string{"fixed-address"}
+
+// leaseLoop keeps the fixed addresses pinned when the AdGuard layer is off.
+//
+// A fixed address is a DHCP promise (a service bound to that literal address
+// depends on it), so it must not depend on AdGuard. With AdGuard off no NEW pin
+// is taken from an observed address, because nothing would use it; pins curfew
+// already owns are kept for registered devices and removed for deregistered
+// ones, exactly as when AdGuard is on.
+func leaseLoop(ctx context.Context, log *slog.Logger, store registry.FileStore, every time.Duration) {
+	if every <= 0 {
+		return
+	}
+	pass := func() {
+		reg, err := store.Load()
+		if err != nil {
+			log.Warn("cannot read the registry, so no lease was pinned this pass", "error", err)
+			return
+		}
+		devices := make([]leases.Device, 0, len(reg.Devices))
+		for _, d := range reg.Devices {
+			devices = append(devices, leases.Device{MAC: d.MAC, Name: d.Name, Fixed: d.IP})
+		}
+		leases.PassAndLog(shellrun.Local{}, log, devices)
+	}
+	pass()
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pass()
 		}
 	}
 }

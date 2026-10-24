@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -23,6 +24,13 @@ import (
 type Device struct {
 	MAC  string `json:"mac"`
 	Name string `json:"name,omitempty"`
+	// IP is the device's FIXED ADDRESS: an IPv4 address the household chose,
+	// which curfew pins as the device's static DHCP lease. Empty means curfew
+	// pins whatever address the device already holds (docs/adr/0011). It is
+	// checked against the router's own DHCP config before any uci write
+	// (leases.Survey.CheckFixed), because only the router knows its subnet
+	// and who else holds an address. See docs/adr/0012.
+	IP string `json:"ip,omitempty"`
 }
 
 // Registry is the whole device file.
@@ -119,6 +127,94 @@ func (r *Registry) Rename(mac, name string) error {
 	return fmt.Errorf("%w: %s", ErrNotFound, canonical)
 }
 
+// NormaliseIPv4 parses a fixed address and returns its canonical dotted-quad
+// form. An IPv4-mapped IPv6 spelling is the same address and is accepted; any
+// other IPv6 address, a prefix or a hostname is refused, because a static
+// DHCP lease is one IPv4 address and nothing else.
+func NormaliseIPv4(s string) (string, error) {
+	a, err := netip.ParseAddr(strings.TrimSpace(s))
+	if err != nil {
+		return "", fmt.Errorf("%q is not an IPv4 address", s)
+	}
+	a = a.Unmap()
+	if !a.Is4() {
+		return "", fmt.Errorf("%q is not an IPv4 address", s)
+	}
+	return a.String(), nil
+}
+
+// SetIP sets a device's fixed address, or clears it when ip is empty.
+//
+// It is STRICT like Rename, for the same reason: setting an address on a MAC
+// that is not registered must not quietly register it, because registering
+// is handing out internet access. It also refuses an address another device
+// in this registry already has, so a typo is caught where it was made rather
+// than on the router; the router-side checks still run before any write,
+// since only the router knows its subnet and its other host entries.
+func (r *Registry) SetIP(mac, ip string) error {
+	canonical, err := NormaliseMAC(mac)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(ip) != "" {
+		if ip, err = NormaliseIPv4(ip); err != nil {
+			return err
+		}
+		for _, d := range r.Devices {
+			if d.MAC != canonical && d.IP == ip {
+				return fmt.Errorf("%s is already the fixed address of %s", ip, describeDevice(d))
+			}
+		}
+	} else {
+		ip = ""
+	}
+	for i := range r.Devices {
+		if r.Devices[i].MAC == canonical {
+			r.Devices[i].IP = ip
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s", ErrNotFound, canonical)
+}
+
+// Resolve finds a registered device by MAC, or by name when the reference is
+// not a MAC. Names are free text and need not be unique, so an ambiguous name
+// is refused with the candidates listed rather than resolved to whichever
+// device happens to come first. Matching a name is case-insensitive.
+func (r *Registry) Resolve(ref string) (string, error) {
+	if canonical, err := NormaliseMAC(ref); err == nil {
+		for _, d := range r.Devices {
+			if d.MAC == canonical {
+				return canonical, nil
+			}
+		}
+		return "", fmt.Errorf("%w: %s", ErrNotFound, canonical)
+	}
+	want := strings.TrimSpace(ref)
+	var matches []string
+	for _, d := range r.Devices {
+		if d.Name != "" && strings.EqualFold(d.Name, want) {
+			matches = append(matches, d.MAC)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("%w: no device named %q", ErrNotFound, want)
+	case 1:
+		return matches[0], nil
+	}
+	sort.Strings(matches)
+	return "", fmt.Errorf("%d devices are named %q (%s); give the MAC instead",
+		len(matches), want, strings.Join(matches, ", "))
+}
+
+func describeDevice(d Device) string {
+	if d.Name == "" {
+		return d.MAC
+	}
+	return fmt.Sprintf("%s (%s)", d.Name, d.MAC)
+}
+
 // Remove deregisters a device, which also removes it from the allowlist.
 func (r *Registry) Remove(mac string) error {
 	canonical, err := NormaliseMAC(mac)
@@ -171,6 +267,15 @@ func Load(path string) (*Registry, error) {
 			return nil, fmt.Errorf("parsing %s: device %d: %w", path, i, err)
 		}
 		r.Devices[i].MAC = canonical
+		// Canonicalise a fixed address that parses; KEEP one that does not.
+		// Refusing to load would refuse the whole allowlist over a field that
+		// only matters to DHCP, taking the household offline. A bad value is
+		// instead refused by the checks that run before any uci write.
+		if r.Devices[i].IP != "" {
+			if ip, err := NormaliseIPv4(r.Devices[i].IP); err == nil {
+				r.Devices[i].IP = ip
+			}
+		}
 	}
 	return &r, nil
 }

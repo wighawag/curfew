@@ -65,6 +65,8 @@ ssh root@192.168.1.1 "ifstatus wan | grep l3_device"
 | `curfew pull <host>` | laptop | Merge the router's device list into yours |
 | `curfew probe <host>` | laptop | Check the router's kernel still supports tickets |
 | `curfew adopt-leases <host>` | laptop | Take over static DHCP leases written by something else |
+| `curfew set-ip <mac\|name> <ip>` | laptop | Give a device a fixed address in your local list; `curfew push` applies it |
+| `curfew set-ip <mac\|name> --clear` | laptop | Remove a device's fixed address (it keeps the address it has now) |
 | `curfew version` | laptop | Print the version |
 | `curfew-daemon -version` | router | Print the version running on the router |
 
@@ -170,9 +172,9 @@ Both are set up from the **settings page**, not by hand. Under each profile, *we
 
 If you are migrating from the shell scripts, they may have left static leases of their own. `curfew adopt-leases <host>` shows you every one whose MAC is a registered device and, with `-yes`, hands it to curfew at the same address, so the device does not move. Without it, curfew leaves such an entry strictly alone and reports it as a conflict on every pass. Entries for devices curfew does not know about are never offered and never touched.
 
-To make this possible curfew **pins a static DHCP lease** for each registered device, because AdGuard identifies a client by IP and cannot be keyed by MAC at all. It writes those as uci entries named `dhcp.curfew_<mac>`, and it owns **only** those: any host entry you or anything else created is left exactly as it was, which a test asserts against a real `/etc/config/dhcp`.
+To make this possible curfew **pins a static DHCP lease** for each registered device, because AdGuard identifies a client by IP and cannot be keyed by MAC at all. It writes those as uci entries named `dhcp.curfew_<mac>`, and it owns **only** those: any host entry you or anything else created is left exactly as it was, which a test asserts against a real `/etc/config/dhcp`. A pin stays put while its device is switched off or the router reboots, and is removed only when you remove the device.
 
-**IPv6 matters here more than it looks.** On this household's router roughly half of all DNS queries arrive over IPv6, including a child's phone, so a rule keyed only to an IPv4 lease would look completely correct and do nothing for half the traffic. curfew therefore adds the device's current IPv6 addresses to the same AdGuard client, read from the router's neighbour table. The two families are treated differently on purpose: IPv4 comes only from the lease curfew pinned, because DHCP reissues addresses and a stale one would restrict the *wrong child*, while a rotating IPv6 privacy address is safe to follow because it is never reused. The reasoning and the measurements are in `docs/adr/0011-curfew-pins-ipv4-leases-and-follows-ipv6-to-identify-a-device-to-adguard.md`.
+**IPv6 matters here more than it looks.** On this household's router roughly half of all DNS queries arrive over IPv6, including a child's phone, so a rule keyed only to an IPv4 lease would look completely correct and do nothing for half the traffic. curfew therefore adds the device's current IPv6 addresses to the same AdGuard client, read from the router's neighbour table. The two families are treated differently on purpose: an IPv4 address is credited to a device only when the router's DHCP server says that device holds it, or it is the device's pin and nobody else holds it, because DHCP reissues addresses and a stale one would restrict the *wrong child*. A rotating IPv6 privacy address is safe to follow because it is never reused. The reasoning and the measurements are in `docs/adr/0011-curfew-pins-ipv4-leases-and-follows-ipv6-to-identify-a-device-to-adguard.md`.
 
 If a device has no known address, its profile's restrictions **do not apply to it**, and the daemon says so in the log rather than pretending otherwise. Schedules, budgets and manual blocks are unaffected, because those are the firewall and never consult an IP address.
 
@@ -183,6 +185,20 @@ What it does **not** close: a DoH endpoint entered as a bare IP address, a hardc
 One more limit: a child who **copies a sibling's registered MAC** inherits that sibling's access and restrictions, which no MAC allowlist can see. (A child who *randomises* their MAC is already handled: an unknown MAC matches nothing and is dropped, so they lose the internet entirely.)
 
 This feature needs AdGuard credentials in the daemon's settings file. `curfew install` writes them; `curfew update` deliberately never rewrites that file, so on a router set up before this existed the feature stays off, and `update` tells you so and tells you that one `curfew install` turns it on.
+
+### Fixed addresses
+
+Some devices need an address you choose: a server something else reaches by its literal address, a printer, a firewall exemption. Give one a **fixed address**:
+
+```sh
+curfew set-ip shyrka 192.168.1.150     # by name or by MAC, edits your local list
+curfew push root@192.168.1.1           # checks it against the router, then applies it
+curfew set-ip shyrka --clear           # remove it again; the device keeps the address it has
+```
+
+Or set it on the devices page, which runs the same checks. Before anything is written, curfew refuses an address outside the LAN (read from the router's own `network.lan`, not assumed), the network or broadcast address, the router's own address, and any address another host entry or device already has. That last one is not fussiness: dnsmasq refuses to start at all on two reservations for one address (measured), which would cost the whole house DHCP. It also tells you when the address is inside the DHCP pool (allowed: dnsmasq honours it) and when another device still holds it.
+
+The device moves on its **next DHCP renewal**, and push says roughly when. To move it straight away, renew on the device (`networkctl renew <interface>`, `dhcpcd -n <interface>`) or reconnect its Wi-Fi or cable. While it moves, any DNS restriction applies to both its old and its new address, so changing a child's address is not a way out of a restriction. Fixed addresses work with or without AdGuard. Push refuses to send one to a daemon too old to understand it, so run `curfew update` first. The decisions are in `docs/adr/0012-a-pin-outlives-its-device-being-away-and-a-household-can-choose-the-address.md`.
 
 ## If something goes wrong
 

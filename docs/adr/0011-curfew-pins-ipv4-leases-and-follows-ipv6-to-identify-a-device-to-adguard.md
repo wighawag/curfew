@@ -1,6 +1,6 @@
 # curfew pins the IPv4 lease and FOLLOWS IPv6, to identify a device to AdGuard
 
-**Status:** accepted
+**Status:** accepted, amended by `docs/adr/0012-a-pin-outlives-its-device-being-away-and-a-household-can-choose-the-address.md`. 0012 makes pins survive their device being away (they were swept whenever a device had no lease, which is how a household lost addresses it depended on), adds a user-chosen fixed address, and changes the IPv4 attribution rule below: an address is credited to a device when the DHCP lease file says that MAC holds it, or when it is the device's pin and no other MAC holds it.
 
 `docs/adr/0010-curfew-drives-adguard-through-its-api-and-owns-only-its-own-objects.md`
 settled that AdGuard identifies a client by IP, that a MAC-keyed client is

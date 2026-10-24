@@ -25,20 +25,26 @@ type ConflictKind string
 const (
 	// BothRenamed means each side gave the device a different name.
 	BothRenamed ConflictKind = "renamed differently on both sides"
+	// BothChangedIP means each side gave the device a different fixed address
+	// (one of them may have cleared it).
+	BothChangedIP ConflictKind = "fixed address changed differently on both sides"
 	// RemovedAndRenamed means one side removed the device while the other
-	// renamed it. This one matters: taking the removal silently discards an
-	// edit, and taking the rename silently restores network access.
-	RemovedAndRenamed ConflictKind = "removed on one side, renamed on the other"
-	// BothAdded means the device is new to both sides, with different names.
-	BothAdded ConflictKind = "added on both sides with different names"
+	// changed it (renamed it, or set or cleared its fixed address). This one
+	// matters: taking the removal silently discards an edit, and taking the
+	// edit silently restores network access.
+	RemovedAndRenamed ConflictKind = "removed on one side, changed on the other"
+	// BothAdded means the device is new to both sides, with different names
+	// or fixed addresses.
+	BothAdded ConflictKind = "added on both sides differently"
 )
 
 // Conflict is one device that needs a human.
 type Conflict struct {
 	MAC  string
 	Kind ConflictKind
-	// Each side's name, and whether the device was present at all.
+	// Each side's name and fixed address, and whether the device was present.
 	BaseName, LocalName, RemoteName string
+	BaseIP, LocalIP, RemoteIP       string
 	InBase, InLocal, InRemote       bool
 }
 
@@ -53,7 +59,31 @@ func index(r *Registry) map[string]Device {
 	return m
 }
 
+// sameDevice compares every field a person can edit. Adding a field to Device
+// without adding it here would make push and pull silently discard it, which
+// is the trap ADR 0009 recorded for the budget knobs.
+func sameDevice(a, b Device) bool { return a.Name == b.Name && a.IP == b.IP }
+
+// mergeField is the three-way rule for ONE field of a device present on both
+// sides: agreement, or whichever side moved away from the base. ok is false
+// when both moved, differently.
+func mergeField(base, local, remote string) (string, bool) {
+	switch {
+	case local == remote:
+		return local, true
+	case local == base:
+		return remote, true
+	case remote == base:
+		return local, true
+	}
+	return local, false
+}
+
 // Merge3 merges local and remote against their common base.
+//
+// A device present on both sides is merged FIELD BY FIELD, so a rename on the
+// laptop and a fixed address set on the router are independent edits and both
+// apply. Only the same field changed differently on both sides is a conflict.
 //
 // The returned registry holds every automatically resolved device. Conflicted
 // devices are carried at their LOCAL value so the result is still a usable
@@ -85,45 +115,53 @@ func Merge3(base, local, remote *Registry) (*Registry, []Conflict) {
 		bd, inB := b[mac]
 		ld, inL := l[mac]
 		rd, inR := r[mac]
-
-		same := func(x Device, inX bool, y Device, inY bool) bool {
-			return inX == inY && x.Name == y.Name
-		}
-
-		switch {
-		case same(ld, inL, rd, inR):
-			// Both sides agree, including both having removed it.
-			if inL {
-				out.Devices = append(out.Devices, ld)
-			}
-		case same(ld, inL, bd, inB):
-			// Only the remote moved.
-			if inR {
-				out.Devices = append(out.Devices, rd)
-			}
-		case same(rd, inR, bd, inB):
-			// Only the local moved.
-			if inL {
-				out.Devices = append(out.Devices, ld)
-			}
-		default:
-			c := Conflict{
-				MAC: mac, InBase: inB, InLocal: inL, InRemote: inR,
+		conflict := func(kind ConflictKind) {
+			conflicts = append(conflicts, Conflict{
+				MAC: mac, Kind: kind, InBase: inB, InLocal: inL, InRemote: inR,
 				BaseName: bd.Name, LocalName: ld.Name, RemoteName: rd.Name,
-			}
-			switch {
-			case inL != inR:
-				c.Kind = RemovedAndRenamed
-			case !inB:
-				c.Kind = BothAdded
-			default:
-				c.Kind = BothRenamed
-			}
-			conflicts = append(conflicts, c)
+				BaseIP: bd.IP, LocalIP: ld.IP, RemoteIP: rd.IP,
+			})
 			// Carry the local value so the list stays usable; the caller
 			// refuses while conflicts exist.
 			if inL {
 				out.Devices = append(out.Devices, ld)
+			}
+		}
+
+		switch {
+		case !inL && !inR:
+			// Removed on both sides, or never anywhere: agreement.
+		case inL && inR && sameDevice(ld, rd):
+			out.Devices = append(out.Devices, ld)
+		case inL && inR && !inB:
+			// New on both sides, differently. With no common ancestor there
+			// is no way to know which is newer, so this is not guessed.
+			conflict(BothAdded)
+		case inL && inR:
+			name, nameOK := mergeField(bd.Name, ld.Name, rd.Name)
+			ip, ipOK := mergeField(bd.IP, ld.IP, rd.IP)
+			switch {
+			case !nameOK:
+				conflict(BothRenamed)
+			case !ipOK:
+				conflict(BothChangedIP)
+			default:
+				out.Devices = append(out.Devices, Device{MAC: mac, Name: name, IP: ip})
+			}
+		default:
+			// Present on exactly one side.
+			present := ld
+			if inR {
+				present = rd
+			}
+			switch {
+			case !inB:
+				// Added on that side.
+				out.Devices = append(out.Devices, present)
+			case sameDevice(present, bd):
+				// Removed on the other side and untouched here: the removal wins.
+			default:
+				conflict(RemovedAndRenamed)
 			}
 		}
 	}
@@ -131,7 +169,9 @@ func Merge3(base, local, remote *Registry) (*Registry, []Conflict) {
 }
 
 // Equal reports whether two registries hold the same devices with the same
-// names, regardless of order.
+// names and fixed addresses, regardless of order. push uses this to decide
+// whether the router changed since the last sync, so a field missing here is
+// a field push silently overwrites.
 func Equal(a, b *Registry) bool {
 	ai, bi := index(a), index(b)
 	if len(ai) != len(bi) {
@@ -139,7 +179,7 @@ func Equal(a, b *Registry) bool {
 	}
 	for mac, ad := range ai {
 		bd, ok := bi[mac]
-		if !ok || ad.Name != bd.Name {
+		if !ok || !sameDevice(ad, bd) {
 			return false
 		}
 	}
@@ -156,6 +196,16 @@ func describe(present bool, name string) string {
 	return name
 }
 
+func describeIP(present bool, ip string) string {
+	if !present {
+		return "(not present)"
+	}
+	if ip == "" {
+		return "(none)"
+	}
+	return ip
+}
+
 // RenderConflicts produces the report written for a human to act on. It is
 // deliberately plain text naming each side, rather than inline markers: the
 // file is a description of a decision to make, not something to edit in place
@@ -170,7 +220,14 @@ func RenderConflicts(cs []Conflict) string {
 		fmt.Fprintf(&sb, "%s  (%s)\n", c.MAC, c.Kind)
 		fmt.Fprintf(&sb, "    last agreed : %s\n", describe(c.InBase, c.BaseName))
 		fmt.Fprintf(&sb, "    your laptop : %s\n", describe(c.InLocal, c.LocalName))
-		fmt.Fprintf(&sb, "    the router  : %s\n\n", describe(c.InRemote, c.RemoteName))
+		fmt.Fprintf(&sb, "    the router  : %s\n", describe(c.InRemote, c.RemoteName))
+		if c.BaseIP != c.LocalIP || c.LocalIP != c.RemoteIP {
+			sb.WriteString("    fixed address:\n")
+			fmt.Fprintf(&sb, "      last agreed : %s\n", describeIP(c.InBase, c.BaseIP))
+			fmt.Fprintf(&sb, "      your laptop : %s\n", describeIP(c.InLocal, c.LocalIP))
+			fmt.Fprintf(&sb, "      the router  : %s\n", describeIP(c.InRemote, c.RemoteIP))
+		}
+		sb.WriteString("\n")
 	}
 	sb.WriteString("To resolve, pick a side per device by editing your local list, then push;\n")
 	sb.WriteString("or take one side wholesale:\n\n")

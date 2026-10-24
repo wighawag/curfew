@@ -157,41 +157,23 @@ func (m *Manager) Tick() error {
 		return err
 	}
 
-	// Pin a static lease for every registered device that currently holds an
-	// address. The IPv4 half of identity becomes configuration curfew owns
-	// rather than something it has to keep observing.
+	// Pin a static lease for every registered device: at its fixed address if
+	// it has one, else at the address it holds, else at the pin it already
+	// has. The IPv4 half of identity becomes configuration curfew owns rather
+	// than something it has to keep observing.
 	//
 	// A failure here is WARNED about and does not stop the pass. The AdGuard
 	// half can still work from the addresses the DHCP server has already handed
 	// out, and the whole layer is fail-open by design: giving up entirely would
 	// turn a lease that could not be written into a restriction that silently
 	// vanished, which is strictly worse than one that is applied and reported.
-	plan := leases.Plan{Pinned: map[string]string{}}
-	current, err := leases.Read(m.runner)
-	if err != nil {
-		m.log.Warn("cannot read the router's DHCP config, so no lease was pinned this pass",
-			"error", err)
-	} else {
-		devices := make([]leases.Device, 0, len(reg.Devices))
-		for _, d := range reg.Devices {
-			devices = append(devices, leases.Device{
-				MAC: d.MAC, Name: d.Name, IP: observed[strings.ToLower(d.MAC)].IPv4,
-			})
-		}
-		plan = leases.Reconcile(current, devices)
-		wrote, err := leases.Apply(m.runner, plan)
-		if err != nil {
-			m.log.Warn("could not pin static DHCP leases; the addresses already handed out "+
-				"are still used for DNS restrictions", "error", err)
-		} else if wrote {
-			m.log.Info("static DHCP leases updated", "commands", len(plan.Commands))
-		}
+	devices := make([]leases.Device, 0, len(reg.Devices))
+	for _, d := range reg.Devices {
+		devices = append(devices, leases.Device{
+			MAC: d.MAC, Name: d.Name, IP: observed[strings.ToLower(d.MAC)].IPv4, Fixed: d.IP,
+		})
 	}
-	for _, c := range plan.Conflicts {
-		m.log.Warn("a static lease curfew does not own already pins this device",
-			"mac", c.MAC, "section", "dhcp."+c.Section, "ip", c.IP,
-			"what_curfew_did", "left it alone and used its address")
-	}
+	plan := leases.PassAndLog(m.runner, m.log, devices)
 	if len(plan.Unaddressed) > 0 {
 		m.log.Warn("registered devices with no DHCP lease, so no address to restrict by",
 			"devices", plan.Unaddressed,

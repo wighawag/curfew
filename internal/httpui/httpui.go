@@ -23,6 +23,7 @@ import (
 
 	"github.com/wighawag/curfew/internal/budget"
 	"github.com/wighawag/curfew/internal/lanhosts"
+	"github.com/wighawag/curfew/internal/leases"
 	"github.com/wighawag/curfew/internal/registry"
 )
 
@@ -121,6 +122,9 @@ type Server struct {
 	// applyCategories applies a category-blocklist change to the running
 	// AdGuard, or is nil when nothing wired one up. See categories.go.
 	applyCategories CategoryApplier
+	// addresses reads the router's DHCP view, for checking and showing fixed
+	// addresses, or is nil when nothing wired it up. See fixedip.go.
+	addresses func() (leases.Survey, error)
 }
 
 // UseAdGuardServices lets the settings page offer AdGuard's built-in service
@@ -175,6 +179,12 @@ type DeviceView struct {
 	// know about. It should never appear; if it does, something wrote to the
 	// ruleset behind our back and that is worth seeing.
 	Unregistered bool `json:"unregistered,omitempty"`
+	// FixedIP is the address the household chose, empty for none.
+	FixedIP string `json:"fixed_ip,omitempty"`
+	// PinnedIP is the address curfew's own static lease holds right now, read
+	// from the router's DHCP config, empty when there is none or it cannot be
+	// read. It differs from FixedIP until the next pass writes the change.
+	PinnedIP string `json:"pinned_ip,omitempty"`
 }
 
 func (s *Server) authOK(r *http.Request) bool {
@@ -220,6 +230,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/devices", s.handleAddDevice)
 	mux.HandleFunc("/devices/rename", s.handleRenameDevice)
 	mux.HandleFunc("/devices/remove", s.handleRemoveDevice)
+	mux.HandleFunc("/devices/ip", s.handleSetIP)
 	mux.HandleFunc("/api/devices", s.handleAPIDevices)
 	if s.filterList == nil || s.filterPath == "" {
 		return s.withAuth(s.withNoStore(mux))
@@ -309,12 +320,14 @@ func (s *Server) view() ([]DeviceView, error) {
 		return nil, err
 	}
 
+	pinned := s.pinnedAddresses()
 	out := make([]DeviceView, 0, len(reg.Devices))
 	seen := make(map[string]bool, len(reg.Devices))
 	for _, d := range reg.Devices {
 		seen[d.MAC] = true
 		allowed, _ := fw.verdict(d.MAC)
-		out = append(out, DeviceView{MAC: d.MAC, Name: d.Name, Allowed: allowed})
+		out = append(out, DeviceView{MAC: d.MAC, Name: d.Name, Allowed: allowed,
+			FixedIP: d.IP, PinnedIP: pinned[d.MAC]})
 	}
 	for _, m := range live {
 		if !seen[m] {
@@ -365,6 +378,7 @@ func (s *Server) handleDevicesPage(w http.ResponseWriter, r *http.Request) {
 	data := pageData{
 		Devices:     devices,
 		Error:       r.URL.Query().Get("error"),
+		Notice:      r.URL.Query().Get("notice"),
 		Pending:     s.pendingDevices(),
 		ShowPending: s.sightings != nil,
 		Profiles:    s.profileChoices(),
@@ -569,6 +583,8 @@ func (s *Server) handleRemoveDevice(w http.ResponseWriter, r *http.Request) {
 type pageData struct {
 	Devices []DeviceView
 	Error   string
+	// Notice is what a fixed-address change needs the household to know.
+	Notice string
 	// Pending is what the router has seen and the registry does not know.
 	Pending []PendingDevice
 	// ShowPending distinguishes "looked and found nothing" from "not looking".
@@ -603,6 +619,7 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
  input { padding: .6rem; font-size: 1rem; width: 100%; box-sizing: border-box; }
  button { padding: .7rem; font-size: 1rem; }
  .err { background: #fdecea; color: #b00020; padding: .6rem; margin-bottom: 1rem; }
+ .notice { background: #eef7ee; color: #1d4d24; padding: .6rem; margin-bottom: 1rem; }
  .muted { color: #666; font-size: .85rem; }
  form.enrol { display: flex; gap: .3rem; margin: 0; flex-wrap: wrap; align-items: center; }
  form.enrol input, form.enrol select { padding: .4rem; font-size: .9rem; width: auto; }
@@ -616,8 +633,9 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
 <p><a href="/">&larr; profiles</a></p>
 <h1>Devices allowed on the internet</h1>
 {{if .Error}}<div class="err">{{.Error}}</div>{{end}}
+{{if .Notice}}<div class="notice">{{.Notice}}</div>{{end}}
 <table>
-<tr><th>Name</th><th>MAC</th><th>Allowed</th><th></th></tr>
+<tr><th>Name</th><th>MAC</th><th>Allowed</th><th>Fixed address</th><th></th></tr>
 {{range .Devices}}
 <tr{{if .Unregistered}} class="warn"{{end}}>
   <td>
@@ -635,6 +653,17 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
   <td><code>{{.MAC}}</code></td>
   <td>{{if .Allowed}}<span class="yes">yes</span>{{else}}<span class="no">no</span>{{end}}</td>
   <td>{{if not .Unregistered}}
+    <form method="POST" action="/devices/ip" class="rename">
+      <input type="hidden" name="mac" value="{{.MAC}}">
+      <input name="ip" value="{{.FixedIP}}" inputmode="decimal" autocomplete="off"
+             placeholder="{{if .PinnedIP}}none (pinned at {{.PinnedIP}}){{else}}none{{end}}"
+             aria-label="fixed address for {{.MAC}}">
+      <button type="submit">Set</button>
+      {{if .FixedIP}}<button type="submit" name="clear" value="1">Clear</button>{{end}}
+    </form>
+    {{if and .FixedIP .PinnedIP}}{{if ne .FixedIP .PinnedIP}}<div class="muted">pinned at {{.PinnedIP}} until the router applies it</div>{{end}}{{end}}
+  {{end}}</td>
+  <td>{{if not .Unregistered}}
     <form method="POST" action="/devices/remove" class="remove"
           onsubmit="return confirm('Remove {{if .Name}}{{.Name}}{{else}}{{.MAC}}{{end}} and cut off its internet?')">
       <input type="hidden" name="mac" value="{{.MAC}}">
@@ -643,7 +672,7 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
   {{end}}</td>
 </tr>
 {{else}}
-<tr><td colspan="4" class="muted">No devices registered. Nothing can reach the internet.</td></tr>
+<tr><td colspan="5" class="muted">No devices registered. Nothing can reach the internet.</td></tr>
 {{end}}
 </table>
 {{if .ShowPending}}
@@ -702,6 +731,10 @@ no budget and no website rules. That is right for a printer and wrong for a chil
 works on MAC addresses, so renaming never changes who has internet.</p>
 <p class="muted">The Allowed column is read from the firewall itself, not from the
 saved list, so if the two ever disagree you will see it here.</p>
+<p class="muted">A <strong>fixed address</strong> is the IPv4 address the router always gives that
+device, for a server or a printer something else reaches by its address. With none, the device
+keeps the address it already has. A device moves to a new fixed address on its next DHCP renewal,
+or straight away if it reconnects.</p>
 </body>
 </html>
 `))
