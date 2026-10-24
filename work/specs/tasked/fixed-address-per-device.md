@@ -6,6 +6,8 @@ promptGuidance.testFirst: true
 
 > Launch snapshot: records intent at creation, NOT maintained. Current truth: `docs/adr/` (decisions) + the code; remaining work: `work/tasks/ready/` tasks. (The technical-detail sections below are trimmed by `to-task` once the work is tasked.)
 
+Built directly from this spec (no tasks were cut) and released in curfew v0.13.0, commit 257185d. Durable decisions: `docs/adr/0012-a-pin-outlives-its-device-being-away-and-a-household-can-choose-the-address.md`.
+
 ## Decisions (answered by the owner, 2026-10-23)
 
 1. **Identity bridge during a move:** the lease-attested union. Recorded as ADR 0012.
