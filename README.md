@@ -67,6 +67,8 @@ ssh root@192.168.1.1 "ifstatus wan | grep l3_device"
 | `curfew adopt-leases <host>` | laptop | Take over static DHCP leases written by something else |
 | `curfew set-ip <mac\|name> <ip>` | laptop | Give a device a fixed address in your local list; `curfew push` applies it |
 | `curfew set-ip <mac\|name> --clear` | laptop | Remove a device's fixed address (it keeps the address it has now) |
+| `curfew add-dns-name <mac\|name> <dns-name>` | laptop | Have the router answer a local DNS name with the device's fixed address; `curfew push` applies it |
+| `curfew remove-dns-name <mac\|name> <dns-name>` | laptop | Take a local DNS name off a device; push removes exactly the records curfew made |
 | `curfew version` | laptop | Print the version |
 | `curfew-daemon -version` | router | Print the version running on the router |
 
@@ -199,6 +201,38 @@ curfew set-ip shyrka --clear           # remove it again; the device keeps the a
 Or set it on the devices page, which runs the same checks. Before anything is written, curfew refuses an address outside the LAN (read from the router's own `network.lan`, not assumed), the network or broadcast address, the router's own address, and any address another host entry or device already has. That last one is not fussiness: dnsmasq refuses to start at all on two reservations for one address (measured), which would cost the whole house DHCP. It also tells you when the address is inside the DHCP pool (allowed: dnsmasq honours it) and when another device still holds it.
 
 The device moves on its **next DHCP renewal**, and push says roughly when. To move it straight away, renew on the device (`networkctl renew <interface>`, `dhcpcd -n <interface>`) or reconnect its Wi-Fi or cable. While it moves, any DNS restriction applies to both its old and its new address, so changing a child's address is not a way out of a restriction. Fixed addresses work with or without AdGuard. Push refuses to send one to a daemon too old to understand it, so run `curfew update` first. The decisions are in `docs/adr/0012-a-pin-outlives-its-device-being-away-and-a-household-can-choose-the-address.md`.
+
+### Local DNS names
+
+A machine on your LAN can also have **local DNS names** that the router answers itself, so they work without the internet, without any public record, and after `panic-off`:
+
+```sh
+curfew add-dns-name "workstation igc" '*.lan.telemaque.ska.sh'   # quote the '*'
+curfew push root@192.168.1.1
+curfew remove-dns-name "workstation igc" '*.lan.telemaque.ska.sh'
+```
+
+Or add and remove them on the devices page, which runs the same checks. A name always points at the device's **fixed address**, so a device needs one first (`curfew set-ip`), clearing it is refused while names remain, and moving it with `set-ip` moves the names on the next pass.
+
+What a name covers: `x.example.com` answers that name and every name below it; `*.x.example.com` answers every name below it but not `x.example.com` itself. There is no "exactly this one name" form, because dnsmasq cannot answer one name and still keep AAAA local (measured). The router answers **IPv4 only**: an AAAA question for these names gets no address, and it is not forwarded to an upstream resolver either.
+
+Both resolvers answer them. AdGuard does it with DNS rewrites curfew creates (you will see them on AdGuard's "DNS rewrites" page), and dnsmasq with `address` and `server` entries in `/etc/config/dhcp`, which is why the names survive `panic-off` and work with `-no-adguard`. A local answer is not affected by dnsmasq's rebind protection, so no `rebind_domain` is needed. curfew keeps a record of exactly which rewrites and entries it wrote (`/etc/config/curfew/dns-records.json`) and only ever changes or removes those: a rewrite or entry you made by hand for the same name is left alone and reported. The decisions are in `docs/adr/0013-a-device-can-carry-local-dns-names-answered-a-only-at-its-fixed-address.md` and `docs/adr/0014-curfew-owns-dns-records-it-has-written-by-ledger-not-by-marker.md`.
+
+Refused before anything is written: a name that is not a valid DNS name; a `*` anywhere but one leading `*.`; a single label or a whole top-level domain (`*.sh`); a name another device's names overlap; anything under the router's own local domain (`lan` here, where DHCP clients register their hostnames); `localhost`, `local` (mDNS), `invalid`, `onion` and `arpa` (but `home.arpa`, which is meant for this, is allowed); and a name covering a hostname the router itself needs, such as its NTP servers. A name that covers a whole registrable domain (`example.com`) is allowed with a warning. A public record for the same name is fine: on your LAN the local answer wins, and a browser using its own DNS-over-HTTPS still sees the public one, which is a reason to keep it, A-only.
+
+Two limits. AdGuard gives no rewrites to a client whose own settings turn filtering off, or to anyone when filtering or rewrites are off globally (measured): those devices ask upstream and see the public record, and the daemon's log says which. And push refuses to send names to a daemon too old to know them, so run `curfew update` first.
+
+To check it on the router after a push:
+
+```sh
+dig @192.168.1.1 breakoutbunny.lan.telemaque.ska.sh A          # 192.168.1.122, from AdGuard
+dig @192.168.1.1 -p 54 breakoutbunny.lan.telemaque.ska.sh A    # 192.168.1.122, from dnsmasq
+dig @192.168.1.1 breakoutbunny.lan.telemaque.ska.sh AAAA       # NOERROR, no answer
+dig @192.168.1.1 -p 54 breakoutbunny.lan.telemaque.ska.sh AAAA # NOERROR, no answer
+ssh root@192.168.1.1 "uci show dhcp.@dnsmasq[0] | grep -E 'address|server'"
+```
+
+The panic-off behaviour is covered by the test suite (the real `panic-off.sh`, then the same questions to dnsmasq on 53), so there is no need to run `panic-off` on the live router to check it.
 
 ## If something goes wrong
 

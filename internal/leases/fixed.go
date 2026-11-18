@@ -9,6 +9,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/wighawag/curfew/internal/dhcplock"
+	"github.com/wighawag/curfew/internal/dnsledger"
+	"github.com/wighawag/curfew/internal/dnsnames"
 )
 
 // Fixed addresses: an IPv4 address the household chose for a device, which
@@ -406,20 +410,72 @@ func ScreenFixed(lan LAN, lanErr error, devices []Device) ([]Device, []Refusal) 
 	return out, refused
 }
 
-// Pass is one pinning pass, as the daemon runs it: read the LAN and the host
-// entries, screen the fixed addresses, reconcile, apply. It returns the plan
-// even when applying fails, so the caller can still report what was refused.
-func Pass(r Runner, devices []Device) (Plan, error) {
+// PassOptions are what a pass needs beyond the devices.
+type PassOptions struct {
+	// LedgerPath is the DNS record ledger (internal/dnsledger). Empty means
+	// local DNS names are not managed at all this pass: nothing is added and,
+	// crucially, nothing is removed, because without the ledger curfew cannot
+	// tell its own entries from anyone else's.
+	LedgerPath string
+}
+
+// Pass is one pinning pass, as the daemon runs it: read the LAN and the dhcp
+// config, screen the fixed addresses, reconcile the pins AND the local DNS
+// names, and apply both in ONE transaction. It returns the plan even when
+// applying fails, so the caller can still report what was refused.
+func Pass(r Runner, devices []Device, opt PassOptions) (Plan, error) {
 	lan, lanErr := ReadLAN(r)
 	screened, refused := ScreenFixed(lan, lanErr, devices)
-	current, err := Read(r)
+	show, err := r.Run("uci show dhcp")
 	if err != nil {
-		return Plan{Pinned: map[string]string{}, Refused: refused}, err
+		// Nothing was planned, so ownership of local names is unknown this
+		// pass. Saying so is what stops the AdGuard half reading "no targets"
+		// as "remove every name" and deleting rewrites for one tick.
+		return Plan{Pinned: map[string]string{}, Refused: refused,
+				NamesSkipped: "the dhcp config could not be read: " + err.Error()},
+			fmt.Errorf("reading the dhcp config: %w", err)
 	}
-	plan := Reconcile(current, screened)
+	plan := Reconcile(Parse(show), screened)
 	plan.Refused = append(refused, plan.Refused...)
-	_, err = Apply(r, plan)
-	return plan, err
+
+	var ledger *dnsledger.Ledger
+	if opt.LedgerPath != "" {
+		if ledger, err = dnsledger.Load(opt.LedgerPath); err != nil {
+			plan.NamesSkipped = err.Error()
+			ledger = nil
+		}
+	}
+	if ledger != nil {
+		system, _ := r.Run("uci -q show system || true")
+		address, server := dnsnames.DnsmasqLists(show)
+		plan.Names = PlanNames(devices, plan.Pinned, dnsnames.ContextFromUCI(show, system),
+			address, server, ledger)
+		plan.Commands = append(plan.Commands, plan.Names.Commands...)
+		if len(plan.Names.Commands) > 0 && !sameEntries(ledger.Dnsmasq, plan.Names.WriteAhead) {
+			ledger.Dnsmasq = plan.Names.WriteAhead
+			if err := dnsledger.Save(opt.LedgerPath, ledger); err != nil {
+				// Without the write-ahead record a crash could orphan an
+				// entry, so the name changes wait; the pins still go ahead.
+				plan.NamesSkipped = "could not record the DNS entries before writing them: " + err.Error()
+				plan.Commands = plan.Commands[:len(plan.Commands)-len(plan.Names.Commands)]
+				plan.Names.Commands, plan.Names.Changed = nil, nil
+				ledger = nil
+			}
+		}
+	}
+	if _, err = Apply(r, plan); err != nil {
+		return plan, err
+	}
+	// Saved only on a difference: the ledger lives on flash, and a pass with
+	// nothing to do must not write it every minute.
+	if ledger != nil && !sameEntries(ledger.Dnsmasq, plan.Names.Final) {
+		ledger.Dnsmasq = plan.Names.Final
+		if err := dnsledger.Save(opt.LedgerPath, ledger); err != nil {
+			plan.NamesSkipped = "the entries were written, but the ledger could not be updated (it " +
+				"still lists them, so nothing is orphaned): " + err.Error()
+		}
+	}
+	return plan, nil
 }
 
 // PassAndLog runs Pass and says what happened. It is shared by the DNS layer
@@ -429,9 +485,14 @@ func Pass(r Runner, devices []Device) (Plan, error) {
 // Every failure is WARNED about and nothing stops the caller: the whole layer
 // is fail-open, and a lease that could not be written must not take the
 // firewall or the rest of the pass down with it.
-func PassAndLog(r Runner, log *slog.Logger, devices []Device) Plan {
-	plan, err := Pass(r, devices)
+func PassAndLog(r Runner, log *slog.Logger, devices []Device, opt PassOptions) Plan {
+	plan, err := Pass(r, devices, opt)
 	switch {
+	case errors.Is(err, dhcplock.ErrBusy):
+		// Not a fault: the install-time DNS takeover is moving dnsmasq right
+		// now, and writing underneath it is exactly what the lock prevents.
+		log.Warn("skipped pinning static DHCP leases this pass: another curfew process "+
+			"is changing the DHCP config", "what_happens_next", "the next pass tries again")
 	case err != nil:
 		log.Warn("could not pin static DHCP leases; the addresses already handed out "+
 			"are still used", "error", err)
@@ -447,5 +508,50 @@ func PassAndLog(r Runner, log *slog.Logger, devices []Device) Plan {
 		log.Warn("an address was NOT pinned", "mac", f.MAC, "ip", f.IP, "why", f.Reason,
 			"what_curfew_did", "wrote nothing for that address; the device keeps the pin it has, if any")
 	}
+	logNames(log, plan, err)
 	return plan
+}
+
+// logNames says what happened to local DNS names on the dnsmasq side.
+func logNames(log *slog.Logger, plan Plan, err error) {
+	if plan.NamesSkipped != "" {
+		log.Warn("local DNS names were not managed this pass", "why", plan.NamesSkipped,
+			"effect", "dnsmasq keeps whatever names it already answers")
+	}
+	n := plan.Names
+	if err == nil && len(n.Changed) > 0 {
+		log.Info("dnsmasq local DNS names updated", "names", n.Changed)
+	}
+	for _, f := range n.Refused {
+		log.Warn("a local DNS name is NOT answered", "mac", f.MAC, "name", f.Name, "why", f.Reason)
+	}
+	for _, y := range n.Yielded {
+		log.Warn("dnsmasq already answers this name with an entry curfew did not write",
+			"name", y.Name, "entry", y.List+" "+y.Entry,
+			"what_curfew_did", "left it alone and wrote nothing for that name in dnsmasq")
+	}
+	for _, u := range n.Unclaimed {
+		log.Info("an entry identical to curfew's exists but was not written by curfew",
+			"entry", u, "what_curfew_did", "left it and did not claim it; the name still resolves")
+	}
+	for _, k := range n.Kept {
+		log.Warn("a dnsmasq entry curfew no longer wants is duplicated by an entry it did not write",
+			"entry", k, "what_curfew_did", "removed nothing, since uci cannot remove only its own copy")
+	}
+}
+
+func sameEntries(a, b []dnsledger.DnsmasqEntry) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	x := append([]dnsledger.DnsmasqEntry(nil), a...)
+	y := append([]dnsledger.DnsmasqEntry(nil), b...)
+	sortEntries(x)
+	sortEntries(y)
+	for i := range x {
+		if x[i] != y[i] {
+			return false
+		}
+	}
+	return true
 }

@@ -16,13 +16,22 @@ import (
 
 // scriptedRunner answers commands from a table and records what it was asked.
 type scriptedRunner struct {
-	answers map[string]string
-	fail    map[string]error
-	ran     []string
+	answers  map[string]string
+	fail     map[string]error
+	ran      []string
+	lockBusy bool
 }
 
 func (s *scriptedRunner) Run(cmd string) (string, error) {
 	s.ran = append(s.ran, cmd)
+	// The DHCP config lock: answer as a free lock would, unless told it is
+	// busy. internal/dhcplock tests the real thing.
+	if strings.Contains(cmd, "flock -n 9") {
+		if s.lockBusy {
+			return "lock:busy\n", nil
+		}
+		return "lock:held\n", nil
+	}
 	for pattern, err := range s.fail {
 		if strings.Contains(cmd, pattern) {
 			return "", err
@@ -410,5 +419,46 @@ func TestRollbackRestoresTheOriginalDHCPOptions(t *testing.T) {
 	}
 	if !r.didRun("uci add_list dhcp.lan.dhcp_option='6,10.0.0.1'") {
 		t.Errorf("the household's original DNS option was not restored:\n%v", r.ran)
+	}
+}
+
+// When the daemon holds the DHCP config lock for the whole wait, the takeover
+// must change NOTHING and must not "roll back" either: a rollback from a move
+// that never happened would rewrite the household's DHCP options from nothing.
+func TestABusyDHCPLockStopsTheTakeoverWithoutTouchingAnything(t *testing.T) {
+	r := newConflictedRouter()
+	r.lockBusy = true
+	report := &AdGuardReport{}
+	err := takeOverDNS(r, AdGuardOptions{Enabled: true, RouterIP: "192.168.1.1", DNSTimeout: time.Second}, report, true)
+	if err == nil {
+		t.Fatal("a takeover that could not take the lock must fail")
+	}
+	if !strings.Contains(err.Error(), "nothing was changed") {
+		t.Errorf("the message must say nothing changed: %v", err)
+	}
+	for _, c := range r.ran {
+		if strings.Contains(c, "flock -n 9") {
+			continue
+		}
+		if strings.Contains(c, "uci set") || strings.Contains(c, "uci commit") ||
+			strings.Contains(c, "dhcp_option") || strings.Contains(c, "dnsmasq restart") {
+			t.Errorf("the takeover wrote without the lock: %q", c)
+		}
+	}
+	if report.MovedDnsmasq || report.RolledBack {
+		t.Errorf("nothing moved, so nothing may be reported moved or rolled back: %+v", report)
+	}
+}
+
+// Reviewer P1: the rollback to 53 is what gives the household its resolver
+// back, so a busy or wedged lock must not stop it.
+func TestTheRollbackToFiftyThreeRunsEvenWhenTheLockIsBusy(t *testing.T) {
+	r := newConflictedRouter()
+	r.lockBusy = true
+	if err := restoreDnsmasqTo53(r, []string{"42,192.168.1.1"}); err != nil {
+		t.Fatalf("the restore failed: %v", err)
+	}
+	if !r.didRun("uci set dhcp.@dnsmasq[0].port=53") || !r.didRun("uci commit dhcp") {
+		t.Errorf("the restore was skipped because of the lock: %v", r.ran)
 	}
 }

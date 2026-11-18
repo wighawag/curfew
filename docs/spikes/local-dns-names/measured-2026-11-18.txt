@@ -1,0 +1,268 @@
+
+### baseline: the fixture upstream answers with the sentinels
+A x.lan.telemaque.ska.sh @127.0.0.1:5454: rcode=RCodeSuccess aa=true answers=1 [A 93.184.216.66] authority=[]
+AAAA x.lan.telemaque.ska.sh @127.0.0.1:5454: rcode=RCodeSuccess aa=true answers=1 [AAAA 2606:4700::66] authority=[]
+
+### dnsmasq: no local record; upstream gives a PRIVATE address (today's public record after panic-off)
+dnsmasq started with:  (exit 0)
+A rebind.example @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=0 [] authority=[]
+A example.com @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 93.184.216.10] authority=[]
+
+### dnsmasq: --address=/lan.telemaque.ska.sh/192.168.1.122
+dnsmasq started with: --address=/lan.telemaque.ska.sh/192.168.1.122 (exit 0)
+A lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [AAAA 2606:4700::66] authority=[]
+HTTPS lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+A breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [AAAA 2606:4700::66] authority=[]
+HTTPS breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+A a.b.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA a.b.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [AAAA 2606:4700::66] authority=[]
+HTTPS a.b.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+
+### dnsmasq: --address=/*.lan.telemaque.ska.sh/192.168.1.122 (dnsmasq 2.86+ wildcard)
+dnsmasq started with: --address=/*.lan.telemaque.ska.sh/192.168.1.122 (exit 0)
+A lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 93.184.216.66] authority=[]
+AAAA lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [AAAA 2606:4700::66] authority=[]
+HTTPS lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+A breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [AAAA 2606:4700::66] authority=[]
+HTTPS breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+A a.b.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA a.b.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [AAAA 2606:4700::66] authority=[]
+HTTPS a.b.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+
+### dnsmasq: --address=/lan.telemaque.ska.sh/192.168.1.122 --server=/lan.telemaque.ska.sh/ (answer locally, never forward)
+dnsmasq started with: --address=/lan.telemaque.ska.sh/192.168.1.122 --server=/lan.telemaque.ska.sh/ (exit 0)
+A lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+HTTPS lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+A breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+HTTPS breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+A a.b.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA a.b.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+HTTPS a.b.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+
+### dnsmasq: --address=/*.lan.telemaque.ska.sh/192.168.1.122 --server=/*.lan.telemaque.ska.sh/ (wildcard, local-only)
+dnsmasq started with: --address=/*.lan.telemaque.ska.sh/192.168.1.122 --server=/*.lan.telemaque.ska.sh/ (exit 0)
+A lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 93.184.216.66] authority=[]
+AAAA lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [AAAA 2606:4700::66] authority=[]
+HTTPS lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+A breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+HTTPS breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+A a.b.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA a.b.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+HTTPS a.b.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+
+### dnsmasq: --address=/*.lan.telemaque.ska.sh/192.168.1.122 --local=/*.lan.telemaque.ska.sh/ (--local spelling)
+dnsmasq started with: --address=/*.lan.telemaque.ska.sh/192.168.1.122 --local=/*.lan.telemaque.ska.sh/ (exit 0)
+A lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 93.184.216.66] authority=[]
+AAAA lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [AAAA 2606:4700::66] authority=[]
+HTTPS lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+A breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+HTTPS breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+A a.b.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA a.b.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+HTTPS a.b.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+
+### dnsmasq: --address=/lan.telemaque.ska.sh/192.168.1.122 --address=/lan.telemaque.ska.sh/:: (what does :: mean?)
+dnsmasq started with: --address=/lan.telemaque.ska.sh/192.168.1.122 --address=/lan.telemaque.ska.sh/:: (exit 0)
+A lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [AAAA ::] authority=[]
+HTTPS lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+A breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [AAAA ::] authority=[]
+HTTPS breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+A a.b.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA a.b.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [AAAA ::] authority=[]
+HTTPS a.b.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+
+### dnsmasq: one --address line naming two domains, plus local for both
+dnsmasq started with: --address=/one.example/two.example/192.168.1.122 --server=/one.example/two.example/ (exit 0)
+A one.example @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA one.example @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+A x.two.example @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA x.two.example @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+
+### dnsmasq on port 53 (panic-off moved it back), same records
+dnsmasq started with: --address=/*.lan.telemaque.ska.sh/192.168.1.122 --server=/*.lan.telemaque.ska.sh/ (exit 0)
+A lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=true answers=1 [A 93.184.216.66] authority=[]
+AAAA lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=true answers=1 [AAAA 2606:4700::66] authority=[]
+HTTPS lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+A breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+HTTPS breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+A a.b.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA a.b.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+HTTPS a.b.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+A example.com @127.0.0.1:53: rcode=RCodeSuccess aa=true answers=1 [A 93.184.216.10] authority=[]
+
+### dnsmasq: --address=/rebind.example/192.168.1.122 (a LOCAL answer to a private address, under rebind protection)
+dnsmasq started with: --address=/rebind.example/192.168.1.122 (exit 0)
+A rebind.example @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA rebind.example @127.0.0.1:54: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+
+### dnsmasq: --host-record=exact.example,192.168.1.122 (exact name only)
+dnsmasq started with: --host-record=exact.example,192.168.1.122 (exit 0)
+A exact.example @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA exact.example @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [AAAA 2606:4700::66] authority=[]
+HTTPS exact.example @127.0.0.1:54: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+A sub.exact.example @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 93.184.216.66] authority=[]
+AAAA sub.exact.example @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [AAAA 2606:4700::66] authority=[]
+HTTPS sub.exact.example @127.0.0.1:54: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+
+### dnsmasq: --address=/exact.example/192.168.1.122 (does it cover subdomains too?)
+dnsmasq started with: --address=/exact.example/192.168.1.122 (exit 0)
+A exact.example @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA exact.example @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [AAAA 2606:4700::66] authority=[]
+A sub.exact.example @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA sub.exact.example @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [AAAA 2606:4700::66] authority=[]
+
+### dnsmasq: both --address=/*.x/ and --address=/x/ forms together, plus a more specific sibling
+dnsmasq started with: --address=/*.lan.telemaque.ska.sh/192.168.1.122 --address=/other.lan.telemaque.ska.sh/192.168.1.150 (exit 0)
+A lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 93.184.216.66] authority=[]
+A a.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+A other.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.150] authority=[]
+A x.other.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.150] authority=[]
+
+### dnsmasq: a name under the router's own local=/lan/ domain
+dnsmasq started with: --address=/printer.lan/192.168.1.122 (exit 0)
+A printer.lan @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+A nothing.lan @127.0.0.1:54: rcode=RCodeNameError aa=false answers=0 [] authority=[]
+
+### dnsmasq --test accepts the wildcard form as a conf-file line (init script writes address= lines)
+dnsmasq: syntax check OK.
+
+### AdGuard: baseline, no rewrites; every name falls through to the sentinel
+A breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 93.184.216.66] authority=[]
+AAAA breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [AAAA 2606:4700::66] authority=[]
+
+### AdGuard API: rewrite list (empty), and the add/list shape
+[HTTP 200] []
+[HTTP 200] 
+[HTTP 200] 
+[HTTP 200] [{"domain":"*.lan.telemaque.ska.sh","answer":"192.168.1.122","enabled":true},{"domain":"exact.example","answer":"192.168.1.122","enabled":true}]
+[HTTP 200] 
+(the line above: adding an exact duplicate)
+[HTTP 200] [{"domain":"*.lan.telemaque.ska.sh","answer":"192.168.1.122","enabled":true},{"domain":"exact.example","answer":"192.168.1.122","enabled":true},{"domain":"*.lan.telemaque.ska.sh","answer":"192.168.1.122","enabled":true}]
+
+### AdGuard: rewrites *.lan.telemaque.ska.sh and exact.example -> 192.168.1.122 (filtered client 127.0.0.1)
+A lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 93.184.216.66] authority=[]
+AAAA lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [AAAA 2606:4700::66] authority=[]
+HTTPS lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+A breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 192.168.1.122] authority=[]
+AAAA breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+HTTPS breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+A a.b.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 192.168.1.122] authority=[]
+AAAA a.b.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+HTTPS a.b.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+A exact.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 192.168.1.122] authority=[]
+AAAA exact.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+HTTPS exact.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+A sub.exact.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 93.184.216.66] authority=[]
+AAAA sub.exact.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [AAAA 2606:4700::66] authority=[]
+HTTPS sub.exact.example @127.0.0.1:53: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+
+### AdGuard: same, from a client with filtering_enabled=false (127.0.0.8)
+A lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 93.184.216.66] authority=[]
+AAAA lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [AAAA 2606:4700::66] authority=[]
+HTTPS lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+A breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 93.184.216.66] authority=[]
+AAAA breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [AAAA 2606:4700::66] authority=[]
+TIMEOUT/READ-ERROR read udp 127.0.0.8:53584->127.0.0.1:53: i/o timeout
+A a.b.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 93.184.216.66] authority=[]
+AAAA a.b.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [AAAA 2606:4700::66] authority=[]
+HTTPS a.b.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+A exact.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 93.184.216.66] authority=[]
+AAAA exact.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [AAAA 2606:4700::66] authority=[]
+HTTPS exact.example @127.0.0.1:53: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+A sub.exact.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 93.184.216.66] authority=[]
+AAAA sub.exact.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [AAAA 2606:4700::66] authority=[]
+HTTPS sub.exact.example @127.0.0.1:53: rcode=RCodeRefused aa=false answers=0 [] authority=[]
+
+### AdGuard: protection DISABLED globally
+[HTTP 200] OK
+A breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 192.168.1.122] authority=[]
+AAAA breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+[HTTP 200] OK
+
+### AdGuard: filtering DISABLED globally (filtering/config enabled=false)
+[HTTP 200] 
+A breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 93.184.216.66] authority=[]
+AAAA breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [AAAA 2606:4700::66] authority=[]
+[HTTP 200] 
+
+### AdGuard: rewrite with enabled=false (newer API field), and the settings endpoint
+[HTTP 200] 
+[HTTP 200] [{"domain":"*.lan.telemaque.ska.sh","answer":"192.168.1.122","enabled":true},{"domain":"exact.example","answer":"192.168.1.122","enabled":true},{"domain":"*.lan.telemaque.ska.sh","answer":"192.168.1.122","enabled":true},{"domain":"off.example","answer":"192.168.1.122","enabled":false}]
+[HTTP 200] {"enabled":true}
+
+### AdGuard: delete by exact (domain, answer); a wrong answer deletes nothing
+[HTTP 200] 
+[HTTP 200] [{"domain":"*.lan.telemaque.ska.sh","answer":"192.168.1.122","enabled":true},{"domain":"exact.example","answer":"192.168.1.122","enabled":true},{"domain":"*.lan.telemaque.ska.sh","answer":"192.168.1.122","enabled":true},{"domain":"off.example","answer":"192.168.1.122","enabled":false}]
+[HTTP 200] 
+[HTTP 200] [{"domain":"*.lan.telemaque.ska.sh","answer":"192.168.1.122","enabled":true},{"domain":"*.lan.telemaque.ska.sh","answer":"192.168.1.122","enabled":true},{"domain":"off.example","answer":"192.168.1.122","enabled":false}]
+A exact.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 93.184.216.66] authority=[]
+
+### AdGuard: deleting a DUPLICATED rewrite once: does it remove one or both?
+[HTTP 200] 
+[HTTP 200] [{"domain":"off.example","answer":"192.168.1.122","enabled":false}]
+A breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 93.184.216.66] authority=[]
+
+### AdGuard: the pair 'x' + '*.x' (how curfew would render a bare name)
+[HTTP 200] 
+[HTTP 200] 
+A pair.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 192.168.1.122] authority=[]
+AAAA pair.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+A a.pair.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 192.168.1.122] authority=[]
+AAAA a.pair.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+A a.b.pair.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 192.168.1.122] authority=[]
+AAAA a.b.pair.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+
+### AdGuard: update (domain, answer) in place, as a set-ip move would
+[HTTP 200] 
+[HTTP 200] [{"domain":"off.example","answer":"192.168.1.122","enabled":false},{"domain":"pair.example","answer":"192.168.1.150","enabled":true},{"domain":"*.pair.example","answer":"192.168.1.122","enabled":true}]
+A pair.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 192.168.1.150] authority=[]
+
+### AdGuard: an exact rewrite nested under another wildcard: which wins?
+[HTTP 200] 
+[HTTP 200] 
+[HTTP 200] 
+A a.nest.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 192.168.1.122] authority=[]
+A nas.nest.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 192.168.1.150] authority=[]
+A x.nas.nest.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 192.168.1.122] authority=[]
+A x.deep.nest.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 192.168.1.151] authority=[]
+
+### AdGuard: does a rewrite write touch the filtering engine? (log lines mentioning filters, before/after)
+285
+[HTTP 200] 
+286
+2026/11/18 15:05:34.371793 593#185 [debug] filtering: added rewrite element domain=engine.example answer=192.168.1.122 rewrites_len=7
+2026/11/18 15:05:34.371824 593#185 [debug] config_modifier: writing config file path=/opt/AdGuardHome/AdGuardHome.yaml
+2026/11/18 15:05:34.372218 593#185 [debug] finished server=plain host=127.0.0.1:3000 method=POST raddr=127.0.0.1:54770 request_uri=/control/rewrite/add code=200 elapsed=475.082µs
+
+### AdGuard: $dnsrewrite in a filter rule (the considered alternative), A only
+[HTTP 200] 
+A alt.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 192.168.1.122] authority=[]
+AAAA alt.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+HTTPS alt.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+A sub.alt.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 192.168.1.122] authority=[]
+AAAA sub.alt.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+HTTPS sub.alt.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+A alt.example @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [A 93.184.216.66] authority=[]
+(the line above: from the filtering_enabled=false client)
+
+### AdGuard: AAAA with an explicit empty-AAAA rewrite? (answer '::'?)
+[HTTP 200] 
+[HTTP 200] [{"domain":"off.example","answer":"192.168.1.122","enabled":false},{"domain":"pair.example","answer":"192.168.1.150","enabled":true},{"domain":"*.pair.example","answer":"192.168.1.122","enabled":true},{"domain":"*.nest.example","answer":"192.168.1.122","enabled":true},{"domain":"nas.nest.example","answer":"192.168.1.150","enabled":true},{"domain":"*.deep.nest.example","answer":"192.168.1.151","enabled":true},{"domain":"engine.example","answer":"192.168.1.122","enabled":true},{"domain":"*.lan.telemaque.ska.sh","answer":"AAAA","enabled":true}]
+AAAA breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:53: rcode=RCodeSuccess aa=false answers=1 [AAAA 2606:4700::66] authority=[]
+
+AdGuard log tail:
+2026/11/18 15:05:36.556611 593#97 [debug] dnsproxy: tcp connection closed addr=127.0.0.1:53
+2026/11/18 15:05:36.556630 593#80 [debug] dnsproxy: udp connection closed addr=127.0.0.1:53
+2026/11/18 15:05:36.556647 593#18 [info] dnsproxy: stopped dns proxy server
+2026/11/18 15:05:36.556681 593#18 [debug] stats: flushing unit id=498615 req_num=57
+2026/11/18 15:05:36.556815 593#18 [debug] stats: database closed

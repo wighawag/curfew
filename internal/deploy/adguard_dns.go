@@ -2,12 +2,15 @@ package deploy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/wighawag/curfew/internal/adguard"
+	"github.com/wighawag/curfew/internal/dhcplock"
 )
 
 // Making AdGuard actually own DNS, which is the half that was missing.
@@ -125,28 +128,82 @@ func setDHCPOptions(r Runner, options []string) error {
 	return nil
 }
 
+// TakeoverLockWait is how long moving dnsmasq waits for the daemon to finish
+// a pin transaction. Generous, because the daemon's transaction includes a
+// liveness check and possibly a rollback, and giving up here would abandon an
+// install half-way.
+const TakeoverLockWait = 60 * time.Second
+
+// lockDHCP is the lock every curfew writer of the dhcp config takes
+// (internal/dhcplock). The daemon takes it around its whole pin transaction;
+// moving dnsmasq takes it around exactly the stage-commit-restart below, and
+// NOT across AdGuard's bind wait, which can last 43 seconds. Without it, a
+// daemon rollback that started before this move could restore port 53 after
+// it, while AdGuard holds 53. A variable only so a test can demonstrate that
+// race; nothing else replaces it.
+var lockDHCP = func(r Runner) (dhcplock.Release, error) {
+	return dhcplock.Acquire(r, TakeoverLockWait)
+}
+
+// errNotLocked marks a failure to take the lock, before anything was changed,
+// so the caller knows there is nothing to roll back.
+type errNotLocked struct{ err error }
+
+func (e errNotLocked) Error() string { return e.err.Error() }
+func (e errNotLocked) Unwrap() error { return e.err }
+
+func withDHCPLock(r Runner, what string, f func() error) error {
+	release, err := lockDHCP(r)
+	if err != nil {
+		return errNotLocked{fmt.Errorf("%s: %w", what, err)}
+	}
+	defer release()
+	return f()
+}
+
+// withDHCPLockOrAnyway is for the ROLLBACK only. Restoring port 53 is the
+// step that gives the household its resolver back, so it must never be
+// refused: it waits for the lock like everything else, and if it cannot get
+// it (a daemon that died holding it keeps it for up to dhcplock.MaxHold) it
+// restores anyway and says so. A rare interleaving with a daemon pass is a
+// smaller risk than a house left with dnsmasq on 54 and no AdGuard.
+func withDHCPLockOrAnyway(r Runner, f func() error) error {
+	release, err := lockDHCP(r)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "curfew: warning: could not take the DHCP config lock (%v); "+
+			"restoring dnsmasq to port 53 anyway, because the household needs a resolver\n", err)
+		return f()
+	}
+	defer release()
+	return f()
+}
+
 // moveDnsmasqTo54 frees port 53 for AdGuard and points DHCP at the router for
 // DNS, which is the arrangement ADR 0002 describes. dnsmasq keeps DHCP.
 //
 // It returns the DHCP options as they were, so a rollback can put them back
 // exactly rather than approximately.
-func moveDnsmasqTo54(r Runner, routerIP string) ([]string, error) {
-	before, err := dhcpOptions(r)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := r.Run("uci set dhcp.@dnsmasq[0].port=54"); err != nil {
-		return before, fmt.Errorf("moving dnsmasq to port 54: %w", err)
-	}
-	if err := setDHCPOptions(r, withDNSOption(before, routerIP)); err != nil {
-		return before, err
-	}
-	for _, cmd := range []string{"uci commit dhcp", "/etc/init.d/dnsmasq restart"} {
-		if _, err := r.Run(cmd); err != nil {
-			return before, fmt.Errorf("moving dnsmasq to port 54 (%s): %w", cmd, err)
+func moveDnsmasqTo54(r Runner, routerIP string) (before []string, err error) {
+	err = withDHCPLock(r, "moving dnsmasq to port 54", func() error {
+		var readErr error
+		before, readErr = dhcpOptions(r)
+		if readErr != nil {
+			return readErr
 		}
-	}
-	return before, nil
+		if _, err := r.Run("uci set dhcp.@dnsmasq[0].port=54"); err != nil {
+			return fmt.Errorf("moving dnsmasq to port 54: %w", err)
+		}
+		if err := setDHCPOptions(r, withDNSOption(before, routerIP)); err != nil {
+			return err
+		}
+		for _, cmd := range []string{"uci commit dhcp", "/etc/init.d/dnsmasq restart"} {
+			if _, err := r.Run(cmd); err != nil {
+				return fmt.Errorf("moving dnsmasq to port 54 (%s): %w", cmd, err)
+			}
+		}
+		return nil
+	})
+	return before, err
 }
 
 // restoreDnsmasqTo53 is the ROLLBACK, and it is why taking port 53 is safe to
@@ -158,18 +215,20 @@ func moveDnsmasqTo54(r Runner, routerIP string) ([]string, error) {
 // up where it started: dnsmasq answering, nothing filtered, and its DHCP
 // options exactly as they were.
 func restoreDnsmasqTo53(r Runner, options []string) error {
-	if _, err := r.Run("uci set dhcp.@dnsmasq[0].port=53"); err != nil {
-		return fmt.Errorf("restoring dnsmasq to port 53: %w", err)
-	}
-	if err := setDHCPOptions(r, options); err != nil {
-		return err
-	}
-	for _, cmd := range []string{"uci commit dhcp", "/etc/init.d/dnsmasq restart"} {
-		if _, err := r.Run(cmd); err != nil {
-			return fmt.Errorf("restoring dnsmasq to port 53 (%s): %w", cmd, err)
+	return withDHCPLockOrAnyway(r, func() error {
+		if _, err := r.Run("uci set dhcp.@dnsmasq[0].port=53"); err != nil {
+			return fmt.Errorf("restoring dnsmasq to port 53: %w", err)
 		}
-	}
-	return nil
+		if err := setDHCPOptions(r, options); err != nil {
+			return err
+		}
+		for _, cmd := range []string{"uci commit dhcp", "/etc/init.d/dnsmasq restart"} {
+			if _, err := r.Run(cmd); err != nil {
+				return fmt.Errorf("restoring dnsmasq to port 53 (%s): %w", cmd, err)
+			}
+		}
+		return nil
+	})
 }
 
 // ensureServiceEnabled makes AdGuard start at boot.
@@ -339,6 +398,13 @@ func takeOverDNS(r Runner, opt AdGuardOptions, report *AdGuardReport, forceResta
 	if inTheWay {
 		report.MovedDnsmasq = true
 		before, err := moveDnsmasqTo54(r, opt.RouterIP)
+		var notLocked errNotLocked
+		if errors.As(err, &notLocked) {
+			// Nothing was touched, so there is nothing to roll back; a
+			// rollback here would rewrite the DHCP options from nothing.
+			report.MovedDnsmasq = false
+			return fmt.Errorf("%w; nothing was changed, dnsmasq still serves DNS. Re-run in a minute", err)
+		}
 		report.dhcpOptionsBefore = before
 		if err != nil {
 			return rollback(r, report, err)

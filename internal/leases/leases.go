@@ -50,6 +50,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/wighawag/curfew/internal/dhcplock"
 )
 
 // SectionPrefix marks a uci host section as curfew's own. It is the ONLY
@@ -185,6 +187,9 @@ type Device struct {
 	// Fixed is the household's chosen address for the device (registry.Device
 	// IP), already screened against the LAN by ScreenFixed. Empty means none.
 	Fixed string
+	// DNSNames are the device's local DNS names (registry.Device DNSNames),
+	// answered by dnsmasq at Fixed when it is actually pinned. See names.go.
+	DNSNames []string
 }
 
 // Plan is what a reconcile decided to do, and why.
@@ -210,6 +215,13 @@ type Plan struct {
 	// Unaddressed are registered devices with no known IP and no pin, so
 	// nothing could be pinned for them.
 	Unaddressed []string
+	// Names is what the pass decided about local DNS names on the dnsmasq
+	// side. Its commands are already part of Commands, in the same
+	// transaction; Targets are what the AdGuard half answers too.
+	Names NamesPlan
+	// NamesSkipped says why local names were not managed at all this pass,
+	// when they were not (an unreadable ledger, for example).
+	NamesSkipped string
 	// Pinned maps MAC to the IPv4 address curfew is confident about, INCLUDING
 	// addresses owned by a foreign entry and pins kept for a device that is
 	// offline. A foreign pin is still a pin, and using it costs nothing while
@@ -485,31 +497,84 @@ type Runner interface {
 	Run(cmd string) (string, error)
 }
 
+// StageDir is where curfew stages its own uci changes to the dhcp config,
+// instead of uci's default /tmp/.uci.
+//
+// Measured in the test image: the default staging area is SHARED between
+// processes, so anybody's `uci commit dhcp` (a person in an ssh session, the
+// install-time DNS takeover) commits whatever curfew has staged but not yet
+// committed. A private save path is invisible to a default commit. Note the
+// converse does NOT hold: committing with -t also commits what others staged
+// in the default area, exactly as a plain commit always did. And `uci -P` is
+// not a substitute: its commit was measured to commit NOTHING while exiting 0.
+// See work/notes/findings/uci-staging-is-shared-and-flock-serialises-curfew-dhcp-writes.md.
+const StageDir = "/tmp/.uci-curfew"
+
+// ApplyLockWait is how long a pin transaction waits for another curfew writer
+// (the DNS takeover) to finish before giving up on this pass. A daemon pass
+// that gives up loses nothing: the next tick tries again.
+const ApplyLockWait = 10 * time.Second
+
+// lockDHCP is the lock every curfew writer of the dhcp config takes. A
+// variable only so a test can demonstrate the race it closes; nothing else
+// replaces it.
+var lockDHCP = func(r Runner) (dhcplock.Release, error) {
+	return dhcplock.Acquire(r, ApplyLockWait)
+}
+
+// staged rewrites a uci command to stage in StageDir. Plans are written as
+// plain `uci ...` commands so they stay readable in tests and logs.
+func staged(cmd string) string {
+	if strings.HasPrefix(cmd, "uci ") {
+		return "uci -t " + StageDir + " " + strings.TrimPrefix(cmd, "uci ")
+	}
+	return cmd
+}
+
 // Apply runs a plan and makes dnsmasq pick it up, reporting whether it changed
 // anything.
 //
 // It commits and reloads ONLY when there was something to do. A reload on
 // every tick would restart the household's DHCP service every minute, which is
 // a great deal worse than the drift it would be correcting.
+//
+// The whole transaction (stage, backup, commit, reload, verify, any rollback)
+// runs under the DHCP config lock (internal/dhcplock), so the install-time DNS
+// takeover cannot commit in the middle of it. Without the lock the worst case
+// is an outage: the takeover moves dnsmasq to 54 after this backup was taken,
+// and this rollback then restores 53 while AdGuard holds 53. When another
+// writer holds the lock for the whole wait, Apply changes nothing and returns
+// an error wrapping dhcplock.ErrBusy.
 func Apply(r Runner, plan Plan) (bool, error) {
 	if len(plan.Commands) == 0 {
 		return false, nil
 	}
+	release, err := lockDHCP(r)
+	if err != nil {
+		return false, fmt.Errorf("not pinning static leases this time: %w", err)
+	}
+	defer release()
+	// Anything left in the private staging area is from a pass that died
+	// mid-way. It must not ride along with this commit.
+	if _, err := r.Run("rm -rf " + StageDir); err != nil {
+		return false, fmt.Errorf("clearing curfew's uci staging area: %w", err)
+	}
 	for _, cmd := range plan.Commands {
-		if _, err := r.Run(cmd); err != nil {
+		if _, err := r.Run(staged(cmd)); err != nil {
 			// Leave the uncommitted changes behind rather than committing a
-			// half-built set: `uci revert` puts the file back exactly.
-			_, _ = r.Run("uci revert dhcp")
+			// half-built set: a revert puts the file back exactly.
+			_, _ = r.Run(staged("uci revert dhcp"))
 			return false, fmt.Errorf("pinning static leases (%s): %w", cmd, err)
 		}
 	}
 	// Keep the file as it was BEFORE committing, so a rollback can restore it
-	// exactly. `uci revert` only helps before a commit, and the failure this
+	// exactly. A revert only helps before a commit, and the failure this
 	// guards against is only visible after one.
 	if _, err := r.Run("cp /etc/config/dhcp /tmp/dhcp.curfew-rollback"); err != nil {
+		_, _ = r.Run(staged("uci revert dhcp"))
 		return false, fmt.Errorf("backing up the dhcp config before pinning leases: %w", err)
 	}
-	if _, err := r.Run("uci commit dhcp"); err != nil {
+	if _, err := r.Run(staged("uci commit dhcp")); err != nil {
 		return false, fmt.Errorf("committing static leases: %w", err)
 	}
 	if _, err := r.Run("/etc/init.d/dnsmasq reload"); err != nil {
@@ -523,7 +588,56 @@ func Apply(r Runner, plan Plan) (bool, error) {
 	if err := dnsmasqAlive(r); err != nil {
 		return true, rollbackDHCP(r, err)
 	}
+	// When dnsmasq is the household's RESOLVER (port 53, as after panic-off),
+	// a running process is not enough: a record it chokes on, or a bind it
+	// lost, is a house with no DNS. So it must also answer a question.
+	if err := resolverAlive(r); err != nil {
+		return true, rollbackDHCP(r, err)
+	}
 	return true, nil
+}
+
+// resolverAlive checks that dnsmasq answers DNS, but only when it is the
+// resolver: with AdGuard holding 53 (dnsmasq on 54) its DNS is unused by the
+// household and nothing here depends on it.
+//
+// The question is for a name in the router's LOCAL domain (`option local`,
+// "lan" on this router), which dnsmasq answers itself without asking
+// upstream, so a WAN outage cannot look like a dead resolver and trigger a
+// rollback that fixes nothing. Any answer counts, NXDOMAIN included. Measured
+// with busybox nslookup: an answer prints a "Server:" line; nothing listening
+// and a resolver whose upstream is dead both print "no servers could be
+// reached" instead.
+func resolverAlive(r Runner) error {
+	port, _ := r.Run("uci -q get dhcp.@dnsmasq[0].port || true")
+	if p := strings.TrimSpace(port); p != "" && p != "53" {
+		return nil
+	}
+	local, _ := r.Run("uci -q get dhcp.@dnsmasq[0].local || true")
+	probe := "localhost"
+	if d := strings.Trim(strings.TrimSpace(local), "/"); d != "" {
+		probe = "curfew-probe." + d
+	}
+	var last string
+	for range 6 {
+		out, _ := r.Run(fmt.Sprintf("nslookup %s 127.0.0.1 2>&1 || true", shellQuote(probe)))
+		if strings.Contains(out, "Server:") {
+			return nil
+		}
+		if strings.Contains(out, "not found") && strings.Contains(out, "nslookup") {
+			// No probe on this router. That says nothing about dnsmasq, and
+			// rolling back every change because of it would be worse.
+			return nil
+		}
+		last = strings.TrimSpace(out)
+		time.Sleep(time.Second)
+	}
+	msg := "dnsmasq is running but NOT answering DNS on port 53, and it is the household's " +
+		"resolver, so nothing on the LAN could resolve a name"
+	if last != "" {
+		msg += "\n       nslookup said: " + last
+	}
+	return errors.New(msg)
 }
 
 // dnsmasqAlive reports whether dnsmasq is actually serving, quoting its own

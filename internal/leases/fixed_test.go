@@ -425,6 +425,12 @@ func (s *scriptedRunner) Run(cmd string) (string, error) {
 	if strings.HasPrefix(cmd, "pgrep dnsmasq") {
 		return "yes\n", nil
 	}
+	if strings.Contains(cmd, "flock -n 9") {
+		return "lock:held\n", nil
+	}
+	if strings.HasPrefix(cmd, "nslookup") {
+		return "Server:\t\t127.0.0.1\n", nil
+	}
 	return "", nil
 }
 
@@ -436,7 +442,7 @@ func TestPassPinsAFixedAddressAndReportsAnInvalidOne(t *testing.T) {
 	plan, err := Pass(r, []Device{
 		{MAC: shyrkaMAC, IP: "192.168.1.226", Fixed: "192.168.1.150"},
 		{MAC: "14:e0:1d:6a:9c:6c", Fixed: "192.168.1.255"},
-	})
+	}, PassOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -449,7 +455,7 @@ func TestPassPinsAFixedAddressAndReportsAnInvalidOne(t *testing.T) {
 	if len(plan.Refused) != 1 {
 		t.Errorf("the invalid address must be reported: %+v", plan.Refused)
 	}
-	if !strings.Contains(strings.Join(r.ran, "\n"), "uci commit dhcp") {
+	if !strings.Contains(strings.Join(r.ran, "\n"), " commit dhcp") {
 		t.Errorf("the plan was not applied: %v", r.ran)
 	}
 }

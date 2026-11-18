@@ -30,6 +30,8 @@ import (
 	"github.com/wighawag/curfew/internal/adguard"
 	"github.com/wighawag/curfew/internal/blockstate"
 	"github.com/wighawag/curfew/internal/budget"
+	"github.com/wighawag/curfew/internal/dnsledger"
+	"github.com/wighawag/curfew/internal/dnsnames"
 	"github.com/wighawag/curfew/internal/dnspolicy"
 	"github.com/wighawag/curfew/internal/enforce"
 	"github.com/wighawag/curfew/internal/httpui"
@@ -56,13 +58,16 @@ type options struct {
 	registryPath string
 	profilesPath string
 	statePath    string
-	lan          string
-	wan          string
-	listen       string
-	user         string
-	password     string
-	reconcile    time.Duration
-	timezone     string
+	// dnsLedgerPath is curfew's record of the DNS records it wrote for local
+	// DNS names, which is how it knows which ones it owns (docs/adr/0014).
+	dnsLedgerPath string
+	lan           string
+	wan           string
+	listen        string
+	user          string
+	password      string
+	reconcile     time.Duration
+	timezone      string
 	// AdGuard credentials, for the per-profile DNS restrictions. Absent means
 	// the whole DNS refinement is off, which degrades nothing else: schedules,
 	// budgets, manual blocks and tickets are nftables on MAC and do not consult
@@ -94,6 +99,8 @@ func run(args []string, stderr *os.File) int {
 		"path to the profiles and schedules")
 	fs.StringVar(&opt.statePath, "state", envOr("CURFEW_STATE", blockstate.DefaultPath),
 		"path to the persisted block state (manual blocks, which must survive a reboot)")
+	fs.StringVar(&opt.dnsLedgerPath, "dns-ledger", envOr("CURFEW_DNS_LEDGER", dnsledger.DefaultPath),
+		"path to the record of the DNS records curfew wrote for local DNS names (which ones it owns)")
 	fs.StringVar(&opt.lan, "lan", envOr("CURFEW_LAN", "br-lan"), "LAN interface")
 	fs.StringVar(&opt.wan, "wan", envOr("CURFEW_WAN", ""),
 		"WAN interface (required: guessing it is how enforcement silently matches nothing)")
@@ -255,6 +262,16 @@ func run(args []string, stderr *os.File) int {
 	ui.UseAddresses(func() (leases.Survey, error) {
 		return leases.ReadSurvey(shellrun.Local{}, dnspolicy.DefaultLeasePath)
 	})
+	// And local DNS names, against this router's own local domain and NTP
+	// servers, with the same rules 'curfew push' runs.
+	ui.UseNameContext(func() (dnsnames.Context, error) {
+		dhcp, err := shellrun.Local{}.Run("uci show dhcp")
+		if err != nil {
+			return dnsnames.Context{}, err
+		}
+		system, _ := shellrun.Local{}.Run("uci -q show system || true")
+		return dnsnames.ContextFromUCI(dhcp, system), nil
+	})
 	if dns != nil {
 		ui.ServeFilterList(dnspolicy.FilterListPath, dns.FilterList)
 		// So the settings page can offer AdGuard's own service catalogue
@@ -283,7 +300,7 @@ func run(args []string, stderr *os.File) int {
 		// The DNS layer pins leases itself, because it needs the result.
 		go dnsLoop(ctx, log, dns, opt.reconcile)
 	} else {
-		go leaseLoop(ctx, log, store, opt.reconcile)
+		go leaseLoop(ctx, log, store, opt.dnsLedgerPath, opt.reconcile)
 	}
 
 	errCh := make(chan error, 1)
@@ -416,6 +433,13 @@ func setUpDNSRestrictions(opt options, sched schedule.FileStore, store registry.
 			"what_does_not", "per-profile website and service restrictions",
 			"how_to_fix", "re-run 'curfew install' from your laptop, which writes the AdGuard "+
 				"settings into "+deployDaemonConf+"; 'curfew update' deliberately leaves that file alone")
+		// Rewrites curfew made earlier stay in AdGuard, answering at the
+		// address they had; without credentials they cannot be checked.
+		if l, err := dnsledger.Load(opt.dnsLedgerPath); err == nil && len(l.AdGuard) > 0 {
+			log.Warn("AdGuard still holds local DNS name rewrites curfew created, and with no "+
+				"credentials curfew cannot update or remove them",
+				"rewrites", len(l.AdGuard), "what_still_works", "dnsmasq answers the names")
+		}
 		return nil
 	}
 	ps, err := sched.Load()
@@ -434,8 +458,9 @@ func setUpDNSRestrictions(opt options, sched schedule.FileStore, store registry.
 		"adguard", opt.adguardURL, "filter_list", listURL)
 
 	return dnspolicy.NewManager(dnspolicy.Config{
-		Registry: store, Schedule: sched, Runner: shellrun.Local{}, API: api,
+		Registry: store, Schedule: sched, Runner: shellrun.Local{}, API: api, Rewrites: api,
 		ListURL: listURL, LANInterface: opt.lan, Location: loc, Log: log,
+		LedgerPath: opt.dnsLedgerPath,
 		// The daemon runs on the router, so it can ask the kernel whether
 		// AdGuard can afford a filter-engine rebuild before causing one. It
 		// could not, once, and the house lost DNS for it.
@@ -493,7 +518,9 @@ func dnsLoop(ctx context.Context, log *slog.Logger, m *dnspolicy.Manager, every 
 // refuses to send a fixed address to a daemon that does not list
 // "fixed-address", because that daemon's page would drop the field on its next
 // save and the next pull would read that as the household clearing it.
-var features = []string{"fixed-address"}
+//
+// "local-dns-names" is the same promise for local DNS names (docs/adr/0013).
+var features = []string{"fixed-address", "local-dns-names"}
 
 // leaseLoop keeps the fixed addresses pinned when the AdGuard layer is off.
 //
@@ -502,7 +529,7 @@ var features = []string{"fixed-address"}
 // is taken from an observed address, because nothing would use it; pins curfew
 // already owns are kept for registered devices and removed for deregistered
 // ones, exactly as when AdGuard is on.
-func leaseLoop(ctx context.Context, log *slog.Logger, store registry.FileStore, every time.Duration) {
+func leaseLoop(ctx context.Context, log *slog.Logger, store registry.FileStore, ledgerPath string, every time.Duration) {
 	if every <= 0 {
 		return
 	}
@@ -514,9 +541,11 @@ func leaseLoop(ctx context.Context, log *slog.Logger, store registry.FileStore, 
 		}
 		devices := make([]leases.Device, 0, len(reg.Devices))
 		for _, d := range reg.Devices {
-			devices = append(devices, leases.Device{MAC: d.MAC, Name: d.Name, Fixed: d.IP})
+			devices = append(devices, leases.Device{MAC: d.MAC, Name: d.Name, Fixed: d.IP, DNSNames: d.DNSNames})
 		}
-		leases.PassAndLog(shellrun.Local{}, log, devices)
+		// Local DNS names ride the same transaction: with AdGuard off,
+		// dnsmasq is the only thing answering them.
+		leases.PassAndLog(shellrun.Local{}, log, devices, leases.PassOptions{LedgerPath: ledgerPath})
 	}
 	pass()
 	ticker := time.NewTicker(every)

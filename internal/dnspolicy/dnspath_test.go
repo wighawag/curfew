@@ -123,16 +123,39 @@ func lookupVerdict(t *testing.T, src, dst, name string) string {
 	return "ERROR:" + lastErr.Error()
 }
 
+// settle is how long a verdict may take to appear after a Tick. AdGuard
+// applies a client or list change ASYNCHRONOUSLY after the API call returns:
+// measured 2026-11-18, a query sent straight after Tick still got the old
+// verdict in roughly one full-suite run in four (an exception BLOCKED, a DoH
+// block RESOLVED), while the very next query, and every one for the following
+// five seconds, had the new one. That was the long-standing "unreproduced"
+// dnspolicy failure (work/notes/observations/one-unreproduced-dnspolicy-acceptance-failure-before-v0-9-3.md).
+// So a verdict is asserted as "becomes this within settle", which is still a
+// real answer from the child's own address, and still fails if it never does.
+const settle = 3 * time.Second
+
+func eventually(t *testing.T, src, dst, name string, ok func(string) bool) string {
+	t.Helper()
+	deadline := time.Now().Add(settle)
+	for {
+		v := lookupVerdict(t, src, dst, name)
+		if ok(v) || time.Now().After(deadline) {
+			return v
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 func mustResolve(t *testing.T, what, src, dst, name string) {
 	t.Helper()
-	if v := lookupVerdict(t, src, dst, name); !strings.HasPrefix(v, "RESOLVED") {
+	if v := eventually(t, src, dst, name, func(v string) bool { return strings.HasPrefix(v, "RESOLVED") }); !strings.HasPrefix(v, "RESOLVED") {
 		t.Errorf("%s: %s from %s should RESOLVE, got %s", what, name, src, v)
 	}
 }
 
 func mustBlock(t *testing.T, what, src, dst, name string) {
 	t.Helper()
-	if v := lookupVerdict(t, src, dst, name); v != "BLOCKED" {
+	if v := eventually(t, src, dst, name, func(v string) bool { return v == "BLOCKED" }); v != "BLOCKED" {
 		t.Errorf("%s: %s from %s should be BLOCKED, got %s", what, name, src, v)
 	}
 }
@@ -646,7 +669,7 @@ func TestAnAllowedDomainOverridesABlockFromAnotherList(t *testing.T) {
 	// BASELINE: it really is blocked, by that other list, before curfew says
 	// anything. Without this the assertion below would pass against a name
 	// that was never blocked at all.
-	if v := lookupVerdict(t, v6EliA, v6Server, "opensea.io"); v != "BLOCKED" {
+	if v := eventually(t, v6EliA, v6Server, "opensea.io", func(v string) bool { return v == "BLOCKED" }); v != "BLOCKED" {
 		t.Fatalf("baseline: opensea.io should be blocked by the category list, got %s", v)
 	}
 
@@ -701,7 +724,7 @@ func TestPublishingCurfewsListDoesNotRefetchTheHouseholdsLists(t *testing.T) {
 	if n := fetches.Load(); n != 1 {
 		t.Fatalf("baseline: the household's list should have been fetched once on add_url, got %d", n)
 	}
-	if v := lookupVerdict(t, v6EliA, v6Server, "opensea.io"); v != "BLOCKED" {
+	if v := eventually(t, v6EliA, v6Server, "opensea.io", func(v string) bool { return v == "BLOCKED" }); v != "BLOCKED" {
 		t.Fatalf("baseline: the household's list is not in force, got %s", v)
 	}
 
@@ -766,7 +789,7 @@ func TestACurfewListLeftDisabledInAdGuardIsSwitchedBackOn(t *testing.T) {
 
 	// Simulate the daemon dying half way through publishing.
 	disableFilter(t, list.URL+FilterListPath)
-	if v := lookupVerdict(t, v6EliA, v6Server, "opensea.io"); v != "BLOCKED" {
+	if v := eventually(t, v6EliA, v6Server, "opensea.io", func(v string) bool { return v == "BLOCKED" }); v != "BLOCKED" {
 		t.Fatalf("baseline: disabling curfew's list should have removed the exception, got %s", v)
 	}
 

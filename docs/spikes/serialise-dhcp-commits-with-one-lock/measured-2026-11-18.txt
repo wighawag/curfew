@@ -1,0 +1,41 @@
+
+### 1. Is the default staging area shared between processes?
+curfewa COMMITTED
+curfewb COMMITTED
+drwxr-xr-x    2 root     root          4096 Nov 18 15:28 .
+drwxr-xr-x    1 root     root          4096 Nov 18 15:28 ..
+-rw-------    1 root     root             0 Nov 18 15:28 dhcp
+
+### 2. A private save path (-t): invisible to a default commit, committed by its own?
+curfewc not committed
+default show sees it?  no
+-t show sees it?       1
+-P show sees it?       1
+curfewc COMMITTED
+curfewd COMMITTED
+
+### 2b. -P (search + save path): does its commit sweep up default-staged changes?
+staged files: dhcp | default: dhcp.lan.curfewe='1'
+commit exit 0
+curfewe not committed
+curfewf not committed
+after: private: dhcp.lan.curfewf='1' | default: dhcp.lan.curfewe='1'
+
+### 3. Does uci serialise concurrent commits? Two writers, private save paths, 60 commits each
+wa options kept: 60 of 60
+wb options kept: 60 of 60
+
+### 4. flock(1), lock(1) and Go flock(2) on one file
+go flock: ACQUIRED
+flock(1) -n while Go holds: BUSY
+Can't lock /var/lock/curfew-dhcp-test
+lock(1) -n while Go holds: BUSY
+go flock: BUSY: resource temporarily unavailable
+lock(1) caller exited
+go flock: BUSY: resource temporarily unavailable
+after the caller of lock(1) exited, the lock is still held by:   297 root      1232 S    lock /var/lock/curfew-dhcp-test
+go flock: ACQUIRED
+
+### 4b. A Go flock dies with its process
+go flock: ACQUIRED
+go flock: ACQUIRED

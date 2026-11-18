@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/wighawag/curfew/internal/budget"
+	"github.com/wighawag/curfew/internal/dnsnames"
 	"github.com/wighawag/curfew/internal/lanhosts"
 	"github.com/wighawag/curfew/internal/leases"
 	"github.com/wighawag/curfew/internal/registry"
@@ -125,6 +126,9 @@ type Server struct {
 	// addresses reads the router's DHCP view, for checking and showing fixed
 	// addresses, or is nil when nothing wired it up. See fixedip.go.
 	addresses func() (leases.Survey, error)
+	// nameContext is the router's own view for checking local DNS names
+	// (its local domain, its NTP servers); see dnsname.go.
+	nameContext func() (dnsnames.Context, error)
 }
 
 // UseAdGuardServices lets the settings page offer AdGuard's built-in service
@@ -185,6 +189,9 @@ type DeviceView struct {
 	// from the router's DHCP config, empty when there is none or it cannot be
 	// read. It differs from FixedIP until the next pass writes the change.
 	PinnedIP string `json:"pinned_ip,omitempty"`
+	// DNSNames are the device's local DNS names, which the router answers
+	// with FixedIP.
+	DNSNames []string `json:"dns_names,omitempty"`
 }
 
 func (s *Server) authOK(r *http.Request) bool {
@@ -231,6 +238,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/devices/rename", s.handleRenameDevice)
 	mux.HandleFunc("/devices/remove", s.handleRemoveDevice)
 	mux.HandleFunc("/devices/ip", s.handleSetIP)
+	mux.HandleFunc("/devices/dns-name", s.handleDNSName)
 	mux.HandleFunc("/api/devices", s.handleAPIDevices)
 	if s.filterList == nil || s.filterPath == "" {
 		return s.withAuth(s.withNoStore(mux))
@@ -327,7 +335,7 @@ func (s *Server) view() ([]DeviceView, error) {
 		seen[d.MAC] = true
 		allowed, _ := fw.verdict(d.MAC)
 		out = append(out, DeviceView{MAC: d.MAC, Name: d.Name, Allowed: allowed,
-			FixedIP: d.IP, PinnedIP: pinned[d.MAC]})
+			FixedIP: d.IP, PinnedIP: pinned[d.MAC], DNSNames: d.DNSNames})
 	}
 	for _, m := range live {
 		if !seen[m] {
@@ -635,7 +643,7 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
 {{if .Error}}<div class="err">{{.Error}}</div>{{end}}
 {{if .Notice}}<div class="notice">{{.Notice}}</div>{{end}}
 <table>
-<tr><th>Name</th><th>MAC</th><th>Allowed</th><th>Fixed address</th><th></th></tr>
+<tr><th>Name</th><th>MAC</th><th>Allowed</th><th>Fixed address</th><th>Local DNS names</th><th></th></tr>
 {{range .Devices}}
 <tr{{if .Unregistered}} class="warn"{{end}}>
   <td>
@@ -662,6 +670,25 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
       {{if .FixedIP}}<button type="submit" name="clear" value="1">Clear</button>{{end}}
     </form>
     {{if and .FixedIP .PinnedIP}}{{if ne .FixedIP .PinnedIP}}<div class="muted">pinned at {{.PinnedIP}} until the router applies it</div>{{end}}{{end}}
+  {{end}}</td>
+  <td>{{if not .Unregistered}}
+    {{$mac := .MAC}}
+    {{range .DNSNames}}
+    <form method="POST" action="/devices/dns-name" class="rename">
+      <input type="hidden" name="mac" value="{{$mac}}">
+      <input type="hidden" name="name" value="{{.}}">
+      <code>{{.}}</code>
+      <button type="submit" name="action" value="remove">Remove</button>
+    </form>
+    {{end}}
+    {{if .FixedIP}}
+    <form method="POST" action="/devices/dns-name" class="rename">
+      <input type="hidden" name="mac" value="{{.MAC}}">
+      <input name="name" placeholder="*.lan.example.com" autocapitalize="none" autocomplete="off"
+             aria-label="local DNS name for {{.MAC}}">
+      <button type="submit" name="action" value="add">Add</button>
+    </form>
+    {{else}}<span class="muted">needs a fixed address</span>{{end}}
   {{end}}</td>
   <td>{{if not .Unregistered}}
     <form method="POST" action="/devices/remove" class="remove"
@@ -735,6 +762,10 @@ saved list, so if the two ever disagree you will see it here.</p>
 device, for a server or a printer something else reaches by its address. With none, the device
 keeps the address it already has. A device moves to a new fixed address on its next DHCP renewal,
 or straight away if it reconnects.</p>
+<p class="muted">A <strong>local DNS name</strong> is a name the router itself answers with that
+device's fixed address, from AdGuard and from dnsmasq, so it works without the internet and after
+panic-off. <code>x.example.com</code> covers that name and every name below it;
+<code>*.x.example.com</code> covers only the names below it. The router answers IPv4 only.</p>
 </body>
 </html>
 `))

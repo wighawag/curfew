@@ -42,6 +42,12 @@ Usage:
   curfew set-ip <mac|name> <ip>   give a device a fixed address in your local list
   curfew set-ip <mac|name> --clear
                                   remove it (the device keeps the address it has)
+  curfew add-dns-name <mac|name> <dns-name>
+                                  have the router answer a local DNS name with the
+                                  device's fixed address ('x' covers x and below,
+                                  '*.x' only below; quote the '*')
+  curfew remove-dns-name <mac|name> <dns-name>
+                                  take a local DNS name off a device
   curfew version
 
 The host is an ssh destination, for example root@192.168.1.1.
@@ -77,6 +83,10 @@ func run(args []string) int {
 		err = cmdAdoptLeases(rest)
 	case "set-ip":
 		err = cmdSetIP(rest)
+	case "add-dns-name":
+		err = cmdAddDNSName(rest)
+	case "remove-dns-name":
+		err = cmdRemoveDNSName(rest)
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 		return 0
@@ -585,6 +595,28 @@ func cmdPush(args []string) error {
 		addressNotes = notes
 	}
 
+	// Local DNS names are checked the same way, against the router's local
+	// domain, its own hostnames and its dnsmasq lists, before anything is
+	// written (docs/adr/0013).
+	var nameNotes []string
+	if anyDNSNames(local) || anyDNSNames(remote) {
+		if err := requireDNSNamesSupport(daemonSupports(runner, DNSNamesFeature), local, host); err != nil {
+			return err
+		}
+		ctx, address, server, err := readNameContext(runner)
+		if err != nil {
+			return fmt.Errorf("cannot check the local DNS names against the router, so nothing "+
+				"was pushed: %w", err)
+		}
+		errs, notes := checkPushNames(ctx, address, server, local, remote)
+		if len(errs) > 0 {
+			return fmt.Errorf("nothing was pushed, because a local DNS name is not allowed on %s:\n  %s\n"+
+				"       Fix it with 'curfew remove-dns-name' or 'curfew add-dns-name', then push again",
+				host, strings.Join(errs, "\n  "))
+		}
+		nameNotes = notes
+	}
+
 	if err := deploy.Push(runner, *path); err != nil {
 		return err
 	}
@@ -598,6 +630,9 @@ func cmdPush(args []string) error {
 	}
 	if len(addressNotes) > 0 {
 		fmt.Println("The router pins fixed addresses on its next pass, within a minute.")
+	}
+	for _, n := range nameNotes {
+		fmt.Println(n)
 	}
 
 	msg, err := syncProfiles(runner, *path, false, *force)

@@ -1,8 +1,12 @@
 package leases
 
 import (
+	"errors"
+	"log/slog"
 	"strings"
 	"testing"
+
+	"github.com/wighawag/curfew/internal/dhcplock"
 )
 
 // realRouterUCI is the `uci show dhcp` output read off the live GL.iNet Flint 2
@@ -320,14 +324,14 @@ func TestApplyCommitsAndReloadsOnlyAfterAllCommandsSucceed(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(r.ran, "\n")
-	if !strings.Contains(joined, "uci commit dhcp") {
+	if !strings.Contains(joined, " commit dhcp") {
 		t.Errorf("nothing was committed, so the change dies at the next reboot:\n%s", joined)
 	}
 	if !strings.Contains(joined, "/etc/init.d/dnsmasq reload") {
 		t.Errorf("dnsmasq was never told, so the pin does not take effect:\n%s", joined)
 	}
 	// Order matters: commit before reload, or dnsmasq re-reads the old file.
-	if strings.Index(joined, "uci commit dhcp") > strings.Index(joined, "dnsmasq reload") {
+	if strings.Index(joined, " commit dhcp") > strings.Index(joined, "dnsmasq reload") {
 		t.Errorf("dnsmasq was reloaded before the commit:\n%s", joined)
 	}
 }
@@ -345,10 +349,10 @@ func TestApplyRevertsWhenACommandFails(t *testing.T) {
 		t.Fatal("want an error")
 	}
 	joined := strings.Join(r.ran, "\n")
-	if !strings.Contains(joined, "uci revert dhcp") {
+	if !strings.Contains(joined, " revert dhcp") {
 		t.Errorf("a half-built change was left uncommitted but not reverted:\n%s", joined)
 	}
-	if strings.Contains(joined, "uci commit dhcp") {
+	if strings.Contains(joined, " commit dhcp") {
 		t.Errorf("a failed run committed anyway:\n%s", joined)
 	}
 }
@@ -357,9 +361,12 @@ func TestApplyRevertsWhenACommandFails(t *testing.T) {
 // deliberately dumb: it knows nothing about uci, so it cannot agree with a
 // broken implementation the way a double reproducing production logic would.
 type recordingRunner struct {
-	ran         []string
-	failOn      string
-	dnsmasqDown bool
+	ran          []string
+	failOn       string
+	dnsmasqDown  bool
+	lockBusy     bool
+	resolverDown bool
+	port         string
 }
 
 func (r *recordingRunner) Run(cmd string) (string, error) {
@@ -367,8 +374,25 @@ func (r *recordingRunner) Run(cmd string) (string, error) {
 	if r.failOn != "" && strings.Contains(cmd, r.failOn) {
 		return "", errShellFailed
 	}
+	// The DHCP config lock's holder reports through a FIFO; answer as a free
+	// lock would. internal/dhcplock tests the real thing.
+	if strings.Contains(cmd, "flock -n 9") {
+		if r.lockBusy {
+			return "lock:busy\n", nil
+		}
+		return "lock:held\n", nil
+	}
 	// Replays the router's answer to the liveness probe. Dumb on purpose: the
 	// test sets dnsmasqDown, this just reports it.
+	if strings.Contains(cmd, "dhcp.@dnsmasq[0].port") {
+		return r.port, nil
+	}
+	if strings.HasPrefix(cmd, "nslookup") {
+		if r.resolverDown {
+			return ";; connection timed out; no servers could be reached\n", nil
+		}
+		return "Server:\t\t127.0.0.1\nAddress:\t127.0.0.1:53\n", nil
+	}
 	if strings.Contains(cmd, "pgrep dnsmasq") {
 		if r.dnsmasqDown {
 			return "no\n", nil
@@ -525,5 +549,116 @@ func TestApplyKeepsThePinWhenDnsmasqIsFine(t *testing.T) {
 	}
 	if strings.Contains(strings.Join(r.ran, "\n"), "cp /tmp/dhcp.curfew-rollback /etc/config/dhcp") {
 		t.Errorf("a successful apply rolled itself back:\n%v", r.ran)
+	}
+}
+
+// While another curfew writer holds the DHCP config lock, a pin transaction
+// must change NOTHING (not even stage), and say why in a way the daemon can
+// tell apart from a real failure.
+func TestApplyWritesNothingWhileAnotherWriterHoldsTheLock(t *testing.T) {
+	r := &recordingRunner{lockBusy: true}
+	changed, err := Apply(r, Plan{Commands: []string{"uci set dhcp.curfew_x=host"}})
+	if !errors.Is(err, dhcplock.ErrBusy) {
+		t.Fatalf("want ErrBusy, got %v", err)
+	}
+	if changed {
+		t.Error("a busy lock reported a change")
+	}
+	for _, c := range r.ran {
+		if strings.Contains(c, "flock -n 9") {
+			continue // the lock attempt itself
+		}
+		if strings.Contains(c, "uci ") || strings.Contains(c, "dnsmasq") || strings.HasPrefix(c, "cp ") {
+			t.Errorf("something was written without the lock: %q", c)
+		}
+	}
+}
+
+// curfew stages in its OWN save path, cleared first, so another process's
+// `uci commit dhcp` cannot commit curfew's half-built change, and a crashed
+// pass's leftovers cannot ride along with this one.
+func TestApplyStagesPrivatelyAfterClearingLeftovers(t *testing.T) {
+	r := &recordingRunner{}
+	if _, err := Apply(r, Plan{Commands: []string{"uci set dhcp.curfew_x=host", "uci -q delete dhcp.curfew_y || true"}}); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(r.ran, "\n")
+	clear := strings.Index(joined, "rm -rf "+StageDir)
+	first := strings.Index(joined, "uci -t "+StageDir+" set dhcp.curfew_x=host")
+	if clear < 0 || first < 0 || clear > first {
+		t.Errorf("staging must be cleared, then used privately:\n%s", joined)
+	}
+	for _, want := range []string{
+		"uci -t " + StageDir + " -q delete dhcp.curfew_y || true",
+		"uci -t " + StageDir + " commit dhcp",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing %q in:\n%s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "\nuci commit dhcp") || strings.Contains(joined, "\nuci set") {
+		t.Errorf("something was staged or committed in the shared default area:\n%s", joined)
+	}
+}
+
+// The daemon logs a busy lock as a skipped pass and carries on: it is not a
+// failure of the refinement and must not read like one.
+func TestPassAndLogReportsABusyLockAsASkippedPass(t *testing.T) {
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	r := &busyPassRunner{}
+	PassAndLog(r, log, []Device{{MAC: "14:e0:1d:6a:9c:6c", IP: "192.168.1.123"}}, PassOptions{})
+	out := buf.String()
+	if !strings.Contains(out, "skipped pinning") || !strings.Contains(out, "next pass tries again") {
+		t.Errorf("a busy lock was not reported as a skipped pass:\n%s", out)
+	}
+	if strings.Contains(out, "could not pin") {
+		t.Errorf("a busy lock was reported as a failure:\n%s", out)
+	}
+}
+
+type busyPassRunner struct{}
+
+func (busyPassRunner) Run(cmd string) (string, error) {
+	switch {
+	case strings.Contains(cmd, "flock -n 9"):
+		return "lock:busy\n", nil
+	case strings.HasPrefix(cmd, "uci show network.lan"):
+		return liveNetworkLAN, nil
+	}
+	return "", nil
+}
+
+// After panic-off dnsmasq IS the household's resolver. A reload that leaves it
+// running but not answering DNS is a house with no names at all, so it must
+// be rolled back exactly as a dead process is.
+func TestApplyRollsBackWhenDnsmasqIsTheResolverAndStopsAnswering(t *testing.T) {
+	r := &recordingRunner{resolverDown: true, port: "53\n"}
+	_, err := Apply(r, Plan{Commands: []string{"uci add_list dhcp.@dnsmasq[0].address='/x.example/192.168.1.122'"}})
+	if err == nil || !strings.Contains(err.Error(), "NOT answering DNS") {
+		t.Fatalf("want a resolver failure, got %v", err)
+	}
+	joined := strings.Join(r.ran, "\n")
+	if !strings.Contains(joined, "cp /tmp/dhcp.curfew-rollback /etc/config/dhcp") {
+		t.Errorf("the previous dhcp config was not restored:\n%s", joined)
+	}
+	// The probe asks for a name in the LOCAL domain when there is one, so a
+	// WAN outage is not mistaken for a dead resolver.
+	if !strings.Contains(joined, "nslookup 'localhost' 127.0.0.1") {
+		t.Errorf("with no local domain the probe should ask for localhost:\n%s", joined)
+	}
+}
+
+// With AdGuard holding 53, dnsmasq's DNS is not the household's, and its
+// answering is not checked (nor can a slow probe delay every pin).
+func TestApplyDoesNotProbeDNSWhenDnsmasqIsNotTheResolver(t *testing.T) {
+	r := &recordingRunner{resolverDown: true, port: "54\n"}
+	if _, err := Apply(r, Plan{Commands: []string{"uci set dhcp.curfew_x=host"}}); err != nil {
+		t.Fatalf("a dnsmasq on 54 must not be probed on 53: %v", err)
+	}
+	for _, c := range r.ran {
+		if strings.HasPrefix(c, "nslookup") {
+			t.Errorf("probed DNS although dnsmasq is on 54: %q", c)
+		}
 	}
 }

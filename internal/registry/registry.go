@@ -17,6 +17,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/wighawag/curfew/internal/dnsnames"
 )
 
 // Device is one named MAC address. Name is optional: a device may be
@@ -31,6 +33,12 @@ type Device struct {
 	// (leases.Survey.CheckFixed), because only the router knows its subnet
 	// and who else holds an address. See docs/adr/0012.
 	IP string `json:"ip,omitempty"`
+	// DNSNames are the device's LOCAL DNS NAMES: names the router answers
+	// itself, A only, with the fixed address, from AdGuard and from dnsmasq.
+	// "x" covers x and every name below it, "*.x" every name strictly below
+	// x (docs/adr/0013). A set, kept canonical and sorted by Load and by the
+	// mutations below. A device with names must have a fixed address.
+	DNSNames []string `json:"dns_names,omitempty"`
 }
 
 // Registry is the whole device file.
@@ -170,9 +178,101 @@ func (r *Registry) SetIP(mac, ip string) error {
 	}
 	for i := range r.Devices {
 		if r.Devices[i].MAC == canonical {
+			if ip == "" && len(r.Devices[i].DNSNames) > 0 {
+				return fmt.Errorf("%s still has local DNS names (%s), which point at its fixed "+
+					"address; remove them with 'curfew remove-dns-name' first, so no name is "+
+					"left pointing at an address that can change",
+					describeDevice(r.Devices[i]), strings.Join(r.Devices[i].DNSNames, ", "))
+			}
 			r.Devices[i].IP = ip
 			return nil
 		}
+	}
+	return fmt.Errorf("%w: %s", ErrNotFound, canonical)
+}
+
+// AddDNSName gives a registered device a local DNS name, after the checks the
+// device file alone can decide (docs/adr/0013): a valid name, a fixed address
+// to point at, no overlap with another device's names and no redundancy with
+// its own. The router-side checks (its local domain, its NTP servers, foreign
+// records) still run on push and in the daemon, because only the router knows
+// them. It returns the warnings to show, and is STRICT like Rename: an
+// unregistered MAC is an error, never a quiet insert.
+func (r *Registry) AddDNSName(mac, name string) ([]string, error) {
+	canonical, err := NormaliseMAC(mac)
+	if err != nil {
+		return nil, err
+	}
+	idx := -1
+	for i := range r.Devices {
+		if r.Devices[i].MAC == canonical {
+			idx = i
+		}
+	}
+	if idx < 0 {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, canonical)
+	}
+	parsed, err := dnsnames.Parse(name)
+	if err != nil {
+		return nil, err
+	}
+	name = parsed.String()
+	for _, have := range r.Devices[idx].DNSNames {
+		if have == name {
+			return nil, fmt.Errorf("%s already has the local DNS name %s", describeDevice(r.Devices[idx]), name)
+		}
+	}
+	candidate := append(append([]string(nil), r.Devices[idx].DNSNames...), name)
+	var devices []dnsnames.Device
+	for i, d := range r.Devices {
+		names := d.DNSNames
+		if i == idx {
+			names = candidate
+		}
+		devices = append(devices, dnsnames.Device{MAC: d.MAC, Label: describeDevice(d), Fixed: d.IP, Names: names})
+	}
+	for _, res := range dnsnames.Check(devices, dnsnames.Context{}) {
+		if res.MAC == canonical && res.Name == name {
+			if len(res.Errors) > 0 {
+				return nil, errors.New(strings.Join(res.Errors, "; "))
+			}
+			r.Devices[idx].DNSNames = dnsnames.CanonicalSet(candidate)
+			return res.Warnings, nil
+		}
+	}
+	return nil, fmt.Errorf("checking %s produced no verdict", name)
+}
+
+// RemoveDNSName takes a local DNS name off a registered device. Removing a
+// name the device does not have is an error, so a typo is not mistaken for a
+// removal.
+func (r *Registry) RemoveDNSName(mac, name string) error {
+	canonical, err := NormaliseMAC(mac)
+	if err != nil {
+		return err
+	}
+	name = dnsnames.Canonical(name)
+	for i := range r.Devices {
+		if r.Devices[i].MAC != canonical {
+			continue
+		}
+		kept := make([]string, 0, len(r.Devices[i].DNSNames))
+		found := false
+		for _, have := range r.Devices[i].DNSNames {
+			if have == name {
+				found = true
+				continue
+			}
+			kept = append(kept, have)
+		}
+		if !found {
+			return fmt.Errorf("%s has no local DNS name %s", describeDevice(r.Devices[i]), name)
+		}
+		if len(kept) == 0 {
+			kept = nil
+		}
+		r.Devices[i].DNSNames = kept
+		return nil
 	}
 	return fmt.Errorf("%w: %s", ErrNotFound, canonical)
 }
@@ -276,6 +376,10 @@ func Load(path string) (*Registry, error) {
 				r.Devices[i].IP = ip
 			}
 		}
+		// Same for local DNS names: canonical spelling, no duplicates, sorted,
+		// and a name that does not parse is KEPT to be refused by the checks
+		// that run before anything is written.
+		r.Devices[i].DNSNames = dnsnames.CanonicalSet(r.Devices[i].DNSNames)
 	}
 	return &r, nil
 }

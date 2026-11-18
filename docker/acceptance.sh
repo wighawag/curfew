@@ -30,6 +30,11 @@ CGO_ENABLED=0 go test -c -o .acceptance/accounting.test ./internal/accounting
 # ships.
 CGO_ENABLED=0 go test -c -o .acceptance/deploy.test ./internal/deploy
 
+# internal/dhcplock serialises every curfew write to the dhcp config. Its
+# claim is about a real flock(2) held by a real background shell through
+# OpenWrt's BUSYBOX flock (no -w, no timeout command), which only this image has.
+CGO_ENABLED=0 go test -c -o .acceptance/dhcplock.test ./internal/dhcplock
+
 # internal/leases writes static DHCP host entries with uci. The claim that
 # matters is what it does NOT touch, and only the real uci on a real
 # /etc/config/dhcp can settle that: the previous stage's gate stayed green

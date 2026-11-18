@@ -28,6 +28,9 @@ const (
 	// BothChangedIP means each side gave the device a different fixed address
 	// (one of them may have cleared it).
 	BothChangedIP ConflictKind = "fixed address changed differently on both sides"
+	// BothChangedDNSNames means each side ended with a different set of local
+	// DNS names. The set is one field: it is not merged name by name.
+	BothChangedDNSNames ConflictKind = "local DNS names changed differently on both sides"
 	// RemovedAndRenamed means one side removed the device while the other
 	// changed it (renamed it, or set or cleared its fixed address). This one
 	// matters: taking the removal silently discards an edit, and taking the
@@ -45,6 +48,7 @@ type Conflict struct {
 	// Each side's name and fixed address, and whether the device was present.
 	BaseName, LocalName, RemoteName string
 	BaseIP, LocalIP, RemoteIP       string
+	BaseDNS, LocalDNS, RemoteDNS    []string
 	InBase, InLocal, InRemote       bool
 }
 
@@ -62,7 +66,20 @@ func index(r *Registry) map[string]Device {
 // sameDevice compares every field a person can edit. Adding a field to Device
 // without adding it here would make push and pull silently discard it, which
 // is the trap ADR 0009 recorded for the budget knobs.
-func sameDevice(a, b Device) bool { return a.Name == b.Name && a.IP == b.IP }
+func sameDevice(a, b Device) bool {
+	return a.Name == b.Name && a.IP == b.IP && namesKey(a.DNSNames) == namesKey(b.DNSNames)
+}
+
+// namesKey is a device's local DNS names as one comparable value. Load keeps
+// them canonical and sorted, so equal sets have equal keys.
+func namesKey(names []string) string { return strings.Join(names, "\n") }
+
+func namesFromKey(k string) []string {
+	if k == "" {
+		return nil
+	}
+	return strings.Split(k, "\n")
+}
 
 // mergeField is the three-way rule for ONE field of a device present on both
 // sides: agreement, or whichever side moved away from the base. ok is false
@@ -120,6 +137,7 @@ func Merge3(base, local, remote *Registry) (*Registry, []Conflict) {
 				MAC: mac, Kind: kind, InBase: inB, InLocal: inL, InRemote: inR,
 				BaseName: bd.Name, LocalName: ld.Name, RemoteName: rd.Name,
 				BaseIP: bd.IP, LocalIP: ld.IP, RemoteIP: rd.IP,
+				BaseDNS: bd.DNSNames, LocalDNS: ld.DNSNames, RemoteDNS: rd.DNSNames,
 			})
 			// Carry the local value so the list stays usable; the caller
 			// refuses while conflicts exist.
@@ -140,13 +158,16 @@ func Merge3(base, local, remote *Registry) (*Registry, []Conflict) {
 		case inL && inR:
 			name, nameOK := mergeField(bd.Name, ld.Name, rd.Name)
 			ip, ipOK := mergeField(bd.IP, ld.IP, rd.IP)
+			dns, dnsOK := mergeField(namesKey(bd.DNSNames), namesKey(ld.DNSNames), namesKey(rd.DNSNames))
 			switch {
 			case !nameOK:
 				conflict(BothRenamed)
 			case !ipOK:
 				conflict(BothChangedIP)
+			case !dnsOK:
+				conflict(BothChangedDNSNames)
 			default:
-				out.Devices = append(out.Devices, Device{MAC: mac, Name: name, IP: ip})
+				out.Devices = append(out.Devices, Device{MAC: mac, Name: name, IP: ip, DNSNames: namesFromKey(dns)})
 			}
 		default:
 			// Present on exactly one side.
@@ -169,7 +190,7 @@ func Merge3(base, local, remote *Registry) (*Registry, []Conflict) {
 }
 
 // Equal reports whether two registries hold the same devices with the same
-// names and fixed addresses, regardless of order. push uses this to decide
+// names, fixed addresses and local DNS names, regardless of order. push uses this to decide
 // whether the router changed since the last sync, so a field missing here is
 // a field push silently overwrites.
 func Equal(a, b *Registry) bool {
@@ -194,6 +215,16 @@ func describe(present bool, name string) string {
 		return "(unnamed)"
 	}
 	return name
+}
+
+func describeNames(present bool, names []string) string {
+	if !present {
+		return "(not present)"
+	}
+	if len(names) == 0 {
+		return "(none)"
+	}
+	return strings.Join(names, ", ")
 }
 
 func describeIP(present bool, ip string) string {
@@ -226,6 +257,12 @@ func RenderConflicts(cs []Conflict) string {
 			fmt.Fprintf(&sb, "      last agreed : %s\n", describeIP(c.InBase, c.BaseIP))
 			fmt.Fprintf(&sb, "      your laptop : %s\n", describeIP(c.InLocal, c.LocalIP))
 			fmt.Fprintf(&sb, "      the router  : %s\n", describeIP(c.InRemote, c.RemoteIP))
+		}
+		if namesKey(c.BaseDNS) != namesKey(c.LocalDNS) || namesKey(c.LocalDNS) != namesKey(c.RemoteDNS) {
+			sb.WriteString("    local DNS names:\n")
+			fmt.Fprintf(&sb, "      last agreed : %s\n", describeNames(c.InBase, c.BaseDNS))
+			fmt.Fprintf(&sb, "      your laptop : %s\n", describeNames(c.InLocal, c.LocalDNS))
+			fmt.Fprintf(&sb, "      the router  : %s\n", describeNames(c.InRemote, c.RemoteDNS))
 		}
 		sb.WriteString("\n")
 	}

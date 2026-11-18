@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wighawag/curfew/internal/dnsledger"
 	"github.com/wighawag/curfew/internal/lanhosts"
 	"github.com/wighawag/curfew/internal/leases"
 	"github.com/wighawag/curfew/internal/registry"
@@ -32,10 +33,12 @@ type Manager struct {
 	schedule ScheduleStore
 	runner   Runner
 	api      API
+	rewrites RewriteAPI
 	mem      Headroom
 	listURL  string
 	lan      string
 	leases   string
+	ledger   string
 	loc      *time.Location
 	log      *slog.Logger
 	now      func() time.Time
@@ -73,6 +76,9 @@ type Config struct {
 	Schedule ScheduleStore
 	Runner   Runner
 	API      API
+	// Rewrites is AdGuard's DNS rewrite API, for local DNS names. Nil (or no
+	// LedgerPath) means AdGuard does not answer them; dnsmasq still does.
+	Rewrites RewriteAPI
 	// Headroom decides whether the router can afford the filter-engine
 	// rebuild a filter-list write causes. Nil means unmeasured, and unmeasured
 	// means the write goes ahead.
@@ -84,8 +90,11 @@ type Config struct {
 	LANInterface string
 	// LeasePath is dnsmasq's lease file, the ONLY source of IPv4 addresses.
 	LeasePath string
-	Location  *time.Location
-	Log       *slog.Logger
+	// LedgerPath is the DNS record ledger for local DNS names
+	// (internal/dnsledger). Empty means local names are not managed.
+	LedgerPath string
+	Location   *time.Location
+	Log        *slog.Logger
 }
 
 // DefaultLeasePath is where OpenWrt's dnsmasq keeps its leases.
@@ -117,7 +126,8 @@ func NewManager(c Config) *Manager {
 	}
 	return &Manager{
 		registry: c.Registry, schedule: c.Schedule, runner: c.Runner, api: c.API, mem: c.Headroom,
-		listURL: c.ListURL, lan: c.LANInterface, leases: leasePath,
+		rewrites: c.Rewrites,
+		listURL:  c.ListURL, lan: c.LANInterface, leases: leasePath, ledger: c.LedgerPath,
 		loc: loc, log: log, now: time.Now,
 		// Start from something AdGuard can fetch even before the first pass,
 		// so a registration that races the first tick gets a valid list rather
@@ -171,15 +181,18 @@ func (m *Manager) Tick() error {
 	for _, d := range reg.Devices {
 		devices = append(devices, leases.Device{
 			MAC: d.MAC, Name: d.Name, IP: observed[strings.ToLower(d.MAC)].IPv4, Fixed: d.IP,
+			DNSNames: d.DNSNames,
 		})
 	}
-	plan := leases.PassAndLog(m.runner, m.log, devices)
+	plan := leases.PassAndLog(m.runner, m.log, devices, leases.PassOptions{LedgerPath: m.ledger})
 	if len(plan.Unaddressed) > 0 {
 		m.log.Warn("registered devices with no DHCP lease, so no address to restrict by",
 			"devices", plan.Unaddressed,
 			"effect", "any DNS restriction for their profile does NOT apply to them; "+
 				"schedules, budgets and manual blocks are unaffected")
 	}
+
+	m.reconcileRewrites(plan)
 
 	desired := Compute(ps, plan.Pinned, observed, m.now().In(m.loc))
 
@@ -221,6 +234,79 @@ func (m *Manager) Tick() error {
 			"effect", "the child is restricted on one device and not another")
 	}
 	return nil
+}
+
+// reconcileRewrites is the AdGuard half of local DNS names. Fail-open like
+// everything else here: an AdGuard error is logged and the pass goes on.
+func (m *Manager) reconcileRewrites(plan leases.Plan) {
+	if m.rewrites == nil || m.ledger == "" {
+		return
+	}
+	if plan.NamesSkipped != "" {
+		// Ownership is unknown (an unreadable ledger), so AdGuard is left
+		// exactly as it is; the DHCP pass has already said why.
+		return
+	}
+	ledger, err := dnsledger.Load(m.ledger)
+	if err != nil {
+		m.log.Warn("local DNS names were not applied to AdGuard", "why", err.Error())
+		return
+	}
+	save := func(rs []dnsledger.Rewrite) error {
+		l, err := dnsledger.Load(m.ledger)
+		if err != nil {
+			return err
+		}
+		l.AdGuard = rs
+		return dnsledger.Save(m.ledger, l)
+	}
+	rep, err := ReconcileRewrites(m.rewrites, plan.Names.Targets, ledger, save)
+	if err != nil {
+		m.log.Warn("local DNS names could not all be applied to AdGuard", "error", err.Error(),
+			"effect", "dnsmasq still answers them after panic-off; the next pass retries")
+	}
+	// Saved only on a difference: the ledger lives on flash.
+	if (rep.Final != nil || err == nil) && !sameRewrites(ledger.AdGuard, rep.Final) {
+		if serr := save(rep.Final); serr != nil {
+			m.log.Warn("could not update the DNS record ledger after writing to AdGuard "+
+				"(it still lists everything curfew may own, so nothing is orphaned)", "error", serr.Error())
+		}
+	}
+	if rep.Changed() {
+		m.log.Info("AdGuard local DNS names updated", "added", rep.Added, "updated", rep.Updated,
+			"removed", rep.Removed)
+	}
+	for _, y := range rep.Yielded {
+		m.log.Warn("a local DNS name is NOT answered by AdGuard", "name", y,
+			"what_curfew_did", "left the household's rewrite alone and added none")
+	}
+	for _, u := range rep.Unclaimed {
+		m.log.Info("an AdGuard rewrite identical to curfew's was not written by curfew", "rewrite", u,
+			"what_curfew_did", "left it and did not claim it; the name still resolves")
+	}
+	for _, k := range rep.Kept {
+		m.log.Warn("an AdGuard rewrite curfew no longer wants is duplicated by one it did not create",
+			"rewrite", k, "what_curfew_did", "deleted nothing, since AdGuard deletes every copy at once")
+	}
+	for _, b := range rep.Bypass {
+		m.log.Warn("some devices get no answer for local DNS names from AdGuard", "why", b)
+	}
+}
+
+func sameRewrites(a, b []dnsledger.Rewrite) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	x := append([]dnsledger.Rewrite(nil), a...)
+	y := append([]dnsledger.Rewrite(nil), b...)
+	sortRewrites(x)
+	sortRewrites(y)
+	for i := range x {
+		if x[i] != y[i] {
+			return false
+		}
+	}
+	return true
 }
 
 type discard struct{}
