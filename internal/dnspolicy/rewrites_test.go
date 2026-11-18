@@ -2,6 +2,7 @@ package dnspolicy
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -54,11 +55,12 @@ func (f *fakeRewrites) DeleteRewrite(d, a string) error {
 	f.list = kept
 	return nil
 }
-func (f *fakeRewrites) UpdateRewrite(d, old, a string) error {
-	f.write("update " + d + " " + old + " " + a)
+func (f *fakeRewrites) UpdateRewrite(d, old, a string, enabled bool) error {
+	f.write(fmt.Sprintf("update %s %s %s enabled=%t", d, old, a, enabled))
 	for i, o := range f.list {
 		if o.Domain == d && o.Answer == old {
 			f.list[i].Answer = a
+			f.list[i].Enabled = &enabled
 			return nil
 		}
 	}
@@ -119,7 +121,7 @@ func TestAMovedAddressIsUpdatedInPlace(t *testing.T) {
 	moved := igcTarget
 	moved.IP = "192.168.1.123"
 	rep, wa := run(t, f, []leases.NameTarget{moved}, l)
-	if strings.Join(f.calls, "|") != "update *.lan.telemaque.ska.sh 192.168.1.122 192.168.1.123" {
+	if strings.Join(f.calls, "|") != "update *.lan.telemaque.ska.sh 192.168.1.122 192.168.1.123 enabled=true" {
 		t.Errorf("a move must be one in-place update: %v", f.calls)
 	}
 	if len(rep.Final) != 1 || rep.Final[0].Answer != "192.168.1.123" {
@@ -253,5 +255,81 @@ func TestNoRewriteIsTouchedWhenTheDHCPPassPlannedNothing(t *testing.T) {
 	m.reconcileRewrites(leases.Plan{NamesSkipped: "the dhcp config could not be read"})
 	if len(f.calls) != 0 {
 		t.Errorf("rewrites were changed with ownership unknown: %v", f.calls)
+	}
+}
+
+func off(d, a string) adguard.RewriteObject {
+	f := false
+	return adguard.RewriteObject{Domain: d, Answer: a, Enabled: &f}
+}
+
+// Reviewer: a DISABLED household rewrite answers nothing, so it must not make
+// curfew yield its name.
+func TestADisabledForeignRewriteDoesNotBlockTheName(t *testing.T) {
+	f := &fakeRewrites{list: []adguard.RewriteObject{off("*.lan.telemaque.ska.sh", "192.168.1.99")}}
+	rep, _ := run(t, f, []leases.NameTarget{igcTarget}, &dnsledger.Ledger{})
+	if strings.Join(f.calls, "|") != "add *.lan.telemaque.ska.sh 192.168.1.122" || len(rep.Yielded) != 0 {
+		t.Errorf("a switched-off rewrite blocked the name: calls=%v %+v", f.calls, rep)
+	}
+}
+
+// An identical but DISABLED household copy does not answer, and adding
+// curfew's own would make an undeletable pair, so curfew adds nothing and
+// says so.
+func TestAnIdenticalDisabledForeignRewriteIsReportedNotDuplicated(t *testing.T) {
+	f := &fakeRewrites{list: []adguard.RewriteObject{off("*.lan.telemaque.ska.sh", "192.168.1.122")}}
+	rep, _ := run(t, f, []leases.NameTarget{igcTarget}, &dnsledger.Ledger{})
+	if len(f.calls) != 0 || len(rep.Unclaimed) != 0 || len(rep.Disabled) != 1 {
+		t.Errorf("want nothing written and the disabled rewrite reported: calls=%v %+v", f.calls, rep)
+	}
+}
+
+// Curfew's own rewrite switched off by the household is respected, kept as
+// curfew's, and reported, never re-enabled.
+func TestCurfewsOwnRewriteSwitchedOffIsRespected(t *testing.T) {
+	f := &fakeRewrites{list: []adguard.RewriteObject{off("*.lan.telemaque.ska.sh", "192.168.1.122")}}
+	l := &dnsledger.Ledger{AdGuard: []dnsledger.Rewrite{rw("*.lan.telemaque.ska.sh", "192.168.1.122")}}
+	rep, _ := run(t, f, []leases.NameTarget{igcTarget}, l)
+	if len(f.calls) != 0 || len(rep.Disabled) != 1 || len(rep.Final) != 1 {
+		t.Errorf("want it left, owned and reported: calls=%v %+v", f.calls, rep)
+	}
+}
+
+// Reviewer: a move must not silently switch back on a rewrite the household
+// switched off.
+func TestAMoveKeepsASwitchedOffRewriteOff(t *testing.T) {
+	f := &fakeRewrites{list: []adguard.RewriteObject{off("*.lan.telemaque.ska.sh", "192.168.1.122")}}
+	l := &dnsledger.Ledger{AdGuard: []dnsledger.Rewrite{rw("*.lan.telemaque.ska.sh", "192.168.1.122")}}
+	moved := igcTarget
+	moved.IP = "192.168.1.123"
+	rep, _ := run(t, f, []leases.NameTarget{moved}, l)
+	if strings.Join(f.calls, "|") != "update *.lan.telemaque.ska.sh 192.168.1.122 192.168.1.123 enabled=false" {
+		t.Errorf("the move re-enabled the rewrite: %v", f.calls)
+	}
+	if len(rep.Disabled) != 1 {
+		t.Errorf("the still-disabled rewrite must be reported: %+v", rep)
+	}
+}
+
+// Reviewer: while a category change has AdGuard's config file in hand
+// (stopped, written, restarted, possibly rolled back), rewrites are not
+// touched, or the rollback could resurrect one curfew just deleted.
+func TestRewritesAreLeftAloneDuringAnAdGuardConfigEdit(t *testing.T) {
+	f := &fakeRewrites{list: []adguard.RewriteObject{ro("*.lan.telemaque.ska.sh", "192.168.1.122")}}
+	ledger := filepath.Join(t.TempDir(), "dns-records.json")
+	if err := dnsledger.Save(ledger, &dnsledger.Ledger{AdGuard: []dnsledger.Rewrite{rw("*.lan.telemaque.ska.sh", "192.168.1.122")}}); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(Config{Rewrites: f, LedgerPath: ledger})
+	m.DuringAdGuardEdit(func() {
+		m.reconcileRewrites(leases.Plan{}) // no targets: would delete curfew's rewrite
+	})
+	if len(f.calls) != 0 {
+		t.Errorf("a rewrite was changed during an AdGuard config edit: %v", f.calls)
+	}
+	// Control: outside the edit the same pass does delete it.
+	m.reconcileRewrites(leases.Plan{})
+	if len(f.calls) != 1 {
+		t.Errorf("the control pass should delete curfew's rewrite: %v", f.calls)
 	}
 }

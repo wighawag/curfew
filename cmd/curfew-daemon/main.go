@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 	// The IANA database, embedded in the binary. OpenWrt ships no
@@ -281,9 +282,14 @@ func run(args []string, stderr *os.File) int {
 		// This one STOPS AdGuard to apply the change: see
 		// internal/adguard/categories.go for why that is the safe path and
 		// the API is not, on a router this size.
-		ui.UseAdGuardCategories(func(wanted []string) (adguard.ApplyReport, error) {
-			return adguard.ApplyCategories(shellrun.Local{}, localResolver{},
-				adguard.ConfigPath, wanted, adguard.DefaultRestartTimeout)
+		ui.UseAdGuardCategories(func(wanted []string) (rep adguard.ApplyReport, err error) {
+			// With local DNS name reconciliation held off, so the daemon's
+			// tick cannot delete a rewrite the rollback would then restore.
+			dns.DuringAdGuardEdit(func() {
+				rep, err = adguard.ApplyCategories(shellrun.Local{}, localResolver{},
+					adguard.ConfigPath, wanted, adguard.DefaultRestartTimeout)
+			})
+			return rep, err
 		})
 	}
 	srv := &http.Server{
@@ -292,15 +298,28 @@ func run(args []string, stderr *os.File) int {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// The signals stay CAUGHT until run returns (stop is deferred), and
+	// shutdown cancels through its own cancel: a second SIGTERM during the
+	// shutdown grace is then ignored instead of killing the daemon mid-pass.
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ctx, cancel := context.WithCancel(sigCtx)
+	defer cancel()
 
-	go reconcileLoop(ctx, log, core, opt.reconcile)
+	// The loops are waited for on shutdown. A pass can be in the middle of a
+	// DHCP transaction (committed, not yet reloaded) when procd stops the
+	// daemon, which `curfew push` does on every push; exiting there leaves
+	// records committed that dnsmasq never loads, and later passes see no
+	// difference to fix. Each loop only checks for shutdown BETWEEN passes,
+	// so waiting for it is waiting for the pass in flight to finish.
+	var loops sync.WaitGroup
+	loops.Add(2)
+	go func() { defer loops.Done(); reconcileLoop(ctx, log, core, opt.reconcile) }()
 	if dns != nil {
 		// The DNS layer pins leases itself, because it needs the result.
-		go dnsLoop(ctx, log, dns, opt.reconcile)
+		go func() { defer loops.Done(); dnsLoop(ctx, log, dns, opt.reconcile) }()
 	} else {
-		go leaseLoop(ctx, log, store, opt.dnsLedgerPath, opt.reconcile)
+		go func() { defer loops.Done(); leaseLoop(ctx, log, store, opt.dnsLedgerPath, opt.reconcile) }()
 	}
 
 	errCh := make(chan error, 1)
@@ -311,25 +330,45 @@ func run(args []string, stderr *os.File) int {
 		}
 	}()
 
+	code := 0
 	select {
 	case err := <-errCh:
 		log.Error("http server failed", "error", err)
-		return 1
+		code = 1
 	case <-ctx.Done():
 		log.Info("shutting down")
 	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Error("shutdown", "error", err)
-		return 1
-	}
+	// No new pass starts once the context is cancelled; the one in flight,
+	// if any, is waited for BEFORE the HTTP server closes, because AdGuard
+	// may be fetching curfew's filter list from it as part of that pass.
+	cancel()
+	code = shutdown(func() bool { return waitFor(&loops, shutdownGrace) }, func() error {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return srv.Shutdown(shutdownCtx)
+	}, log, code)
 	// The ruleset is deliberately LEFT IN PLACE on exit. Stopping the daemon
 	// must not open the household's internet; removing policy is what the
 	// panic path is for, and it is an explicit choice rather than a side
 	// effect of a process dying.
-	return 0
+	return code
+}
+
+// shutdown waits for the pass in flight, THEN stops the HTTP server, and
+// never skips the wait: an HTTP shutdown that times out (a settings-page
+// category change can hold a request for two minutes) must not cut a DHCP
+// transaction between its commit and its reload.
+func shutdown(waitLoops func() bool, stopHTTP func() error, log *slog.Logger, code int) int {
+	if !waitLoops() {
+		log.Warn("a pass was still running when the shutdown grace ran out",
+			"grace", shutdownGrace.String(),
+			"effect", "a DHCP change may be committed but not loaded; the next start re-checks it")
+	}
+	if err := stopHTTP(); err != nil {
+		log.Error("shutdown", "error", err)
+		return 1
+	}
+	return code
 }
 
 // runProbe measures the kernel and prints what it found.
@@ -359,6 +398,24 @@ func runProbe(stderr *os.File) int {
 		return 1
 	}
 	return 0
+}
+
+// shutdownGrace is how long shutdown waits for a pass in flight. A DHCP
+// transaction is bounded by its lock wait (10s), the liveness checks (about
+// 10s) and a rollback, so 45s covers it. procd is told to wait longer than
+// this before it kills the process (term_timeout in the init script).
+const shutdownGrace = 45 * time.Second
+
+// waitFor waits for wg, at most d, and reports whether it finished.
+func waitFor(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }
 
 // resolveLocation picks the zone schedules are evaluated in.

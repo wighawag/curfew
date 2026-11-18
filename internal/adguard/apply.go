@@ -81,32 +81,52 @@ func ApplyCategories(r Runner, probe Prober, configPath string, wanted []string,
 	if !changed {
 		return report, nil
 	}
-	report.Changed = true
-	report.Added, report.Removed = diffCategories(before, ConfiguredCategories(updated))
-
-	// The backup FIRST, and verified, because everything after this point can
-	// fail and the rollback is only as good as this copy.
-	if _, err := r.Run(fmt.Sprintf("cp %s %s%s", configPath, configPath, backupSuffix)); err != nil {
-		return report, fmt.Errorf("backing up %s: %w", configPath, err)
-	}
-	if out, err := r.Run(fmt.Sprintf("cmp -s %s %s%s && echo same", configPath, configPath,
-		backupSuffix)); err != nil || strings.TrimSpace(out) != "same" {
-		return report, fmt.Errorf("the backup of %s does not match the original, so curfew "+
-			"will not edit it", configPath)
-	}
-
-	// Stopped before the write, so AdGuard cannot rewrite the file underneath
-	// the edit, and so the engine is built ONCE from the new config rather
-	// than rebuilt on top of the old one. Avoiding that rebuild is the whole
-	// reason this path exists; see categories.go.
+	// Stopped BEFORE the snapshot, the backup and the write. Before the write,
+	// so AdGuard cannot rewrite the file underneath the edit, and so the
+	// engine is built ONCE from the new config rather than rebuilt on top of
+	// the old one (avoiding that rebuild is the whole reason this path
+	// exists; see categories.go). Before the snapshot and the backup too:
+	// AdGuard keeps changing its own file through the API while it runs (the
+	// daemon's tick creates and deletes DNS rewrites, for local DNS names),
+	// so a copy taken while it is still up could put back, on write or on
+	// rollback, a rewrite deleted a moment later, which curfew would then
+	// count as the household's for ever. Found by review, 2026-11-18.
 	started := time.Now()
 	if _, err := r.Run("/etc/init.d/adguardhome stop"); err != nil {
 		return report, fmt.Errorf("stopping AdGuard: %w", err)
 	}
-	if err := writeFile(r, configPath, updated); err != nil {
+	restart := func(err error) (ApplyReport, error) {
 		// Nothing was changed yet, but AdGuard is down, so it must come back.
 		_, _ = r.Run("/etc/init.d/adguardhome start")
-		return report, fmt.Errorf("writing %s: %w", configPath, err)
+		return report, err
+	}
+	if current, err = r.Run("cat " + configPath); err != nil {
+		return restart(fmt.Errorf("reading %s: %w", configPath, err))
+	}
+	before = ConfiguredCategories(current)
+	if updated, changed, err = SetCategories(current, wanted); err != nil {
+		return restart(err)
+	}
+	if !changed {
+		// What AdGuard flushed on stop already says what was wanted.
+		_, err := r.Run("/etc/init.d/adguardhome start")
+		return report, err
+	}
+	report.Changed = true
+	report.Added, report.Removed = diffCategories(before, ConfiguredCategories(updated))
+
+	// The backup, and verified, because everything after this point can fail
+	// and the rollback is only as good as this copy.
+	if _, err := r.Run(fmt.Sprintf("cp %s %s%s", configPath, configPath, backupSuffix)); err != nil {
+		return restart(fmt.Errorf("backing up %s: %w", configPath, err))
+	}
+	if out, err := r.Run(fmt.Sprintf("cmp -s %s %s%s && echo same", configPath, configPath,
+		backupSuffix)); err != nil || strings.TrimSpace(out) != "same" {
+		return restart(fmt.Errorf("the backup of %s does not match the original, so curfew "+
+			"will not edit it", configPath))
+	}
+	if err := writeFile(r, configPath, updated); err != nil {
+		return restart(fmt.Errorf("writing %s: %w", configPath, err))
 	}
 	if _, err := r.Run("/etc/init.d/adguardhome start"); err != nil {
 		return report, fmt.Errorf("starting AdGuard: %w", err)

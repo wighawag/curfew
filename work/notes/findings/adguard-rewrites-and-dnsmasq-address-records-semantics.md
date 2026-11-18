@@ -47,6 +47,10 @@ Router-shaped instance: `--stop-dns-rebind --rebind-localhost-ok --local=/lan/`,
 - Same records, same answers on port 53 as on 54 (the post-`panic-off` arrangement).
 - There is no exact-name-only form that also keeps AAAA local: `host-record` forwards AAAA, and `--server=/x/` covers every subdomain of x.
 
+## dnsmasq: does somebody else's entry for a PARENT domain beat curfew's wildcard?
+
+Measured separately (`docs/spikes/local-dns-names/measure-parent.sh`, output in `measured-parent-2026-11-18.txt`), because dnsmasq's man page says a non-wildcard pattern takes priority over a wildcard one. With curfew's `address=/*.lan.telemaque.ska.sh/192.168.1.122` and `server=/*.lan.telemaque.ska.sh/` in place, `breakoutbunny.lan.telemaque.ska.sh` still answered 192.168.1.122 (and AAAA NODATA) next to each of: `address=/lan.telemaque.ska.sh/10.1.1.1`, `address=/telemaque.ska.sh/10.1.1.1`, `server=/lan.telemaque.ska.sh/127.0.0.1#5454` and `address=/*.telemaque.ska.sh/10.1.1.1`. Only a MORE SPECIFIC entry won: `address=/breakoutbunny.lan.telemaque.ska.sh/10.1.1.2` answered 10.1.1.2 for that one name. So a broader entry cannot silently override a local name; a narrower one carves out exactly the name it names, which is the household's own deliberate choice and is left alone. Not measured: the household entries were given AFTER curfew's on the command line; on a router the order follows the uci list. dnsmasq 2.86+ sorts domain matches by specificity rather than order, so the reverse order is expected to behave the same, but that is inference.
+
 ## How OpenWrt's init script renders them (25.12.4 `/etc/init.d/dnsmasq`)
 
 - `list address '<v>'` in `dhcp.@dnsmasq[0]` becomes `address=<v>` verbatim (`append_address`, line 172), and with `address_as_local '1'` also a `local=` line for EVERY address entry (a global switch, so not something curfew should flip).

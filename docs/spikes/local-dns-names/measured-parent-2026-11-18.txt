@@ -1,0 +1,24 @@
+
+### curfew's records alone (control)
+A breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+
+### plus a household address=/lan.telemaque.ska.sh/10.1.1.1 (bare parent, 1 level up)
+A breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+
+### plus a household address=/telemaque.ska.sh/10.1.1.1 (bare grandparent)
+A breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+
+### plus a household server=/lan.telemaque.ska.sh/127.0.0.1#5454 (bare parent, forward)
+A breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+
+### plus a household address=/*.telemaque.ska.sh/10.1.1.1 (wildcard grandparent)
+A breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 192.168.1.122] authority=[]
+AAAA breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]
+
+### plus a household address=/breakoutbunny.lan.telemaque.ska.sh/10.1.1.2 (more specific child)
+A breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=true answers=1 [A 10.1.1.2] authority=[]
+AAAA breakoutbunny.lan.telemaque.ska.sh @127.0.0.1:54: rcode=RCodeSuccess aa=false answers=0 [] authority=[]

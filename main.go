@@ -617,10 +617,15 @@ func cmdPush(args []string) error {
 		nameNotes = notes
 	}
 
-	if err := deploy.Push(runner, *path); err != nil {
+	// One restart, at the end, after both files are up: see UploadRegistry.
+	if err := deploy.UploadRegistry(runner, *path); err != nil {
 		return err
 	}
 	if err := registry.Save(basePath(*path), local); err != nil {
+		// The router already has the new list; apply it now anyway.
+		if rerr := deploy.Restart(runner); rerr != nil {
+			return fmt.Errorf("%w (and restarting the daemon failed: %v)", err, rerr)
+		}
 		return err
 	}
 	_ = os.Remove(conflictPath(*path))
@@ -637,6 +642,11 @@ func cmdPush(args []string) error {
 
 	msg, err := syncProfiles(runner, *path, false, *force)
 	if err != nil {
+		// The device list is already on the router; restart so it applies
+		// now, then report the schedule problem.
+		if rerr := deploy.Restart(runner); rerr != nil {
+			return fmt.Errorf("%w (and restarting the daemon failed: %v)", err, rerr)
+		}
 		return err
 	}
 	fmt.Printf("%s\n", msg)

@@ -31,7 +31,7 @@ type RewriteAPI interface {
 	Rewrites() ([]adguard.RewriteObject, error)
 	AddRewrite(domain, answer string) error
 	DeleteRewrite(domain, answer string) error
-	UpdateRewrite(domain, oldAnswer, newAnswer string) error
+	UpdateRewrite(domain, oldAnswer, newAnswer string, enabled bool) error
 	RewritesEnabled() (bool, error)
 	FilteringEnabled() (bool, error)
 	Clients() ([]adguard.ClientObject, error)
@@ -48,6 +48,9 @@ type RewriteReport struct {
 	// Kept are curfew rewrites duplicated by a household one, which cannot be
 	// deleted without deleting both.
 	Kept []string
+	// Disabled are wanted rewrites that exist but are switched off in
+	// AdGuard, so AdGuard does not answer them. Reported, never re-enabled.
+	Disabled []string
 	// Bypass says who gets NO rewrites at all, measured: everyone when
 	// rewrites or filtering are off globally, and any client with its own
 	// settings and filtering off. Reported, never changed.
@@ -76,7 +79,13 @@ func ReconcileRewrites(api RewriteAPI, targets []leases.NameTarget, ledger *dnsl
 	if err != nil {
 		return rep, err
 	}
+	// count includes DISABLED rewrites, because AdGuard's delete removes
+	// every identical copy whether enabled or not; enabled says whether any
+	// copy actually answers. A disabled rewrite answers nothing (it is how a
+	// household switches one off), so it neither blocks curfew's name nor
+	// stands in for it.
 	count := map[dnsledger.Rewrite]int{}
+	enabled := map[dnsledger.Rewrite]bool{}
 	var present []dnsledger.Rewrite
 	for _, o := range list {
 		r := rw(dnsnames.Canonical(o.Domain), o.Answer)
@@ -84,6 +93,9 @@ func ReconcileRewrites(api RewriteAPI, targets []leases.NameTarget, ledger *dnsl
 			present = append(present, r)
 		}
 		count[r]++
+		if o.Enabled == nil || *o.Enabled {
+			enabled[r] = true
+		}
 	}
 	owned := func(r dnsledger.Rewrite) bool { return count[r] > 0 && ledger.HasRewrite(r) }
 
@@ -105,7 +117,7 @@ func ReconcileRewrites(api RewriteAPI, targets []leases.NameTarget, ledger *dnsl
 		}
 		yielded := false
 		for _, o := range present {
-			if wantDom[o.Domain] && !owned(o) && o.Answer != t.IP {
+			if wantDom[o.Domain] && !owned(o) && o.Answer != t.IP && enabled[o] {
 				rep.Yielded = append(rep.Yielded, fmt.Sprintf("%s (AdGuard already rewrites %s to %s)",
 					t.Name, o.Domain, o.Answer))
 				yielded = true
@@ -118,8 +130,19 @@ func ReconcileRewrites(api RewriteAPI, targets []leases.NameTarget, ledger *dnsl
 			switch {
 			case owned(w):
 				keep[w] = true
-			case count[w] > 0:
+				if !enabled[w] {
+					// Somebody switched curfew's own rewrite off. Respected,
+					// not fought: it is reported, and kept as curfew's.
+					rep.Disabled = append(rep.Disabled, w.Domain+" -> "+w.Answer)
+				}
+			case count[w] > 0 && enabled[w]:
 				rep.Unclaimed = append(rep.Unclaimed, w.Domain+" -> "+w.Answer)
+			case count[w] > 0:
+				// Only a DISABLED household copy exists. Adding curfew's own
+				// would make two identical rewrites that can never be removed
+				// separately, so nothing is added and the household is told.
+				rep.Disabled = append(rep.Disabled, w.Domain+" -> "+w.Answer+
+					" (a rewrite curfew did not create, switched off; enable or delete it in AdGuard)")
 			default:
 				// A curfew rewrite for the same domain at another address is
 				// this device moving: replace it in place.
@@ -183,10 +206,15 @@ func ReconcileRewrites(api RewriteAPI, targets []leases.NameTarget, ledger *dnsl
 		}
 	}
 	for _, m := range moves {
-		err := api.UpdateRewrite(m.to.Domain, m.from.Answer, m.to.Answer)
+		on := enabled[m.from]
+		err := api.UpdateRewrite(m.to.Domain, m.from.Answer, m.to.Answer, on)
 		note(err)
 		if err == nil {
 			rep.Updated = append(rep.Updated, fmt.Sprintf("%s: %s -> %s", m.to.Domain, m.from.Answer, m.to.Answer))
+			if !on {
+				rep.Disabled = append(rep.Disabled, m.to.Domain+" -> "+m.to.Answer+
+					" (moved with the device, and still switched off as the household left it)")
+			}
 		}
 	}
 	for _, a := range adds {

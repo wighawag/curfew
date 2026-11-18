@@ -44,6 +44,12 @@ type Manager struct {
 	now      func() time.Time
 
 	mu sync.Mutex
+	// adguardEdit is held while something edits AdGuard's config FILE with
+	// AdGuard stopped and restarted around it (a category change). Rewrite
+	// reconciliation skips while it is held: a rewrite deleted through the
+	// API in that window could come back from the file's backup on a
+	// rollback, and would then count as the household's for ever.
+	adguardEdit sync.Mutex
 	// served is the filter list text the HTTP server is handing to AdGuard
 	// right now. It is held here rather than regenerated per request so that
 	// what AdGuard fetches is exactly what this pass decided, even if a
@@ -236,12 +242,27 @@ func (m *Manager) Tick() error {
 	return nil
 }
 
+// DuringAdGuardEdit runs f, which edits AdGuard's config file with AdGuard
+// stopped, with rewrite reconciliation held off for its whole duration
+// (rollback included). It waits for a reconciliation already in flight.
+func (m *Manager) DuringAdGuardEdit(f func()) {
+	m.adguardEdit.Lock()
+	defer m.adguardEdit.Unlock()
+	f()
+}
+
 // reconcileRewrites is the AdGuard half of local DNS names. Fail-open like
 // everything else here: an AdGuard error is logged and the pass goes on.
 func (m *Manager) reconcileRewrites(plan leases.Plan) {
 	if m.rewrites == nil || m.ledger == "" {
 		return
 	}
+	if !m.adguardEdit.TryLock() {
+		m.log.Info("local DNS names were not checked in AdGuard this pass: its config is " +
+			"being changed from the settings page; the next pass does it")
+		return
+	}
+	defer m.adguardEdit.Unlock()
 	if plan.NamesSkipped != "" {
 		// Ownership is unknown (an unreadable ledger), so AdGuard is left
 		// exactly as it is; the DHCP pass has already said why.
@@ -287,6 +308,10 @@ func (m *Manager) reconcileRewrites(plan leases.Plan) {
 	for _, k := range rep.Kept {
 		m.log.Warn("an AdGuard rewrite curfew no longer wants is duplicated by one it did not create",
 			"rewrite", k, "what_curfew_did", "deleted nothing, since AdGuard deletes every copy at once")
+	}
+	for _, d := range rep.Disabled {
+		m.log.Warn("a local DNS name's AdGuard rewrite is switched off, so AdGuard does not answer it",
+			"rewrite", d, "what_curfew_did", "left it as it is; dnsmasq still answers the name after panic-off")
 	}
 	for _, b := range rep.Bypass {
 		m.log.Warn("some devices get no answer for local DNS names from AdGuard", "why", b)

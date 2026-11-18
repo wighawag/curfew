@@ -59,15 +59,16 @@ func (c *Client) DeleteRewrite(domain, answer string) error {
 }
 
 // UpdateRewrite replaces one rewrite in place, so a moved address never
-// leaves a moment where the name falls through to upstream.
-func (c *Client) UpdateRewrite(domain, oldAnswer, newAnswer string) error {
+// leaves a moment where the name falls through to upstream. enabled carries
+// the rewrite's on/off state across the move, so one the household switched
+// off stays off.
+func (c *Client) UpdateRewrite(domain, oldAnswer, newAnswer string, enabled bool) error {
 	if err := plainAnswer(newAnswer); err != nil {
 		return err
 	}
-	t := true
 	return c.rewriteWrite(http.MethodPut, "/control/rewrite/update", map[string]any{
 		"target": RewriteObject{Domain: domain, Answer: oldAnswer},
-		"update": RewriteObject{Domain: domain, Answer: newAnswer, Enabled: &t},
+		"update": RewriteObject{Domain: domain, Answer: newAnswer, Enabled: &enabled},
 	}, domain)
 }
 

@@ -604,3 +604,12 @@ func TestUpdateNoticesSettingsThisBuildNeedsThatTheRouterPredates(t *testing.T) 
 		t.Errorf("a freshly written settings file reports missing keys: %v", missing)
 	}
 }
+
+// procd's default is to SIGKILL 5s after SIGTERM, which can cut a DHCP
+// transaction between commit and reload. The service waits longer than the
+// daemon's own shutdown grace.
+func TestTheServiceGivesAPassInFlightTimeToFinish(t *testing.T) {
+	if !strings.Contains(initScript(), "procd_set_param term_timeout 60") {
+		t.Errorf("the init script does not raise procd's term_timeout:\n%s", initScript())
+	}
+}

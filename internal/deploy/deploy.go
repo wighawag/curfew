@@ -212,6 +212,10 @@ start_service() {
         CURFEW_ADGUARD_PASSWORD="$CURFEW_ADGUARD_PASSWORD" \
         CURFEW_ROUTER_IP="$CURFEW_ROUTER_IP"
     procd_set_param respawn
+    # Wait for a pass in flight before killing the daemon: procd's default is
+    # 5s, and a DHCP transaction cut there is committed but never loaded.
+    # Longer than the daemon's own 45s shutdown grace.
+    procd_set_param term_timeout 60
     procd_set_param stdout 1
     procd_set_param stderr 1
     procd_close_instance
@@ -582,20 +586,25 @@ func FetchRegistry(r Runner, localPath string) (bool, error) {
 
 // Push copies the local registry to the router and reloads the service.
 func Push(r Runner, localPath string) error {
+	if err := UploadRegistry(r, localPath); err != nil {
+		return err
+	}
+	// Reload so the change takes effect now rather than at the next reconcile.
+	return Restart(r)
+}
+
+// UploadRegistry copies the local registry to the router WITHOUT restarting
+// the daemon, for a caller that uploads several files and restarts once.
+// Restarting twice in a row is not free: the first restart's startup pass may
+// be mid-way through a DHCP transaction when the second arrives.
+func UploadRegistry(r Runner, localPath string) error {
 	if _, err := os.Stat(localPath); err != nil {
 		return fmt.Errorf("local registry: %w", err)
 	}
 	if _, err := r.Run("mkdir -p " + RemoteConfDir); err != nil {
 		return err
 	}
-	if err := r.Upload(localPath, RemoteRegistry); err != nil {
-		return err
-	}
-	// Reload so the change takes effect now rather than at the next reconcile.
-	if _, err := r.Run(RemoteInit + " restart"); err != nil {
-		return err
-	}
-	return nil
+	return r.Upload(localPath, RemoteRegistry)
 }
 
 // Pull copies the router's registry to a local path, creating the parent

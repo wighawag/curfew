@@ -197,3 +197,62 @@ func TestTheConfigIsWrittenWithoutGoingThroughShellQuoting(t *testing.T) {
 		}
 	}
 }
+
+// flushingRunner plays AdGuard writing its own state to its config file as it
+// stops, here dropping a DNS rewrite the daemon deleted a moment before.
+type flushingRunner struct {
+	*scriptRunner
+	onStop func()
+}
+
+func (f *flushingRunner) Run(cmd string) (string, error) {
+	out, err := f.scriptRunner.Run(cmd)
+	if strings.Contains(cmd, "adguardhome stop") && f.onStop != nil {
+		f.onStop()
+		f.onStop = nil
+	}
+	return out, err
+}
+
+// Reviewer: the snapshot written back (and the rollback copy) must be taken
+// AFTER AdGuard stops, or a rewrite deleted through the API just before the
+// stop comes back from the stale copy, and curfew then counts it as the
+// household's for ever.
+func TestACategoryChangeWritesBackTheConfigAsAdGuardLeftItOnStop(t *testing.T) {
+	const marker = "    - domain: '*.lan.example.test'\n      answer: 192.168.1.122\n"
+	stale := liveConfig + "# rewrites\n" + marker
+	r := &flushingRunner{scriptRunner: newRunner(stale)}
+	r.onStop = func() { r.files[ConfigPath] = strings.Replace(r.files[ConfigPath], marker, "", 1) }
+	if _, err := ApplyCategories(r, r.scriptRunner, ConfigPath, []string{"Gambling", "Porn", "Ads"}, 50*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(r.files[ConfigPath], "*.lan.example.test") {
+		t.Error("the stale pre-stop copy was written back, resurrecting a deleted rewrite")
+	}
+	if strings.Contains(r.files[ConfigPath+backupSuffix], "*.lan.example.test") {
+		t.Error("the rollback copy was taken before AdGuard stopped")
+	}
+}
+
+// Every failure after AdGuard is stopped and before the new config is written
+// must start AdGuard again on the UNCHANGED config: the household's resolver
+// comes back exactly as it was.
+func TestEveryFailureAfterTheStopBringsAdGuardBackUnchanged(t *testing.T) {
+	for _, step := range []string{
+		"cp " + ConfigPath + " ", // the backup
+		"cmp -s ",                // verifying the backup
+		"cat > ",                 // the write itself
+	} {
+		r := newRunner(liveConfig)
+		r.failOn, r.err = step, errors.New("disk full")
+		if _, err := apply(t, r, "Gambling", "Porn", "Ads"); err == nil {
+			t.Errorf("%q: a failed step must be an error", step)
+		}
+		if !r.Serving() {
+			t.Errorf("%q: AdGuard was left stopped, so the house has no DNS", step)
+		}
+		if r.files[ConfigPath] != liveConfig {
+			t.Errorf("%q: the config changed although the edit failed", step)
+		}
+	}
+}
